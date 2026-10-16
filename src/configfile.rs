@@ -3,7 +3,7 @@ use pretty_ini::{ini, ini_file};
 use std::env;
 use std::path::Path;
 
-const APP_NAME: &str = env!("CARGO_PKG_NAME");
+const APP_NAME: &str = "clipgpt";
 
 const SECTION: &str = "openai";
 
@@ -51,9 +51,9 @@ pub struct Config {
 }
 
 /// Default per-OS location of config.ini:
-/// * Linux   "~/.config/clip_gpt/config.ini"
-/// * MacOS   "~/Library/Application Support/clip_gpt/config.ini"
-/// * Windows "%APPDATA%\clip_gpt\config.ini"
+/// * Linux   "~/.config/clipgpt/config.ini"
+/// * MacOS   "~/Library/Application Support/clipgpt/config.ini"
+/// * Windows "%APPDATA%\clipgpt\config.ini"
 fn ini_path() -> Result<String, String> {
     if cfg!(target_os = "windows") {
         if let Some(app_dir) = env::var_os("APPDATA") {
@@ -126,16 +126,11 @@ pub fn read_ini() -> Result<Config, String> {
     let mut ini = ini::Ini::default();
     ini.load(&mut file)?;
 
-    let api_key = get_value(&ini, SECTION, "api_key").ok_or_else(|| {
-        format!(
-            "'api_key' is required in [{}] section of {}",
-            SECTION, path
-        )
-    })?;
+    let api_key = get_value(&ini, SECTION, "api_key")
+        .ok_or_else(|| format!("'api_key' is required in [{}] section of {}", SECTION, path))?;
 
-    let model = get_value(&ini, SECTION, "model").ok_or_else(|| {
-        format!("'model' is required in [{}] section of {}", SECTION, path)
-    })?;
+    let model = get_value(&ini, SECTION, "model")
+        .ok_or_else(|| format!("'model' is required in [{}] section of {}", SECTION, path))?;
 
     let api_type_str =
         get_value(&ini, SECTION, "api_type").unwrap_or_else(|| DEFAULT_API_TYPE.to_string());

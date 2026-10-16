@@ -1,0 +1,16 @@
+# cargo-audit configuration. See .woodpecker/release.yaml's
+# build-linux-amd64-trixie step, which runs `cargo audit` as a release gate.
+[advisories]
+ignore = [
+    # xcb (via x11-clipboard/clipboard), only reachable from the macOS-only
+    # clipboard backend (src/clipboard_backend.rs) - macOS is not a CI
+    # target at all (see README.md "Releases" / AGENTS.md "Target
+    # platforms"), so this is never actually built or shipped by anything
+    # this project releases. Linux/FreeBSD moved to wl-clipboard-rs and
+    # Windows to clipboard-win specifically to get off this unmaintained,
+    # unsound dependency (RUSTSEC-2022-0056, RUSTSEC-2025-0051,
+    # RUSTSEC-2020-0097) - macOS keeps the old `clipboard` crate only for
+    # its Cocoa backend, which is unaffected. Revisit this ignore if macOS
+    # ever becomes a real CI/release target.
+    "RUSTSEC-2021-0019",
+]

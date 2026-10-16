@@ -1,4 +1,4 @@
-# clip_gpt
+# clipGPT
 
 A small command-line tool that grabs whatever text is on your clipboard,
 sends it to an OpenAI-compatible LLM API (OpenAI itself, or a local server
@@ -8,7 +8,20 @@ trigger it, and have the rewritten/corrected version replace your clipboard
 contents a moment later. A beep plays when the response is ready (or when an
 error occurs).
 
+**On Linux and FreeBSD, clipGPT is Wayland-only - X11 is not supported.**
+See "Clipboard backend" below for why and what that means in practice.
+
+# THIS IS VIBE CODED GARBAGE, USE ON YOUR OWN RISK
+
+I did not check what is in the code at all, so who knows what it is really doing.
+
 ## Quick start
+
+Prebuilt packages (Linux `.deb`, Windows `.exe`, FreeBSD `.pkg`) for each
+tagged release are available on the
+[GitHub Releases](https://github.com/TheHolm/clipGPT/releases) page - that's
+the easiest way to get a working binary without compiling anything. To build
+from source instead:
 
 1. Build the release binary:
    ```
@@ -46,19 +59,38 @@ profiles within one config file.
 ### Config file location
 
 Default per-OS location of `config.ini`:
-* Linux *"~/.config/clip_gpt/config.ini"*
-* MacOS *"~/Library/Application Support/clip_gpt/config.ini"*
-* Windows *"%APPDATA%\clip_gpt\config.ini"* - %APPDATA% typically resolves to `C:\Users\<username>\AppData\Roaming`.
+* Linux *"~/.config/clipgpt/config.ini"*
+* MacOS *"~/Library/Application Support/clipgpt/config.ini"*
+* Windows *"%APPDATA%\clipgpt\config.ini"* - %APPDATA% typically resolves to `C:\Users\<username>\AppData\Roaming`.
 
 If `config.ini` isn't found at the path above, the current working
 directory is checked too (i.e. `./config.ini`).
+
+## Clipboard backend
+
+Clipboard access is OS-specific:
+
+* **Linux and FreeBSD: Wayland only, via `wl-clipboard-rs`.** X11 is not
+  supported. This was a deliberate choice, not an oversight: the previous
+  backend (`clipboard`/`x11-clipboard`, built on the `xcb` crate) is
+  unmaintained since 2022 and has real, published soundness advisories
+  (e.g. [RUSTSEC-2021-0019](https://rustsec.org/advisories/RUSTSEC-2021-0019)).
+  It's also an increasingly safe bet platform-wise: Ubuntu 25.10 (GNOME 49)
+  already disables the X11 session by default, and Ubuntu 26.04 LTS (GNOME
+  50) - the exact base this project's CI builds its `.deb` packages on -
+  removed Xorg/X11 support entirely. If you're still on an X11-only desktop
+  environment, clipGPT's clipboard access won't work there.
+* **Windows**: `clipboard-win`, called directly.
+* **macOS**: the old cross-platform `clipboard` crate, kept only for its
+  Cocoa backend (the audit issue above was specifically in its X11 backend,
+  not this one) - see the macOS note under "Releases" below.
 
 ## Compiling
 
 ### Linux
 
 ```
-apt install libasound2-dev libxcb-xfixes0-dev libxcb-shape0-dev
+apt install libasound2-dev
 cargo build --release
 ```
 
@@ -83,19 +115,48 @@ docker compose -f docker/docker-compose.yaml up -d
 
 ### Windows (cross-compile from Linux)
 
+x86_64:
 ```
 rustup target add x86_64-pc-windows-gnu
 apt install mingw-w64
 cargo build --target x86_64-pc-windows-gnu --release
 ```
 
-### macOS (cross-compile from Linux)
+aarch64 - needs [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) (classic
+GNU mingw-w64 has no ARM64 Windows support; the real rustc target is
+`aarch64-pc-windows-gnullvm`, not `aarch64-pc-windows-gnu`):
+```
+rustup target add aarch64-pc-windows-gnullvm
+# download and extract an llvm-mingw release, then add its bin/ to PATH
+export CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER=aarch64-w64-mingw32-clang
+export AR_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-ar
+export CC_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-clang
+cargo build --target aarch64-pc-windows-gnullvm --release
+```
 
-```
-cargo install cross --locked
-rustup target add aarch64-apple-darwin
-cross build --target aarch64-apple-darwin --release
-```
+### FreeBSD (cross-compile from Linux)
+
+No FreeBSD host is needed - see `.woodpecker/release.yaml` and `scripts/`
+for the sysroot/dependency-closure approach used in CI (`scripts/ci-freebsd.sh`
+ties it together, calling `scripts/fetch-freebsd-deps.py` and
+`scripts/build-freebsd-pkg.py`).
+
+## Releases
+
+Pushing a tag `vX.Y.Z` matching the version in `Cargo.toml` triggers
+`.woodpecker/release.yaml`, which builds Linux `.deb` (x86_64 and aarch64),
+Windows `.exe` (x86_64 and aarch64) and FreeBSD `.pkg` (x86_64) artifacts and
+publishes them to a GitHub release. See `AGENTS.md` for the versioning and
+tagging convention.
+
+macOS builds aren't produced by CI: cross-compiling for macOS needs Apple's
+SDK, which Apple's license doesn't allow redistributing, so there's no
+Docker image or CI setup that can produce one without you supplying your
+own SDK. That said, clipGPT's dependencies (`clipboard`, `cpal`, `native-tls`)
+all have genuine upstream macOS support, so building it natively on a real
+Mac - just `cargo build --release`, no cross-compiling involved - will very
+likely work too; it's just untested here, since no Mac hardware is available
+in this environment.
 
 ## License
 

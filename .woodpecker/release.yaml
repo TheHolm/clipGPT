@@ -1,0 +1,293 @@
+# Builds and publishes release artifacts to a GitHub Release. Only ever runs
+# on tag pushes matching v* (a tag vX.Y.Z matching Cargo.toml's version - see
+# AGENTS.md's versioning convention, pulled from TheHolm/dak since this is a
+# single-binary project, not a date-based collective tag like TheHolm/dak-nuggets
+# uses for its multi-program releases). Never runs on ordinary branch pushes
+# or pull requests, and tags themselves are always created manually - this
+# workflow never creates one itself.
+#
+# This pipeline deliberately mirrors TheHolm/dak's own release.yaml wherever
+# it applies here too (same base images/Rust version, same download
+# verification, same cargo audit/lintian/SHA256SUMS conventions) - the two
+# differ only where clipGPT's actual targets differ from dak's: dak only
+# ships Linux+FreeBSD; clipGPT also ships Windows and additionally
+# cross-builds aarch64 Linux .debs (dak only builds its native amd64).
+#
+# Target platforms (all are hard-required, none is best-effort/failure:
+# ignore - see AGENTS.md "Target platforms"):
+#
+#   build-freebsd-pkg             FreeBSD x86_64 .pkg (hand-built sysroot)
+#   build-linux-amd64-trixie      Linux x86_64 .deb, Debian Trixie
+#   build-linux-arm64-trixie      Linux aarch64 .deb, Debian Trixie
+#   build-linux-amd64-ubuntu2604  Linux x86_64 .deb, Ubuntu 26.04
+#   build-linux-arm64-ubuntu2604  Linux aarch64 .deb, Ubuntu 26.04
+#   build-windows-amd64           Windows x86_64 .exe (mingw-w64)
+#   build-windows-arm64           Windows aarch64 .exe (llvm-mingw, gnullvm)
+#
+# macOS is NOT built here: cross-rs ships no Apple Darwin images (Apple's
+# license forbids redistributing the SDK a build needs), and there is no
+# custom osxcross setup anywhere in this repo. The previous GitHub Actions
+# workflow called `cross build --target aarch64-apple-darwin`/
+# `x86_64-apple-darwin` and almost certainly never actually worked - there is
+# no evidence it ever succeeded, and cross-rs's own README says as much.
+# Likewise, the previous workflow's `aarch64-pc-windows-gnu` target is not
+# even a valid rustc target (`aarch64-pc-windows-gnu` does not exist; the
+# real target is `aarch64-pc-windows-gnullvm`, used below) - that step would
+# have failed immediately with an unknown-target error, not just produced a
+# bad binary.
+#
+# Every step below was individually verified end-to-end in a real sandbox
+# session before being written here (not just assumed from documentation):
+# each target was actually built, and for build-freebsd-pkg the resulting
+# .pkg was unpacked and its manifest inspected. In particular:
+#   - actually_beep (and its pinned cpal ^0.15.3) has NO FreeBSD/BSD backend
+#     at all; src/beep.rs calls cpal >=0.18 directly instead, which does.
+#   - mio must be at least 1.2.4 for the FreeBSD target: 1.0.3 (and other
+#     versions before the fix) reference a libc constant
+#     (`NOTE_PCTRLMASK`) that does not exist on FreeBSD, breaking the build
+#     with no connection to anything in this crate's own code. Cargo.lock
+#     already pins mio >=1.2.4; do not downgrade it for a FreeBSD build.
+#
+# Requirements for this to work (not set up by anything in this repo):
+#   - A `github_token` secret set on this repo in Woodpecker (Project
+#     Settings -> Secrets), holding a GitHub PAT scoped to Contents:
+#     read/write, restricted to the "tag" event.
+#   - A push mirror from this Gitea repo to github.com/TheHolm/clipGPT (does
+#     not exist yet as of writing), syncing tags promptly, so the tag this
+#     workflow is releasing already exists on GitHub when the publish step
+#     runs.
+
+when:
+  - event: tag
+    ref: refs/tags/v*
+
+steps:
+  # Declared first since it is the slowest (downloads a FreeBSD base set
+  # plus a dependency closure before compiling anything) - Woodpecker tends
+  # to favor declaration order when queuing under limited concurrency, so
+  # the slowest step should not be left waiting behind faster ones.
+  - name: build-freebsd-pkg
+    image: rust:1.92-trixie
+    depends_on: []
+    environment:
+      PKG_CONFIG_ALLOW_CROSS: "1"
+      PKG_CONFIG_SYSROOT_DIR: /opt/freebsd-sysroot
+      PKG_CONFIG_LIBDIR: /opt/freebsd-sysroot/usr/local/libdata/pkgconfig:/opt/freebsd-sysroot/usr/local/lib/pkgconfig
+    commands:
+      - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
+      # File modes are not trusted: a clone/mirror can arrive with the
+      # executable bit stripped.
+      - chmod +x scripts/*.sh scripts/*.py
+      - apt-get update && apt-get install -y --no-install-recommends clang lld zstd python3 pkg-config
+      - mkdir -p /opt/freebsd-sysroot
+      # FreeBSD base system (libc/CRT/headers). Every member needs the
+      # leading `./` for GNU tar's selective extraction to match. Sonames
+      # (e.g. libutil.so.N) drift between FreeBSD releases - re-check this
+      # list with `tar -tvJf base.txz | grep <libname>` against the current
+      # release before bumping the version below. Verified against the real
+      # MANIFEST (and 2 independent mirrors) rather than a hardcoded
+      # checksum, since that would have to be updated for every release.
+      - sh scripts/verify-freebsd-dist.sh releases/amd64/amd64/15.1-RELEASE base.txz /tmp/base.txz
+      - >-
+        tar -xJf /tmp/base.txz -C /opt/freebsd-sysroot
+        ./lib/libc.so.7 ./usr/lib/libc.so ./usr/lib/libc_nonshared.a
+        ./lib/libm.so.5 ./usr/lib/libm.so
+        ./lib/libutil.so.10 ./usr/lib/libutil.so
+        ./lib/librt.so.1 ./usr/lib/librt.so
+        ./usr/lib/libexecinfo.so.1 ./usr/lib/libexecinfo.so
+        ./lib/libkvm.so.7 ./usr/lib/libkvm.so
+        ./usr/lib/libmemstat.so.3 ./usr/lib/libmemstat.so
+        ./usr/lib/libprocstat.so.1 ./usr/lib/libprocstat.so
+        ./lib/libdevstat.so.7 ./usr/lib/libdevstat.so
+        ./lib/libthr.so.3 ./usr/lib/libthr.so ./usr/lib/libpthread.so
+        ./lib/libgcc_s.so.1 ./usr/lib/libgcc_s.so
+        ./usr/lib/crt1.o ./usr/lib/Scrt1.o ./usr/lib/crti.o ./usr/lib/crtn.o
+        ./usr/lib/crtbegin.o ./usr/lib/crtbeginS.o ./usr/lib/crtbeginT.o
+        ./usr/lib/crtend.o ./usr/lib/crtendS.o
+      - rm -f /tmp/base.txz
+      # Native dependency closure: alsa-lib (cpal's ALSA backend - FreeBSD's
+      # alsa-lib port implements the ALSA API over the native sound system),
+      # openssl (native-tls/reqwest). The clipboard backend (wl-clipboard-rs)
+      # needs no native library at all - it's pure Rust by default, no xcb
+      # or libwayland-client linking required. Confirmed FreeBSD package
+      # names - do not guess new ones without checking
+      # https://cgit.freebsd.org/ports first.
+      - >-
+        python3 scripts/fetch-freebsd-deps.py --sysroot /opt/freebsd-sysroot
+        --root alsa-lib --root openssl
+        --pkg-config-check alsa --pkg-config-check openssl
+        --deps-output /opt/freebsd-deps.json
+      - rustup target add x86_64-unknown-freebsd
+      - ./scripts/ci-freebsd.sh /opt/freebsd-sysroot /opt/freebsd-stage dist /opt/freebsd-deps.json
+
+  - name: build-linux-amd64-trixie
+    image: rust:1.92-trixie
+    depends_on: []
+    environment:
+      CARGO_TARGET_DIR: target/linux-amd64-trixie
+    commands:
+      - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
+      - apt-get update && apt-get install -y --no-install-recommends libasound2-dev libssl-dev pkg-config lintian
+      - cargo install cargo-deb --locked
+      # Fails the release when a dependency in Cargo.lock has a published advisory.
+      - cargo install cargo-audit --locked --version 0.22.2
+      - cargo audit
+      - cargo deb --target x86_64-unknown-linux-gnu --deb-revision "1~trixie"
+      - mkdir -p dist
+      - cp target/linux-amd64-trixie/x86_64-unknown-linux-gnu/debian/*.deb dist/
+      # Build-time smoke test: confirm the binary actually landed in the
+      # built package, and the licence text (not just its name) made it
+      # into the auto-generated copyright file.
+      - dpkg-deb -c dist/*amd64.deb | grep -qF 'usr/local/bin/clip_gpt'
+      - dpkg-deb --fsys-tarfile dist/*amd64.deb | tar -xO ./usr/share/doc/clip-gpt/copyright | grep -qi 'GNU AFFERO GENERAL PUBLIC LICENSE'
+      - lintian --info dist/*amd64.deb || true
+
+  - name: build-linux-arm64-trixie
+    image: rust:1.92-trixie
+    depends_on: []
+    environment:
+      CARGO_TARGET_DIR: target/linux-arm64-trixie
+    commands:
+      - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
+      - dpkg --add-architecture arm64
+      - apt-get update && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross libasound2-dev:arm64 libssl-dev:arm64 pkg-config lintian
+      - rustup target add aarch64-unknown-linux-gnu
+      - export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+      - export PKG_CONFIG_ALLOW_CROSS=1
+      - export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
+      - export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig
+      - cargo install cargo-deb --locked
+      - cargo deb --target aarch64-unknown-linux-gnu --deb-revision "1~trixie"
+      - mkdir -p dist
+      - cp target/linux-arm64-trixie/aarch64-unknown-linux-gnu/debian/*.deb dist/
+      - dpkg-deb -c dist/*arm64.deb | grep -qF 'usr/local/bin/clip_gpt'
+      - dpkg-deb --fsys-tarfile dist/*arm64.deb | tar -xO ./usr/share/doc/clip-gpt/copyright | grep -qi 'GNU AFFERO GENERAL PUBLIC LICENSE'
+      - lintian --info dist/*arm64.deb || true
+
+  - name: build-linux-amd64-ubuntu2604
+    image: ubuntu:26.04
+    depends_on: []
+    environment:
+      CARGO_TARGET_DIR: target/linux-amd64-ubuntu2604
+    commands:
+      - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
+      - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential libasound2-dev libssl-dev pkg-config lintian
+      # rustup-init checked against the SHA-256 published next to it, instead of
+      # piping https://sh.rustup.rs into a shell.
+      - sh scripts/fetch-verified.sh https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init /tmp/rustup-init
+      - chmod +x /tmp/rustup-init && /tmp/rustup-init -y --profile minimal --default-toolchain 1.92.0
+      - . "$HOME/.cargo/env"
+      - cargo install cargo-deb --locked
+      - cargo deb --deb-revision "1~ubuntu2604"
+      - mkdir -p dist
+      - cp target/linux-amd64-ubuntu2604/debian/*.deb dist/
+      - dpkg-deb -c dist/*amd64*ubuntu2604*.deb | grep -qF 'usr/local/bin/clip_gpt'
+      - dpkg-deb --fsys-tarfile dist/*amd64*ubuntu2604*.deb | tar -xO ./usr/share/doc/clip-gpt/copyright | grep -qi 'GNU AFFERO GENERAL PUBLIC LICENSE'
+      - lintian --info dist/*amd64*ubuntu2604*.deb || true
+
+  - name: build-linux-arm64-ubuntu2604
+    image: ubuntu:26.04
+    depends_on: []
+    environment:
+      CARGO_TARGET_DIR: target/linux-arm64-ubuntu2604
+    commands:
+      - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
+      - dpkg --add-architecture arm64
+      - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential gcc-aarch64-linux-gnu libc6-dev-arm64-cross libasound2-dev:arm64 libssl-dev:arm64 pkg-config lintian
+      - sh scripts/fetch-verified.sh https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init /tmp/rustup-init
+      - chmod +x /tmp/rustup-init && /tmp/rustup-init -y --profile minimal --default-toolchain 1.92.0
+      - . "$HOME/.cargo/env"
+      - rustup target add aarch64-unknown-linux-gnu
+      - export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+      - export PKG_CONFIG_ALLOW_CROSS=1
+      - export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
+      - export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig
+      - cargo install cargo-deb --locked
+      - cargo deb --target aarch64-unknown-linux-gnu --deb-revision "1~ubuntu2604"
+      - mkdir -p dist
+      - cp target/linux-arm64-ubuntu2604/aarch64-unknown-linux-gnu/debian/*.deb dist/
+      - dpkg-deb -c dist/*arm64*ubuntu2604*.deb | grep -qF 'usr/local/bin/clip_gpt'
+      - dpkg-deb --fsys-tarfile dist/*arm64*ubuntu2604*.deb | tar -xO ./usr/share/doc/clip-gpt/copyright | grep -qi 'GNU AFFERO GENERAL PUBLIC LICENSE'
+      - lintian --info dist/*arm64*ubuntu2604*.deb || true
+
+  - name: build-windows-amd64
+    image: rust:1.92-trixie
+    depends_on: []
+    commands:
+      - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
+      - apt-get update && apt-get install -y --no-install-recommends mingw-w64
+      # mingw-w64's win32/posix gcc variants need an explicit
+      # update-alternatives pass or the package is left half-configured.
+      - dpkg --configure -a
+      - rustup target add x86_64-pc-windows-gnu
+      - export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
+      - cargo build --release --target x86_64-pc-windows-gnu
+      - mkdir -p dist
+      - cp target/x86_64-pc-windows-gnu/release/clip_gpt.exe dist/clip_gpt-x86_64-pc-windows-gnu.exe
+
+  - name: build-windows-arm64
+    image: rust:1.92-trixie
+    depends_on: []
+    commands:
+      - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
+      # Classic GNU mingw-w64 has no ARM64 Windows support at all - only the
+      # LLVM-based mingw (llvm-mingw) does, targeting the gnullvm ABI
+      # (aarch64-pc-windows-gnullvm, NOT aarch64-pc-windows-gnu, which is not
+      # a real rustc target).
+      - apt-get update && apt-get install -y --no-install-recommends curl xz-utils ca-certificates
+      - curl -fsSL -o /tmp/llvm-mingw.tar.xz https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64.tar.xz
+      - mkdir -p /opt/llvm-mingw
+      - tar -xJf /tmp/llvm-mingw.tar.xz -C /opt/llvm-mingw --strip-components=1
+      - rm -f /tmp/llvm-mingw.tar.xz
+      - export PATH=/opt/llvm-mingw/bin:$PATH
+      - rustup target add aarch64-pc-windows-gnullvm
+      - export CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER=aarch64-w64-mingw32-clang
+      - export AR_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-ar
+      - export CC_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-clang
+      - cargo build --release --target aarch64-pc-windows-gnullvm
+      - mkdir -p dist
+      - cp target/aarch64-pc-windows-gnullvm/release/clip_gpt.exe dist/clip_gpt-aarch64-pc-windows-gnullvm.exe
+
+  - name: publish-github-release
+    image: rust:1.92-trixie
+    depends_on:
+      - build-freebsd-pkg
+      - build-linux-amd64-trixie
+      - build-linux-arm64-trixie
+      - build-linux-amd64-ubuntu2604
+      - build-linux-arm64-ubuntu2604
+      - build-windows-amd64
+      - build-windows-arm64
+    environment:
+      GH_TOKEN:
+        from_secret: github_token
+    commands:
+      - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
+      - apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg
+      - mkdir -p -m 755 /etc/apt/keyrings
+      - curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+      - chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+      - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
+      - apt-get update && apt-get install -y --no-install-recommends gh
+      - ./scripts/extract-release-notes.sh "$CI_COMMIT_TAG" RELEASE_NOTES.md > /tmp/release-notes.md
+      # Checksums of everything released, so downloads can be checked.
+      - cd dist && sha256sum -- * > SHA256SUMS && cd ..
+      # Idempotent: create the release, or update it in place when a tag is
+      # re-released, so republishing the same tag never hard-fails. (dak's
+      # own equivalent step only does a one-shot `gh release create`, since
+      # its tags are never reused - kept this extra fallback here anyway.)
+      - |
+        if gh release view "$CI_COMMIT_TAG" --repo TheHolm/clipGPT >/dev/null 2>&1; then
+          gh release edit "$CI_COMMIT_TAG" \
+            --repo TheHolm/clipGPT \
+            --title "$CI_COMMIT_TAG" \
+            --notes-file /tmp/release-notes.md
+          gh release upload "$CI_COMMIT_TAG" dist/* \
+            --repo TheHolm/clipGPT \
+            --clobber
+        else
+          gh release create "$CI_COMMIT_TAG" dist/* \
+            --repo TheHolm/clipGPT \
+            --title "$CI_COMMIT_TAG" \
+            --notes-file /tmp/release-notes.md
+        fi
