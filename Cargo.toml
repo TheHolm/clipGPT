@@ -2,6 +2,7 @@
 name = "clip_gpt"
 version = "0.1.0"
 authors = [ "TheHolm" ]
+license = "AGPL-3.0-or-later"
 rust-version = "1.80"
 edition = "2021"
 # default-run = "clipGPT"
