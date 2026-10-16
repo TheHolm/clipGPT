@@ -1,0 +1,65 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install cross for cross-compilation
+        run: cargo install cross --locked
+
+      - name: Build Debian packages (x86_64 and ARM)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cargo-deb
+          cross build --target x86_64-unknown-linux-gnu --release
+          cross build --target aarch64-unknown-linux-gnu --release
+
+      - name: Build Windows binaries (x86_64 and ARM)
+        run: |
+          cross build --target x86_64-pc-windows-gnu --release
+          cross build --target aarch64-pc-windows-gnu --release
+
+      - name: Build macOS binaries (x86_64 and ARM)
+        run: |
+          cross build --target aarch64-apple-darwin --release
+          cross build --target x86_64-apple-darwin --release
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: releases
+          path: |
+            target/x86_64-unknown-linux-gnu/release/*
+            target/aarch64-unknown-linux-gnu/release/*
+            target/x86_64-pc-windows-gnu/release/*.exe
+            target/aarch64-pc-windows-gnu/release/*.exe
+            target/aarch64-apple-darwin/release/*
+            target/x86_64-apple-darwin/release/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: releases
+
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: releases
+          token: ${{ secrets.GITHUB_TOKEN }}

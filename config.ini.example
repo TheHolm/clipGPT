@@ -1,0 +1,32 @@
+[openai]
+# Only "OpenAI" is supported for now (works with Ollama's OpenAI-compatible
+# API too).
+api_type=OpenAI
+
+# OpenAI's real endpoint, or point this at a local Ollama server, e.g.:
+# api_url=http://127.0.0.1:11434/v1/chat/completions
+api_url=https://api.openai.com/v1/chat/completions
+
+# Required. Must be provided via this file or the (not yet implemented) -k
+# command line option.
+api_key=sk-your-key-here
+
+# Required. The model name your api_url/api_key combination serves,
+# e.g. gpt-4o-mini for OpenAI, or a local model name for Ollama.
+model=gpt-4o-mini
+
+# Prompt used when the clipboard contains text.
+prompt_text=Check spelling and gramma and rewrite following text on pirate speak. Be mean and pushy \n\n
+
+# Prompt used when the clipboard contains an image (not implemented yet).
+prompt_image=OCR attached image and return text formatted as markdown
+
+# Frequency in Hz, played when a response is received and pasted to the
+# clipboard, approx. C6.
+beep_tone=1046
+
+# Frequency in Hz, played when an error occurs, approx. C3.
+error_tone=131
+
+# Duration in ms for the success/error beeps (set to 0 to disable).
+beep_duration=250

@@ -1,0 +1,11 @@
+services:
+  rust:
+   #  image: rust:1.80.0-bookworm
+    build: . 
+    container_name: rust-180               # keeps the same name as the `docker run --name`
+    volumes:
+      - "../:/code"
+    tty: true                           # allocate a pseudo‑Tty (like -t)
+    stdin_open: true                    # keep STDIN open (like -i)
+    # optional: start a shell instead of the default CMD
+    # command: /bin/bash

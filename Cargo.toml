@@ -1,0 +1,27 @@
+[package]
+name = "clip_gpt"
+version = "0.1.0"
+authors = [ "TheHolm" ]
+rust-version = "1.80"
+edition = "2021"
+# default-run = "clipGPT"
+
+[dependencies]
+reqwest = { version = "0.11", features = ["blocking", "json"] }
+clipboard = "0.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+actually_beep = "0.1"
+pretty_ini = "0.1"
+native-tls = "0.2.13"
+
+[package.metadata.deb]
+maintainer = "TheHolm"
+copyright = ""
+extended-description = """Interact with LLM via clipboard"""
+depends = "$auto"
+section = "utility"
+priority = "optional"
+assets = [
+ ["target/release/clip_gpt", "usr/local/bin/", "755"],
+]

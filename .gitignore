@@ -1,0 +1,6 @@
+target
+config.ini
+execute.sh
+*.swp
+*.swo
+*~
