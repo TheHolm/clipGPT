@@ -11,15 +11,23 @@ use cpal::{FromSample, Sample, SizedSample};
 use std::time::Duration;
 
 /// Play a sine wave tone at `hertz` for `millis` milliseconds on the
-/// default output device, blocking until playback finishes.
-pub fn beep_with_hz_and_millis(hertz: u32, millis: u32) -> Result<(), cpal::Error> {
+/// default output device, blocking until playback finishes. A duration of
+/// 0 plays nothing (and does not touch the audio device at all). Missing
+/// audio devices and unsupported formats are returned as errors, never
+/// panics.
+pub fn beep_with_hz_and_millis(hertz: u32, millis: u32) -> Result<(), String> {
+    if millis == 0 {
+        return Ok(());
+    }
     let host = cpal::default_host();
     let device = host
         .default_output_device()
-        .expect("no output device available");
-    let config = device.default_output_config()?;
+        .ok_or_else(|| "no audio output device available".to_string())?;
+    let config = device
+        .default_output_config()
+        .map_err(|e| format!("audio output config: {e}"))?;
 
-    match config.sample_format() {
+    let result = match config.sample_format() {
         cpal::SampleFormat::I8 => run::<i8>(&device, &config.into(), hertz, millis),
         cpal::SampleFormat::I16 => run::<i16>(&device, &config.into(), hertz, millis),
         cpal::SampleFormat::I32 => run::<i32>(&device, &config.into(), hertz, millis),
@@ -30,8 +38,9 @@ pub fn beep_with_hz_and_millis(hertz: u32, millis: u32) -> Result<(), cpal::Erro
         cpal::SampleFormat::U64 => run::<u64>(&device, &config.into(), hertz, millis),
         cpal::SampleFormat::F32 => run::<f32>(&device, &config.into(), hertz, millis),
         cpal::SampleFormat::F64 => run::<f64>(&device, &config.into(), hertz, millis),
-        sample_format => panic!("unsupported sample format: {sample_format}"),
-    }
+        sample_format => return Err(format!("unsupported sample format: {sample_format}")),
+    };
+    result.map_err(|e| format!("audio playback: {e}"))
 }
 
 /// Build and play the actual output stream for one concrete sample type.
@@ -80,5 +89,28 @@ where
         for sample in frame.iter_mut() {
             *sample = value;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_duration_is_silent_and_ok() {
+        // Must not touch audio at all, so it works on headless CI.
+        assert_eq!(beep_with_hz_and_millis(440, 0), Ok(()));
+    }
+
+    #[test]
+    fn write_data_fills_all_channels() {
+        let mut out = [0.0f32; 6];
+        let mut n = 0.0;
+        let mut next = || {
+            n += 0.25;
+            n
+        };
+        write_data(&mut out, 2, &mut next);
+        assert_eq!(out, [0.25, 0.25, 0.5, 0.5, 0.75, 0.75]);
     }
 }

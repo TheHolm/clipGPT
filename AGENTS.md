@@ -49,8 +49,10 @@ Mac hardware is available to this project's CI.
 ## Layout
 
 - `src/` - the binary (`main.rs`), config loading (`configfile.rs`), beep
-  tone generation (`beep.rs`), and per-OS clipboard access
-  (`clipboard_backend.rs`)
+  tone generation (`beep.rs`), per-OS clipboard access and password-marker
+  detection (`clipboard_backend.rs`), HTTP transport checks (`net.rs`),
+  input/output cleaning (`sanitize.rs`), secret-pattern detection
+  (`secrets.rs`) and command-line parsing (`cli.rs`)
 - `config.ini.example` - the config template users copy and fill in
 - `docker/` - a Dockerfile/compose setup for building in a clean container
   (build-only; clipboard/audio access isn't available from inside it)
@@ -124,10 +126,7 @@ changes, or CI/tooling changes that don't alter packaged output.
 - Every function is documented with a `///` doc comment describing its
   purpose and any non-obvious behavior
 - All new code must be covered by tests; never add production code without
-  accompanying tests. **Note:** this codebase has no test suite yet -
-  building one out is tracked as follow-up work (next stage), not something
-  retroactively required of the existing code - but it applies to anything
-  new from here on
+  accompanying tests (`cargo test`; unit tests live in each module)
 - Commits include a detailed description of what changed and why
 - **Never commit changes unless the user explicitly asks to commit**
 - **Never create or push a git tag unless the user explicitly asks** - a tag

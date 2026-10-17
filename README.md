@@ -29,9 +29,11 @@ from source instead:
    ```
    The binary will be at `target/release/clip_gpt`.
 
-2. Copy `config.ini.example` to `config.ini` and fill in `api_key` and
-   `model` (both required - see the configuration table below). Place it at
-   one of the locations listed under "Config file location" below.
+2. Copy `config.ini.example` to `config.ini` and fill in `model`
+   (required) and `api_key` (if your server needs one - a local Ollama
+   doesn't). Place it at one of the locations listed under "Config file
+   location" below. If it contains an `api_key`, make it private:
+   `chmod 600 config.ini` (see "Security" below).
 
 3. Run `target/release/clip_gpt`. It copies whatever text is currently on
    the clipboard, sends it to the configured LLM, and replaces the clipboard
@@ -43,14 +45,20 @@ from source instead:
 | config file | command line | default value | type | comment |
 | --- |  --- |  --- |  --- | --- |
 | api_type |  | OpenAI | str | Only OpenAI is currently supported (works with Ollama too, since it exposes an OpenAI-compatible API) |
-| api_url |  | https://api.openai.com/v1/chat/completions | str | |
-| api_key | -k *(not yet implemented)* |  | str | Required. Must be provided via config file |
+| api_url |  | https://api.openai.com/v1/chat/completions | str | http or https only; plain http to another computer prints a warning (see "Security") |
+| api_key | -k *(not yet implemented)* |  | str | Optional. Empty or missing means no key is sent (e.g. local Ollama). If set, the config file must be mode 600 on Unix |
 | model |  |  | str | Required. Model name sent to api_url, e.g. gpt-4o-mini for OpenAI, or a local model name for Ollama |
-| prompt_text | -t *(not yet implemented)* | "Check spelling and gramma and rewrite following text on pirate speak. Be mean and pushy \n\n" | str | prompt used if clipboard contains text |
+| prompt_text | -t *(not yet implemented)* | "Check spelling and gramma and rewrite following text on pirate speak. Be mean and pushy \n\n" | str | prompt used if clipboard contains text (sent as the system message, the clipboard text as a separate user message) |
 | prompt_image | -i *(not yet implemented)* | "OCR attached image and return text formatted as markdown" | str | prompt used if clipboard contains an image (not implemented) |
 | beep_tone |  | 1046 | int | frequency in Hz, played when response is received and pasted to clipboard, approx. C6 |
-| error_tone |   | 131  | int  | frequency in Hz, played when error occurs, approx. C3 (not yet wired up) |
+| error_tone |   | 131  | int  | frequency in Hz, played when an error occurs or a password was found on the clipboard, approx. C3 |
 | beep_duration |  | 250 | int | duration in ms, for error and success beeps (set to 0 to disable) |
+| max_input_bytes |  | 65536 | int | largest clipboard text (UTF-8 bytes) sent to the LLM; bigger clipboards are refused |
+| allow_redirects |  | false | bool | follow HTTP redirects from api_url (true/false, yes/no, 1/0, on/off) |
+| secret_check | -s / --no-secret-check (turns it off) | true | bool | refuse clipboard text that looks like an API key, token, private key or URL with a password (see "Security") |
+
+Command line options: `-s`/`--no-secret-check` skips the secret check for
+one run; `-h`/`--help` prints usage. Any other argument is an error.
 
 The following are planned but **not yet implemented**: the `-c`/`-k`/`-t`/`-i`
 command line options, and a `name`/`include` system for multiple named
@@ -65,6 +73,69 @@ Default per-OS location of `config.ini`:
 
 If `config.ini` isn't found at the path above, the current working
 directory is checked too (i.e. `./config.ini`).
+
+## Security
+
+clipGPT sends your clipboard to a remote service and puts untrusted model
+output back where you will paste it, so it applies these protections:
+
+* **Passwords are never sent.** If a password manager marked the clipboard
+  contents as secret, clipGPT doesn't read them, replaces the clipboard with
+  `[clipGPT] Clipboard held a password - not sent to the LLM.`, plays the
+  error tone and makes no request. Detected markers: Wayland
+  `x-kde-passwordManagerHint` (KeePassXC, KDE and others); Windows
+  `ExcludeClipboardContentFromMonitorProcessing`, `Clipboard Viewer Ignore`,
+  or `CanIncludeInClipboardHistory` = 0. **macOS: not detected.** A password
+  manager that sets no marker can't be detected either.
+* **Hidden prompt injection is refused.** Clipboard text containing
+  Unicode tag characters (U+E0000-U+E007F - invisible, but read by LLMs)
+  is treated as an attack: the clipboard is replaced with a notice, the
+  error tone plays, nothing is sent. This check can't be turned off. The
+  England/Scotland/Wales flag emoji use these characters and are refused
+  too.
+* **Clipboard text is cleaned before it is sent**, the same way as the
+  response below (control, bidirectional-override, zero-width and BOM
+  characters removed). Always on.
+* **Secrets are not sent.** The cleaned text is scanned for API keys and
+  tokens: private keys (PEM, age), OpenAI, Anthropic, OpenRouter, Groq, xAI,
+  Hugging Face, Replicate, Perplexity, AWS, Google, Azure, DigitalOcean,
+  Databricks, Vault, Doppler, GitHub, GitLab, npm, PyPI, Slack, Stripe,
+  SendGrid, Shopify, Atlassian, Linear, Notion, Twilio, Mailgun, Mailchimp,
+  Postman, Grafana, Sentry, Square, Telegram, Discord, JSON Web Tokens, and
+  URLs with a password (a `user:password@` part after the scheme). On a
+  match the error tone plays, nothing is sent and **the clipboard is left
+  untouched**; stderr names only the kind of secret. Turn it off for one run with
+  `-s`/`--no-secret-check`, or permanently with `secret_check=false`.
+  Placeholder connection strings in documentation (a URL with any
+  username and password, even made-up ones) match too.
+* **Prompt and clipboard are kept apart.** `prompt_text` goes in the system
+  message (with a note to treat the user message as data); the clipboard
+  text is the user message on its own. This makes prompt injection by
+  clipboard text harder, not impossible.
+* **The response is cleaned before it is pasted.** Control characters
+  (except newline and tab - this removes terminal escape sequences),
+  bidirectional-override characters, zero-width characters, the BOM and
+  Unicode tag characters are removed; line endings become `\n`. Emoji built
+  with zero-width joiners fall apart into their parts as a side effect. The
+  model can still write plausible but harmful plain text - read what you
+  paste into a terminal.
+* **Transport.** Only `http`/`https` URLs are accepted. Plain `http` to
+  loopback or to one of this computer's own addresses (e.g. its LAN IP) is
+  silent; to any other host it works but prints a warning on stderr, since
+  the key and text travel unencrypted. Redirects are refused unless
+  `allow_redirects=true`; then each hop is checked the same way (at most 10).
+  When a redirect changes host the API key is dropped, but a 307/308
+  redirect does re-send the clipboard text to the new host.
+* **Limits.** Clipboard text over `max_input_bytes` is refused; responses
+  over 1 MiB are discarded.
+* **No content in logs.** Error messages contain only HTTP status codes and
+  error kinds - never the response body, which can echo your text back.
+* **Key file permissions.** On Linux/FreeBSD/macOS, if `config.ini` holds an
+  `api_key` and other users can access it (mode wider than `0600`),
+  clipGPT refuses to run and prints the `chmod 600` command to fix it.
+  Windows is not checked (`%APPDATA%` is per-user).
+
+Every failure plays `error_tone` and exits with status 1.
 
 ## Clipboard backend
 
