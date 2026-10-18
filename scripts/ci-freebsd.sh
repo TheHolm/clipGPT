@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cross-compile clip_gpt for FreeBSD and build a .pkg from it, using a
 # sysroot assembled by the caller (base.txz libc/CRT files plus the
-# alsa-lib/openssl/libxcb native dependency closure fetched by
+# alsa-lib/openssl native dependency closure fetched by
 # fetch-freebsd-deps.py - see .woodpecker/release.yaml for how the sysroot
 # at $1 is put together before this script runs).
 #

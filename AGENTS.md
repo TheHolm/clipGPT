@@ -32,9 +32,11 @@ framework - keep that in mind before reaching for something heavier.
 Linux, Windows, and FreeBSD are first-class, hard-required CI targets; none
 is best-effort. A change that would silently drop one of them (e.g. picking
 a dependency with no FreeBSD backend) needs to be caught before merging, not
-discovered later in CI. Clipboard access is Wayland-only on Linux/FreeBSD
-(via `wl-clipboard-rs`) - X11 is deliberately not supported, see README.md
-"Clipboard backend" for why. Audio is directly on `cpal` - verify both the
+discovered later in CI. Clipboard access on Linux/FreeBSD is Wayland first
+(via `wl-clipboard-rs`, needs the data-control protocol), with an X11
+fallback (via pure-Rust `x11rb`) for GNOME/Mutter, which lacks that protocol,
+and for pure X11 sessions - see README.md "Clipboard backend". Never bring
+back the `xcb` crate (unmaintained, unsound). Audio is directly on `cpal` - verify both the
 clipboard and audio backends still support a target before bumping either
 dependency.
 
@@ -50,7 +52,8 @@ Mac hardware is available to this project's CI.
 
 - `src/` - the binary (`main.rs`), config loading (`configfile.rs`), beep
   tone generation (`beep.rs`), per-OS clipboard access and password-marker
-  detection (`clipboard_backend.rs`), HTTP transport checks (`net.rs`),
+  detection (`clipboard_backend.rs`, with the X11 fallback and its
+  background clipboard-owner helper in `clipboard_backend/x11.rs`), HTTP transport checks (`net.rs`),
   input/output cleaning (`sanitize.rs`), secret-pattern detection
   (`secrets.rs`) and command-line parsing (`cli.rs`)
 - `config.ini.example` - the config template users copy and fill in

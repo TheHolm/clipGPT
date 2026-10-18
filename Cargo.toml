@@ -1,6 +1,6 @@
 [package]
 name = "clip_gpt"
-version = "0.3.0"
+version = "0.3.1"
 authors = [ "TheHolm" ]
 license = "AGPL-3.0-or-later"
 rust-version = "1.92"
@@ -17,16 +17,18 @@ cpal = "0.18"
 regex = "1.12"
 
 # Clipboard access is OS-specific: Linux/FreeBSD use wl-clipboard-rs
-# (Wayland only - the old `clipboard`/`x11-clipboard` crates pulled in
-# xcb 0.8.2, unmaintained since 2022 with real soundness advisories
-# (RUSTSEC-2021-0019); X11 desktops are no longer supported as a result,
-# by choice). Windows keeps the same underlying backend the old
+# (Wayland data-control) first and x11rb (X11/Xwayland) as fallback, e.g.
+# on GNOME, whose compositor has no data-control protocol. x11rb is pure
+# Rust with no native library; unlike the old `clipboard`/`x11-clipboard`
+# crates it does not pull in xcb 0.8.2, unmaintained since 2022 with real
+# soundness advisories (RUSTSEC-2021-0019). Windows keeps the same underlying backend the old
 # cross-platform `clipboard` crate used there (clipboard-win), just called
 # directly instead of through that abstraction. macOS keeps the old
 # `clipboard` crate purely for its Cocoa backend, since the audit problem
 # was specifically in its X11 backend, not here.
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 wl-clipboard-rs = "0.9"
+x11rb = "0.14"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 clipboard-win = "5.4"

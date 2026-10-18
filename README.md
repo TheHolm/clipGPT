@@ -8,8 +8,9 @@ trigger it, and have the rewritten/corrected version replace your clipboard
 contents a moment later. A beep plays when the response is ready (or when an
 error occurs).
 
-**On Linux and FreeBSD, clipGPT is Wayland-only - X11 is not supported.**
-See "Clipboard backend" below for why and what that means in practice.
+**On Linux and FreeBSD, clipGPT prefers Wayland and falls back to X11**
+(needed on GNOME, whose compositor doesn't offer the Wayland clipboard
+protocol clipGPT uses). See "Clipboard backend" below for details.
 
 # THIS IS VIBE CODED GARBAGE, USE ON YOUR OWN RISK
 
@@ -82,7 +83,7 @@ output back where you will paste it, so it applies these protections:
 * **Passwords are never sent.** If a password manager marked the clipboard
   contents as secret, clipGPT doesn't read them, replaces the clipboard with
   `[clipGPT] Clipboard held a password - not sent to the LLM.`, plays the
-  error tone and makes no request. Detected markers: Wayland
+  error tone and makes no request. Detected markers: Wayland and X11
   `x-kde-passwordManagerHint` (KeePassXC, KDE and others); Windows
   `ExcludeClipboardContentFromMonitorProcessing`, `Clipboard Viewer Ignore`,
   or `CanIncludeInClipboardHistory` = 0. **macOS: not detected.** A password
@@ -141,16 +142,32 @@ Every failure plays `error_tone` and exits with status 1.
 
 Clipboard access is OS-specific:
 
-* **Linux and FreeBSD: Wayland only, via `wl-clipboard-rs`.** X11 is not
-  supported. This was a deliberate choice, not an oversight: the previous
-  backend (`clipboard`/`x11-clipboard`, built on the `xcb` crate) is
-  unmaintained since 2022 and has real, published soundness advisories
-  (e.g. [RUSTSEC-2021-0019](https://rustsec.org/advisories/RUSTSEC-2021-0019)).
-  It's also an increasingly safe bet platform-wise: Ubuntu 25.10 (GNOME 49)
-  already disables the X11 session by default, and Ubuntu 26.04 LTS (GNOME
-  50) - the exact base this project's CI builds its `.deb` packages on -
-  removed Xorg/X11 support entirely. If you're still on an X11-only desktop
-  environment, clipGPT's clipboard access won't work there.
+* **Linux and FreeBSD: Wayland first, X11 as fallback.**
+  * **Wayland**, via `wl-clipboard-rs`, is used whenever the compositor
+    supports the `ext-data-control` or `wlr-data-control` protocol (KDE
+    Plasma, Sway, Hyprland and most other wlroots-based compositors). A
+    tool without a window of its own can only reach the Wayland clipboard
+    through these protocols.
+  * **X11**, via `x11rb`, is used when Wayland clipboard access isn't
+    available and `DISPLAY` is set:
+    * **GNOME** (Mutter) implements neither data-control protocol, so
+      clipGPT goes through Xwayland there. GNOME keeps the Xwayland and
+      Wayland clipboards in sync, so this is the same clipboard.
+    * **Pure X11 sessions** work the same way.
+  * On X11 the clipboard holds no data itself: the program that copied
+    something must keep running to hand it out. So after writing the
+    response, clipGPT leaves a small background copy of itself (`clip_gpt
+    --x11-clipboard-owner`) running. It exits as soon as anything else is
+    copied. Don't run that option yourself; it's internal.
+  * `x11rb` is maintained and pure Rust: no libxcb, and in the default
+    configuration used here it is compiled with `forbid(unsafe_code)`. It
+    is unrelated to the `clipboard`/`x11-clipboard`
+    crates this project used before, which were built on the `xcb` crate:
+    unmaintained since 2022, with real, published soundness advisories
+    (e.g. [RUSTSEC-2021-0019](https://rustsec.org/advisories/RUSTSEC-2021-0019)).
+    That's why the old backend was dropped.
+  * If neither works, the error names both reasons (e.g. "Wayland: ...;
+    X11: ...").
 * **Windows**: `clipboard-win`, called directly.
 * **macOS**: the old cross-platform `clipboard` crate, kept only for its
   Cocoa backend (the audit issue above was specifically in its X11 backend,
@@ -171,6 +188,14 @@ To build a `.deb` package instead, see this
 ```
 cargo install cargo-deb
 cargo deb
+```
+
+The X11 clipboard tests need a real X server, so `cargo test` skips them
+by default. To run them headless:
+
+```
+apt install xvfb xauth
+xvfb-run -a cargo test -- --ignored
 ```
 
 ### Docker (build environment only)

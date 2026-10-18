@@ -107,9 +107,10 @@ steps:
       - rm -f /tmp/base.txz
       # Native dependency closure: alsa-lib (cpal's ALSA backend - FreeBSD's
       # alsa-lib port implements the ALSA API over the native sound system),
-      # openssl (native-tls/reqwest). The clipboard backend (wl-clipboard-rs)
-      # needs no native library at all - it's pure Rust by default, no xcb
-      # or libwayland-client linking required. Confirmed FreeBSD package
+      # openssl (native-tls/reqwest). The clipboard backends (wl-clipboard-rs
+      # and its x11rb fallback) need no native library at all - both are
+      # pure Rust by default, no libxcb or libwayland-client linking
+      # required. Confirmed FreeBSD package
       # names - do not guess new ones without checking
       # https://cgit.freebsd.org/ports first.
       - >-
