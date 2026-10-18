@@ -100,13 +100,16 @@ enum Outcome {
 
 /// Entry point: parse the command line, load the config, run once, and
 /// signal the result with a beep. Every failure or refusal - including an
-/// unexpected panic - plays the error tone and exits with status 1.
+/// unexpected panic - plays the error tone and exits with status 1. The
+/// hidden X11 clipboard owner mode runs before (and without) the config and
+/// never beeps; it reports to the clipGPT run that started it instead.
 fn main() {
     let options = match cli::parse(std::env::args().skip(1)) {
         Ok(cli::Command::Help) => {
             println!("{}", cli::USAGE);
             return;
         }
+        Ok(cli::Command::ClipboardOwner) => std::process::exit(clipboard_backend::serve_owner()),
         Ok(cli::Command::Run(options)) => options,
         Err(e) => fail(
             &e,

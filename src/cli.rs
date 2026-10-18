@@ -15,6 +15,11 @@ Options:
                          still apply)
   -h, --help             Print this help and exit";
 
+/// Hidden argument that runs clipGPT as the background X11 clipboard owner
+/// (see `clipboard_backend`'s `x11` module). Deliberately not in [`USAGE`]:
+/// it is only meant to be passed by clipGPT itself.
+pub const OWNER_HELPER_ARG: &str = "--x11-clipboard-owner";
+
 /// Parsed command-line options.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Options {
@@ -29,16 +34,25 @@ pub enum Command {
     Run(Options),
     /// Print [`USAGE`] and exit successfully.
     Help,
+    /// Serve the X11 clipboard ([`OWNER_HELPER_ARG`], must be the only
+    /// argument).
+    ClipboardOwner,
 }
 
 /// Parse the arguments after the program name. Unknown arguments are an
 /// error naming the argument, so a mistyped flag never silently does
-/// nothing.
+/// nothing. [`OWNER_HELPER_ARG`] is only recognised on its own.
 pub fn parse<I, S>(args: I) -> Result<Command, String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    let args: Vec<S> = args.into_iter().collect();
+    if let [only] = args.as_slice() {
+        if only.as_ref() == OWNER_HELPER_ARG {
+            return Ok(Command::ClipboardOwner);
+        }
+    }
     let mut options = Options::default();
     for arg in args {
         match arg.as_ref() {
@@ -86,6 +100,14 @@ mod tests {
         assert!(err.contains("Usage:"));
         assert!(parse(["-x"]).is_err());
         assert!(parse(["extra"]).is_err());
+    }
+
+    #[test]
+    fn owner_helper_only_alone_and_hidden() {
+        assert_eq!(parse([OWNER_HELPER_ARG]), Ok(Command::ClipboardOwner));
+        assert!(parse(["-s", OWNER_HELPER_ARG]).is_err());
+        assert!(parse([OWNER_HELPER_ARG, "-s"]).is_err());
+        assert!(!USAGE.contains(OWNER_HELPER_ARG));
     }
 
     #[test]

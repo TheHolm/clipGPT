@@ -3,6 +3,86 @@
 This file lists user-facing changes for each tagged release. See `AGENTS.md`
 for the versioning and tagging convention.
 
+## v0.3.1 - Clipboard works on GNOME (and X11) again
+
+User-facing changes:
+
+- **Fixed: clipGPT failed on GNOME** (e.g. Debian trixie, Ubuntu) with
+  "A required Wayland protocol (ext-data-control, or wlr-data-control
+  version 1) is not supported by the compositor". GNOME doesn't offer that
+  protocol, so clipGPT now falls back to the X11 clipboard (through
+  Xwayland), which GNOME keeps in sync with the Wayland one. Compositors
+  that do support the protocol (KDE Plasma, Sway, Hyprland, ...) keep
+  using Wayland directly.
+- **Pure X11 sessions are supported again** through the same fallback.
+- Password-manager detection (`x-kde-passwordManagerHint`) works on the
+  X11 path too.
+- On X11, a small background `clip_gpt --x11-clipboard-owner` process
+  stays running after each run to keep the response on the clipboard. It
+  exits as soon as something else is copied.
+- If no clipboard is reachable at all, the error message now gives the
+  reason for both Wayland and X11.
+
+### Details
+
+- New dependency `x11rb` 0.14 (Linux/FreeBSD only), using its pure-Rust
+  `RustConnection`: no libxcb, no new native library, so neither the
+  `.deb` dependencies nor the FreeBSD sysroot/dependency closure change.
+  It does not pull in the `xcb` crate (still only reachable from the
+  macOS-only `clipboard` crate); `cargo audit` reports exactly the same
+  findings as v0.3.0.
+- `src/clipboard_backend.rs`: Wayland is still tried first. The fallback
+  runs only for errors meaning Wayland clipboard access is unavailable
+  (`MissingProtocol`, `WaylandConnection`, `SocketOpenError`), and only if
+  `DISPLAY` is non-empty. Other Wayland errors (empty clipboard, no seats,
+  ...) behave as before. `wayland_marks_password` was renamed
+  `marks_password`, since X11 targets use the same hint name.
+- New `src/clipboard_backend/x11.rs`:
+  - Reading: checks the owner, converts `TARGETS` (at most 256 entries)
+    to detect the password hint and pick a text format (`UTF8_STRING`,
+    `text/plain;charset=utf-8`, `STRING` (decoded as Latin-1), `TEXT`,
+    `text/plain`), then converts the text. `INCR` transfers are supported.
+    The `max_input_bytes` limit is enforced while receiving: the
+    `GetProperty` length is capped at `max_bytes + 1`, the `INCR` size
+    announcement and each chunk are checked, and nothing over the limit
+    is returned in part. Every wait for the owner or server has a 3 s
+    timeout. If the owner doesn't answer `TARGETS`, `UTF8_STRING` then
+    `STRING` are tried directly (the hint can't be checked then).
+  - Writing: clipGPT re-executes itself (`current_exe`) with the hidden
+    argument `--x11-clipboard-owner`, in its own process group (so Ctrl-C
+    in the starting terminal doesn't end it), with stderr discarded and
+    cwd `/`, and passes the text on stdin. The helper takes `CLIPBOARD`
+    with a real server timestamp, verifies ownership, reports `ok` or
+    `error: <message>` on stdout (the parent waits at most 5 s, then
+    kills it), and serves `TARGETS`, `TIMESTAMP`, `UTF8_STRING`,
+    `text/plain;charset=utf-8` and `TEXT`. Texts above the server's
+    request size (max 256 KiB per chunk) are sent with `INCR`, with
+    several transfers at once supported. It exits on `SelectionClear`
+    once all its transfers are done. Re-executing avoids `fork()` in a
+    multi-threaded process and needs no `unsafe` or libc code.
+- `src/cli.rs`: new `Command::ClipboardOwner`, recognised only when
+  `--x11-clipboard-owner` is the sole argument, and kept out of `--help`.
+  `main.rs` handles it before loading the config and never beeps in that
+  mode.
+- The decisions in the clipboard code are pure functions with unit tests,
+  separate from the X11/Wayland I/O: Wayland result -> fallback/empty/error
+  (`finish_get`/`finish_set`), capped pipe reads (`read_capped`), poll
+  timeouts (`wait_until`), `TARGETS` parsing and the read plan
+  (`target_atoms`, `plan_read`), chunk intake (`take_chunk`), the owner's
+  answer to each request (`decide_answer`, `reply_property`), `INCR`
+  bookkeeping for several requestors (`Transfers`), the helper command line
+  (`helper_command`) and the helper's status protocol (`run_owner`).
+- Tests: unit tests for fallback classification, `DISPLAY` detection,
+  combined error messages, target choice, Latin-1/UTF-8 decoding and size
+  limits, `INCR` reassembly and chunking, the helper status protocol and
+  handover (with a shell stand-in for the helper: data passing, early
+  exit, timeout), and the hidden argument. Three X11 round-trip tests
+  (small, 300 KB `INCR`, over-limit) are `#[ignore]`d by default; run them
+  with `xvfb-run -a cargo test -- --ignored`.
+- Comment updates in `.woodpecker/release.yaml` and
+  `scripts/ci-freebsd.sh` (the FreeBSD dependency closure never included
+  libxcb).
+
 ## v0.3.0 - Security hardening: password detection, output cleaning, safer transport
 
 User-facing changes:
