@@ -177,6 +177,20 @@ mod tests {
     }
 
     #[test]
+    fn man_page_documents_every_option() {
+        let man = include_str!("../man/clip_gpt.1").replace("\\-", "-");
+        for flag in ["-s", "--no-secret-check", "--timeout", "-h", "--help"] {
+            let macro_form = format!("Fl {}", &flag[1..]);
+            assert!(man.contains(&macro_form), "{flag} missing from man page");
+        }
+        assert!(
+            man.contains(OWNER_HELPER_ARG),
+            "internal argument should be named"
+        );
+        assert!(!man.contains("Fl T"), "-T was removed");
+    }
+
+    #[test]
     fn usage_mentions_all_flags() {
         for flag in ["-s", "--no-secret-check", "--timeout", "-h", "--help"] {
             assert!(USAGE.contains(flag), "{flag}");

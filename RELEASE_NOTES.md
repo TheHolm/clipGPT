@@ -16,6 +16,13 @@ User-facing changes:
 - A timeout is now reported clearly: "The LLM did not answer within 30 s;
   raise request_timeout in config.ini or use --timeout SECONDS (0 = no
   limit)".
+- **Packages now include a man page**: `man clip_gpt` describes every
+  option, config key, the clipboard behaviour and exit status.
+- **Behaviour change (Debian/Ubuntu `.deb` only):** the binary moved from
+  `/usr/local/bin/clip_gpt` to `/usr/bin/clip_gpt`, as Debian policy
+  requires. Hotkeys that run plain `clip_gpt` keep working; ones that use
+  the full old path need updating. FreeBSD is unchanged
+  (`/usr/local/bin/clip_gpt`).
 
 ### Details
 
@@ -35,6 +42,18 @@ User-facing changes:
   (`reqwest::Error::is_timeout`) and while reading the body (the reqwest
   timeout wrapped in the `io::Error`, or `ErrorKind::TimedOut`).
 - `main.rs`: the command line value replaces the config value for the run.
+- New `man/clip_gpt.1` (mdoc, `mandoc -T lint -W warning` clean). `.deb`:
+  `/usr/share/man/man1/clip_gpt.1.gz` (cargo-deb gzips it); FreeBSD
+  `.pkg`: `/usr/local/share/man/man1/clip_gpt.1.gz` (`gzip -9n` in
+  `scripts/ci-freebsd.sh`, reproducible). Tests check that the page lists
+  every option, every key in `config.ini.example` and the code's defaults.
+- `.deb` binary path `usr/local/bin` -> `usr/bin` (Debian Policy 9.1.2,
+  followed by Ubuntu: packages must not install into `/usr/local`). This
+  clears lintian's `file-in-usr-local`/`dir-in-usr-local` errors, which the
+  non-fatal lintian step in CI had hidden. Remaining lintian findings are
+  unchanged (`malformed-contact`, `no-changelog`, `unknown-section`).
+- CI: every `.deb` job checks for `usr/bin/clip_gpt` and the man page;
+  `ci-freebsd.sh` checks the `.pkg` for the man page.
 - Tests: timeout parsing (config and command line forms, errors), a local
   server that answers too late and one that stalls mid-body (both give the
   timeout message after 1 s), a slow answer with no limit, and the

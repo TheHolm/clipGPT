@@ -22,7 +22,7 @@ REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$REPO_ROOT/Cargo.toml" | head -1)
 
 rm -rf "$STAGE_DIR"
-mkdir -p "$STAGE_DIR/usr/local/bin" "$DIST_DIR"
+mkdir -p "$STAGE_DIR/usr/local/bin" "$STAGE_DIR/usr/local/share/man/man1" "$DIST_DIR"
 
 export PKG_CONFIG_ALLOW_CROSS=1
 export PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
@@ -35,6 +35,10 @@ cargo build --release --target x86_64-unknown-freebsd --manifest-path "$REPO_ROO
 
 cp "$CARGO_TARGET_DIR/x86_64-unknown-freebsd/release/clip_gpt" "$STAGE_DIR/usr/local/bin/clip_gpt"
 chmod 755 "$STAGE_DIR/usr/local/bin/clip_gpt"
+# FreeBSD packages live under /usr/local, man pages gzipped (-n: no name or
+# timestamp in the header, so the build stays reproducible).
+gzip -9nc "$REPO_ROOT/man/clip_gpt.1" > "$STAGE_DIR/usr/local/share/man/man1/clip_gpt.1.gz"
+chmod 644 "$STAGE_DIR/usr/local/share/man/man1/clip_gpt.1.gz"
 
 DEPS_ARGS=""
 if [ -n "$DEPS_FILE" ] && [ -f "$DEPS_FILE" ]; then
@@ -53,5 +57,6 @@ python3 "$SCRIPT_DIR/build-freebsd-pkg.py" \
     --desc "Grabs clipboard text, sends it to an OpenAI-compatible LLM API, and pastes the response back onto the clipboard. Meant to be bound to an OS-level hotkey or macro key." \
     $DEPS_ARGS
 
-# Build-time smoke test: confirm the binary actually landed in the package.
+# Build-time smoke test: confirm the binary and man page landed in the package.
 zstd -dc "$DIST_DIR/clip_gpt-$VERSION-freebsd-amd64.pkg" | tar -tf - | grep -qF 'usr/local/bin/clip_gpt'
+zstd -dc "$DIST_DIR/clip_gpt-$VERSION-freebsd-amd64.pkg" | tar -tf - | grep -qF 'usr/local/share/man/man1/clip_gpt.1.gz'

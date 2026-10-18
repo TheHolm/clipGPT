@@ -421,6 +421,53 @@ mod tests {
         assert_eq!(cfg.request_timeout, Some(Duration::from_secs(30)));
     }
 
+    /// The man page with roff hyphen escapes (`\-`) undone.
+    fn man_page() -> String {
+        include_str!("../man/clip_gpt.1").replace("\\-", "-")
+    }
+
+    #[test]
+    fn man_page_documents_every_config_key() {
+        let man = man_page();
+        let example = include_str!("../config.ini.example");
+        let keys: Vec<&str> = example
+            .lines()
+            .map(|l| l.trim_start_matches('#'))
+            .filter_map(|l| l.split_once('=').map(|(k, _)| k.trim()))
+            .filter(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+            .collect();
+        assert!(keys.len() >= 13, "{keys:?}");
+        for key in keys {
+            assert!(man.contains(&format!(".It Cm {key}\n")), "{key} missing");
+        }
+    }
+
+    #[test]
+    fn man_page_defaults_match_code() {
+        let man = man_page();
+        for (key, default) in [
+            ("beep_tone", DEFAULT_BEEP_TONE.to_string()),
+            ("error_tone", DEFAULT_ERROR_TONE.to_string()),
+            ("beep_duration", DEFAULT_BEEP_DURATION.to_string()),
+            ("max_input_bytes", DEFAULT_MAX_INPUT_BYTES.to_string()),
+            ("allow_redirects", DEFAULT_ALLOW_REDIRECTS.to_string()),
+            ("secret_check", DEFAULT_SECRET_CHECK.to_string()),
+            ("request_timeout", DEFAULT_REQUEST_TIMEOUT_SECS.to_string()),
+        ] {
+            let entry = man
+                .split(&format!(".It Cm {key}\n"))
+                .nth(1)
+                .and_then(|rest| rest.split(".It ").next())
+                .unwrap_or_else(|| panic!("{key} missing"));
+            assert!(
+                entry.contains(&format!("default {default}")),
+                "{key}: {entry}"
+            );
+        }
+        assert!(man.contains(DEFAULT_API_URL));
+        assert!(man.contains(&format!("~/.config/{APP_NAME}/config.ini")));
+    }
+
     #[test]
     fn parse_timeout_values() {
         assert_eq!(parse_timeout("k", "0"), Ok(None));

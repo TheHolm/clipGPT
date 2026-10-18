@@ -47,7 +47,11 @@ priority = "optional"
 # cargo-deb does not generate its own, which only names the licence
 # ("License: AGPL-3.0-or-later") without its text - AGPL is not guaranteed
 # to be present in /usr/share/common-licenses, so it must be quoted in full.
+# The binary goes to /usr/bin and the man page to /usr/share/man: Debian
+# Policy 9.1.2 (same on Ubuntu) leaves /usr/local to the local admin, so no
+# package may install there. cargo-deb gzips the man page itself (-9n).
 assets = [
- ["target/release/clip_gpt", "usr/local/bin/", "755"],
+ ["target/release/clip_gpt", "usr/bin/", "755"],
+ ["man/clip_gpt.1", "usr/share/man/man1/clip_gpt.1", "644"],
  ["debian/copyright", "usr/share/doc/clip-gpt/copyright", "644"],
 ]

@@ -21,8 +21,19 @@ I did not check what is in the code at all, so who knows what it is really doing
 Prebuilt packages (Linux `.deb`, Windows `.exe`, FreeBSD `.pkg`) for each
 tagged release are available on the
 [GitHub Releases](https://github.com/TheHolm/clipGPT/releases) page - that's
-the easiest way to get a working binary without compiling anything. To build
-from source instead:
+the easiest way to get a working binary without compiling anything:
+
+| package | binary | man page |
+| --- | --- | --- |
+| Debian / Ubuntu `.deb` | `/usr/bin/clip_gpt` | `/usr/share/man/man1/clip_gpt.1.gz` |
+| FreeBSD `.pkg` | `/usr/local/bin/clip_gpt` | `/usr/local/share/man/man1/clip_gpt.1.gz` |
+
+`man clip_gpt` describes every option and config key (source:
+`man/clip_gpt.1`; read it unpackaged with `man -l man/clip_gpt.1`). Until
+v0.3.1 the `.deb` installed to `/usr/local/bin`; update any hotkey that uses
+that full path.
+
+To build from source instead:
 
 1. Build the release binary:
    ```
