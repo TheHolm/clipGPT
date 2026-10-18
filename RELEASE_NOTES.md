@@ -3,6 +3,43 @@
 This file lists user-facing changes for each tagged release. See `AGENTS.md`
 for the versioning and tagging convention.
 
+## v0.4.0 - Configurable request timeout
+
+User-facing changes:
+
+- **New option `request_timeout`** (seconds, default 30, `0` = no limit):
+  how long to wait for the LLM's answer. Before, the 30 s limit was built
+  in, so slow local models (e.g. an Ollama model loading cold) failed with
+  "operation timed out".
+- **New command line option `--timeout SECONDS`** (also
+  `--timeout=SECONDS`) overrides it for one run. There is no short form.
+- A timeout is now reported clearly: "The LLM did not answer within 30 s;
+  raise request_timeout in config.ini or use --timeout SECONDS (0 = no
+  limit)".
+
+### Details
+
+- `configfile.rs`: `Config::request_timeout: Option<Duration>` (`None` = no
+  limit); `parse_timeout` accepts a whole number of seconds, anything else
+  (negative, fractional, units, text) is an error naming the key; a
+  missing or empty value means 30. The default matches reqwest's own
+  default, which applied implicitly before.
+- `cli.rs`: `Options::timeout`, parsed with the same `parse_timeout`; a
+  missing or invalid value is an error with the usage text; the last one
+  given wins. Long form only (`-t` is reserved for the planned prompt
+  option).
+- `net.rs`: `build_client` sets the timeout explicitly (covering the whole
+  request including the body). `post_json` and `read_capped` report
+  timeouts through `timeout_error`, which names the limit (with no limit,
+  the underlying error is shown). Detected both from `send()`
+  (`reqwest::Error::is_timeout`) and while reading the body (the reqwest
+  timeout wrapped in the `io::Error`, or `ErrorKind::TimedOut`).
+- `main.rs`: the command line value replaces the config value for the run.
+- Tests: timeout parsing (config and command line forms, errors), a local
+  server that answers too late and one that stalls mid-body (both give the
+  timeout message after 1 s), a slow answer with no limit, and the
+  `io::Error` timeout detection.
+
 ## v0.3.1 - Clipboard works on GNOME (and X11) again
 
 User-facing changes:

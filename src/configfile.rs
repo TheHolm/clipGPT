@@ -4,6 +4,7 @@ use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::time::Duration;
 
 const APP_NAME: &str = "clipgpt";
 
@@ -22,6 +23,9 @@ pub const DEFAULT_BEEP_DURATION: u32 = 250;
 const DEFAULT_MAX_INPUT_BYTES: usize = 64 * 1024;
 const DEFAULT_ALLOW_REDIRECTS: bool = false;
 const DEFAULT_SECRET_CHECK: bool = true;
+/// Default for `request_timeout`, in seconds (the same as reqwest's own
+/// default, which applied before the option existed).
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiType {
@@ -69,6 +73,10 @@ pub struct Config {
     /// private key, URL with password) is refused. The `-s` command line
     /// option turns it off for one run regardless of this value.
     pub secret_check: bool,
+    /// Longest wait for the whole LLM request, from sending it to the end
+    /// of the response. `None` means no limit (`request_timeout=0`). The
+    /// `--timeout` command line option overrides it for one run.
+    pub request_timeout: Option<Duration>,
 }
 
 /// Default per-OS location of config.ini:
@@ -176,6 +184,34 @@ fn get_size(ini: &ini::Ini, table: &str, key: &str, default: usize) -> Result<us
     }
 }
 
+/// Parse a timeout given as a whole number of seconds; `0` means no limit
+/// (`None`). Anything else (negative, fractional, text) is an error naming
+/// `key`. Shared by the config key and the command line option.
+pub fn parse_timeout(key: &str, value: &str) -> Result<Option<Duration>, String> {
+    match value.trim().parse::<u64>() {
+        Ok(0) => Ok(None),
+        Ok(secs) => Ok(Some(Duration::from_secs(secs))),
+        Err(_) => Err(format!(
+            "Invalid value '{}' for '{}': expected a whole number of seconds (0 = no limit)",
+            value, key
+        )),
+    }
+}
+
+/// Return `key` as a timeout (see [`parse_timeout`]); a missing or empty
+/// value means `default_secs`.
+fn get_timeout(
+    ini: &ini::Ini,
+    table: &str,
+    key: &str,
+    default_secs: u64,
+) -> Result<Option<Duration>, String> {
+    match get_value(ini, table, key) {
+        Some(value) if !value.trim().is_empty() => parse_timeout(key, &value),
+        _ => Ok(Some(Duration::from_secs(default_secs))),
+    }
+}
+
 /// Treat a missing, empty or whitespace-only api_key as "no key".
 fn normalize_api_key(value: Option<String>) -> Option<String> {
     value
@@ -276,6 +312,12 @@ fn load_from_path(path: &str) -> Result<Config, String> {
     let max_input_bytes = get_size(&ini, SECTION, "max_input_bytes", DEFAULT_MAX_INPUT_BYTES)?;
     let allow_redirects = get_bool(&ini, SECTION, "allow_redirects", DEFAULT_ALLOW_REDIRECTS)?;
     let secret_check = get_bool(&ini, SECTION, "secret_check", DEFAULT_SECRET_CHECK)?;
+    let request_timeout = get_timeout(
+        &ini,
+        SECTION,
+        "request_timeout",
+        DEFAULT_REQUEST_TIMEOUT_SECS,
+    )?;
 
     Ok(Config {
         api_type,
@@ -290,6 +332,7 @@ fn load_from_path(path: &str) -> Result<Config, String> {
         max_input_bytes,
         allow_redirects,
         secret_check,
+        request_timeout,
     })
 }
 
@@ -375,6 +418,45 @@ mod tests {
         assert!(!cfg.allow_redirects);
         assert!(cfg.secret_check);
         assert_eq!(cfg.error_tone, DEFAULT_ERROR_TONE);
+        assert_eq!(cfg.request_timeout, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn parse_timeout_values() {
+        assert_eq!(parse_timeout("k", "0"), Ok(None));
+        assert_eq!(
+            parse_timeout("k", " 120 "),
+            Ok(Some(Duration::from_secs(120)))
+        );
+        for bad in ["-1", "1.5", "ten", "", "30s"] {
+            let err = parse_timeout("request_timeout", bad).unwrap_err();
+            assert!(
+                err.contains("request_timeout") && err.contains("0 = no limit"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_timeout_from_file() {
+        let read = |name: &str, line: &str| {
+            let path = temp_config(name, &format!("[openai]\nmodel=m\n{line}\n"), 0o600);
+            let cfg = load_from_path(&path);
+            std::fs::remove_file(&path).unwrap();
+            cfg.map(|c| c.request_timeout)
+        };
+        assert_eq!(
+            read("to300", "request_timeout=300"),
+            Ok(Some(Duration::from_secs(300)))
+        );
+        assert_eq!(read("to0", "request_timeout=0"), Ok(None));
+        assert_eq!(
+            read("toempty", "request_timeout="),
+            Ok(Some(Duration::from_secs(30)))
+        );
+        assert!(read("tobad", "request_timeout=forever")
+            .unwrap_err()
+            .contains("request_timeout"));
     }
 
     #[test]

@@ -9,12 +9,15 @@
 //! * redirects are refused unless `allow_redirects` is set; when allowed,
 //!   every hop gets the same checks, up to [`MAX_REDIRECTS`] hops
 //! * responses are capped at [`MAX_RESPONSE_BYTES`]
+//! * the whole request is bounded by the configured timeout (if any); a
+//!   timeout is reported as such, with the limit and how to raise it
 //! * error messages never contain the response body
 
 use reqwest::blocking::Client;
 use reqwest::{redirect, Url};
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::time::Duration;
 
 /// Maximum number of redirect hops followed when redirects are allowed
 /// (the same limit reqwest uses by default).
@@ -142,7 +145,9 @@ pub fn redirect_decision(
 /// followed (a 3xx then becomes an error in [`post_json`]); otherwise each
 /// hop goes through [`redirect_decision`]. reqwest itself drops the
 /// Authorization header when a redirect changes host, port or scheme.
-pub fn build_client(allow_redirects: bool) -> Result<Client, String> {
+/// `timeout` bounds the whole request, response body included; `None`
+/// means no limit.
+pub fn build_client(allow_redirects: bool, timeout: Option<Duration>) -> Result<Client, String> {
     let policy = if allow_redirects {
         redirect::Policy::custom(|attempt| {
             match redirect_decision(attempt.url(), attempt.previous().len(), &host_is_local) {
@@ -160,17 +165,29 @@ pub fn build_client(allow_redirects: bool) -> Result<Client, String> {
     };
     Client::builder()
         .redirect(policy)
+        .timeout(timeout)
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", error_chain(&e)))
 }
 
 /// Read at most `limit` bytes from `reader`; more than that is an error.
-pub fn read_capped(reader: impl Read, limit: usize) -> Result<Vec<u8>, String> {
+/// A read that hit the request `timeout` is reported by [`timeout_error`].
+pub fn read_capped(
+    reader: impl Read,
+    limit: usize,
+    timeout: Option<Duration>,
+) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     reader
         .take(limit as u64 + 1)
         .read_to_end(&mut body)
-        .map_err(|e| format!("Failed to read response: {}", e))?;
+        .map_err(|e| {
+            if io_is_timeout(&e) {
+                timeout_error(timeout, &e)
+            } else {
+                format!("Failed to read response: {}", e)
+            }
+        })?;
     if body.len() > limit {
         return Err(format!(
             "Response is larger than {} bytes; discarded",
@@ -178,6 +195,31 @@ pub fn read_capped(reader: impl Read, limit: usize) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(body)
+}
+
+/// Whether a body read failed because the request timed out: reqwest
+/// wraps its own timeout error in the `io::Error`; a plain `TimedOut` kind
+/// counts too.
+fn io_is_timeout(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::TimedOut
+        || err
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+            .is_some_and(reqwest::Error::is_timeout)
+}
+
+/// Message for a request that timed out. With a configured limit it names
+/// the limit and how to change it; without one (`None`, so the timeout
+/// came from the network or OS) it gives the underlying error.
+pub fn timeout_error(timeout: Option<Duration>, err: &dyn std::error::Error) -> String {
+    match timeout {
+        Some(limit) => format!(
+            "The LLM did not answer within {} s; raise request_timeout in config.ini or use \
+             --timeout SECONDS (0 = no limit)",
+            limit.as_secs()
+        ),
+        None => format!("Request timed out: {}", error_chain(err)),
+    }
 }
 
 /// Format an error with its whole `source()` chain, so the reason behind a
@@ -201,14 +243,19 @@ pub fn post_json<T: serde::Serialize>(
     url: &Url,
     api_key: Option<&str>,
     body: &T,
+    timeout: Option<Duration>,
 ) -> Result<String, String> {
     let mut request = client.post(url.clone()).json(body);
     if let Some(key) = api_key {
         request = request.bearer_auth(key);
     }
-    let response = request
-        .send()
-        .map_err(|e| format!("Request failed: {}", error_chain(&e)))?;
+    let response = request.send().map_err(|e| {
+        if e.is_timeout() {
+            timeout_error(timeout, &e)
+        } else {
+            format!("Request failed: {}", error_chain(&e))
+        }
+    })?;
 
     let status = response.status();
     if status.is_redirection() {
@@ -229,7 +276,7 @@ pub fn post_json<T: serde::Serialize>(
             MAX_RESPONSE_BYTES
         ));
     }
-    let bytes = read_capped(response, MAX_RESPONSE_BYTES)?;
+    let bytes = read_capped(response, MAX_RESPONSE_BYTES, timeout)?;
     String::from_utf8(bytes).map_err(|_| "Response is not valid UTF-8".to_string())
 }
 
@@ -350,8 +397,8 @@ mod tests {
 
     #[test]
     fn read_capped_enforces_limit() {
-        assert_eq!(read_capped(&b"12345"[..], 5), Ok(b"12345".to_vec()));
-        let err = read_capped(&b"123456"[..], 5).unwrap_err();
+        assert_eq!(read_capped(&b"12345"[..], 5, None), Ok(b"12345".to_vec()));
+        let err = read_capped(&b"123456"[..], 5, None).unwrap_err();
         assert!(!err.contains("123456"));
     }
 
@@ -411,14 +458,14 @@ mod tests {
             http_response("200 OK", "", "{\"ok\":1}"),
             http_response("200 OK", "", "{\"ok\":2}"),
         ]);
-        let client = build_client(false).unwrap();
+        let client = build_client(false, None).unwrap();
         let body = serde_json::json!({"x": 1});
         assert_eq!(
-            post_json(&client, &base, Some("sk-test"), &body),
+            post_json(&client, &base, Some("sk-test"), &body, None),
             Ok("{\"ok\":1}".to_string())
         );
         assert_eq!(
-            post_json(&client, &base, None, &body),
+            post_json(&client, &base, None, &body, None),
             Ok("{\"ok\":2}".to_string())
         );
         let requests = handle.join().unwrap();
@@ -435,8 +482,8 @@ mod tests {
             "",
             "{\"error\":\"your secret clipboard text\"}",
         )]);
-        let client = build_client(false).unwrap();
-        let err = post_json(&client, &base, None, &serde_json::json!({})).unwrap_err();
+        let client = build_client(false, None).unwrap();
+        let err = post_json(&client, &base, None, &serde_json::json!({}), None).unwrap_err();
         handle.join().unwrap();
         assert!(err.contains("400"));
         assert!(!err.contains("secret"));
@@ -449,8 +496,15 @@ mod tests {
             "Location: http://203.0.113.7/steal\r\n",
             "",
         )]);
-        let client = build_client(false).unwrap();
-        let err = post_json(&client, &base, Some("sk-test"), &serde_json::json!({})).unwrap_err();
+        let client = build_client(false, None).unwrap();
+        let err = post_json(
+            &client,
+            &base,
+            Some("sk-test"),
+            &serde_json::json!({}),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(handle.join().unwrap().len(), 1);
         assert!(err.contains("307"));
         assert!(err.contains("allow_redirects"));
@@ -464,8 +518,8 @@ mod tests {
             &format!("Location: {}final\r\n", target),
             "",
         )]);
-        let client = build_client(true).unwrap();
-        let result = post_json(&client, &base, None, &serde_json::json!({}));
+        let client = build_client(true, None).unwrap();
+        let result = post_json(&client, &base, None, &serde_json::json!({}), None);
         handle.join().unwrap();
         let requests = target_handle.join().unwrap();
         assert_eq!(result, Ok("done".to_string()));
@@ -479,8 +533,8 @@ mod tests {
             "Location: ftp://203.0.113.7/x\r\n",
             "",
         )]);
-        let client = build_client(true).unwrap();
-        let err = post_json(&client, &base, None, &serde_json::json!({})).unwrap_err();
+        let client = build_client(true, None).unwrap();
+        let err = post_json(&client, &base, None, &serde_json::json!({}), None).unwrap_err();
         handle.join().unwrap();
         assert!(err.contains("Redirect refused"), "{err}");
     }
@@ -489,16 +543,104 @@ mod tests {
     fn post_json_rejects_oversized_response() {
         let big = "a".repeat(MAX_RESPONSE_BYTES + 1);
         let (base, handle) = serve(vec![http_response("200 OK", "", &big)]);
-        let client = build_client(false).unwrap();
-        let err = post_json(&client, &base, None, &serde_json::json!({})).unwrap_err();
+        let client = build_client(false, None).unwrap();
+        let err = post_json(&client, &base, None, &serde_json::json!({}), None).unwrap_err();
         let _ = handle.join();
         assert!(err.contains("larger than"));
     }
 
+    /// A server for one request that reads it, then after `delay` writes
+    /// `response` and keeps the connection open for `hold` more (so a
+    /// partial response stalls instead of ending).
+    fn serve_slow(delay: Duration, response: String, hold: Duration) -> Url {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            std::thread::sleep(delay);
+            let _ = stream.write_all(response.as_bytes());
+            std::thread::sleep(hold);
+        });
+        base
+    }
+
+    #[test]
+    fn post_json_times_out_waiting_for_answer() {
+        let base = serve_slow(
+            Duration::from_secs(5),
+            http_response("200 OK", "", "late"),
+            Duration::ZERO,
+        );
+        let limit = Some(Duration::from_secs(1));
+        let client = build_client(false, limit).unwrap();
+        let start = std::time::Instant::now();
+        let err = post_json(&client, &base, None, &serde_json::json!({}), limit).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(4));
+        assert!(err.contains("did not answer within 1 s"), "{err}");
+        assert!(
+            err.contains("request_timeout") && err.contains("--timeout"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn post_json_times_out_reading_body() {
+        // Headers and part of the body arrive, then the server stalls.
+        let partial = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"choices\"".to_string();
+        let base = serve_slow(Duration::ZERO, partial, Duration::from_secs(5));
+        let limit = Some(Duration::from_secs(1));
+        let client = build_client(false, limit).unwrap();
+        let err = post_json(&client, &base, None, &serde_json::json!({}), limit).unwrap_err();
+        assert!(err.contains("did not answer within 1 s"), "{err}");
+    }
+
+    #[test]
+    fn no_limit_waits_for_slow_answer() {
+        // With no timeout a slow answer still arrives (kept short here).
+        let base = serve_slow(
+            Duration::from_millis(1500),
+            http_response("200 OK", "", "slow but fine"),
+            Duration::ZERO,
+        );
+        let client = build_client(false, None).unwrap();
+        let body = post_json(&client, &base, None, &serde_json::json!({}), None);
+        assert_eq!(body, Ok("slow but fine".to_string()));
+    }
+
+    #[test]
+    fn timeout_error_without_limit_shows_cause() {
+        let cause = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        let msg = timeout_error(None, &cause);
+        assert!(msg.starts_with("Request timed out: "), "{msg}");
+        let msg = timeout_error(Some(Duration::from_secs(90)), &cause);
+        assert!(msg.contains("within 90 s"), "{msg}");
+    }
+
+    #[test]
+    fn io_timeout_detection() {
+        assert!(io_is_timeout(&std::io::Error::from(
+            std::io::ErrorKind::TimedOut
+        )));
+        assert!(!io_is_timeout(&std::io::Error::other("reset")));
+        /// A reader that times out.
+        struct Stalled;
+        impl Read for Stalled {
+            /// Always times out.
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+            }
+        }
+        let err = read_capped(Stalled, 5, Some(Duration::from_secs(3))).unwrap_err();
+        assert!(err.contains("within 3 s"), "{err}");
+    }
+
     #[test]
     fn build_client_both_modes() {
-        assert!(build_client(false).is_ok());
-        assert!(build_client(true).is_ok());
+        assert!(build_client(false, None).is_ok());
+        assert!(build_client(true, Some(Duration::from_secs(5))).is_ok());
     }
 
     #[test]

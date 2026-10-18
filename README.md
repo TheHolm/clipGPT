@@ -57,9 +57,12 @@ from source instead:
 | max_input_bytes |  | 65536 | int | largest clipboard text (UTF-8 bytes) sent to the LLM; bigger clipboards are refused |
 | allow_redirects |  | false | bool | follow HTTP redirects from api_url (true/false, yes/no, 1/0, on/off) |
 | secret_check | -s / --no-secret-check (turns it off) | true | bool | refuse clipboard text that looks like an API key, token, private key or URL with a password (see "Security") |
+| request_timeout | --timeout SECONDS | 30 | int | longest wait in seconds for the LLM's whole answer; 0 = no limit. Raise it for slow local models (e.g. a cold Ollama model load) |
 
 Command line options: `-s`/`--no-secret-check` skips the secret check for
-one run; `-h`/`--help` prints usage. Any other argument is an error.
+one run; `--timeout SECONDS` (or `--timeout=SECONDS`) sets the
+request timeout for one run, overriding `request_timeout` (0 = no limit);
+`-h`/`--help` prints usage. Any other argument is an error.
 
 The following are planned but **not yet implemented**: the `-c`/`-k`/`-t`/`-i`
 command line options, and a `name`/`include` system for multiple named
