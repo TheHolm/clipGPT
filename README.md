@@ -21,8 +21,19 @@ I did not check what is in the code at all, so who knows what it is really doing
 Prebuilt packages (Linux `.deb`, Windows `.exe`, FreeBSD `.pkg`) for each
 tagged release are available on the
 [GitHub Releases](https://github.com/TheHolm/clipGPT/releases) page - that's
-the easiest way to get a working binary without compiling anything. To build
-from source instead:
+the easiest way to get a working binary without compiling anything:
+
+| package | binary | man page |
+| --- | --- | --- |
+| Debian / Ubuntu `.deb` | `/usr/bin/clip_gpt` | `/usr/share/man/man1/clip_gpt.1.gz` |
+| FreeBSD `.pkg` | `/usr/local/bin/clip_gpt` | `/usr/local/share/man/man1/clip_gpt.1.gz` |
+
+`man clip_gpt` describes every option and config key (source:
+`man/clip_gpt.1`; read it unpackaged with `man -l man/clip_gpt.1`). Until
+v0.3.1 the `.deb` installed to `/usr/local/bin`; update any hotkey that uses
+that full path.
+
+To build from source instead:
 
 1. Build the release binary:
    ```
@@ -57,9 +68,12 @@ from source instead:
 | max_input_bytes |  | 65536 | int | largest clipboard text (UTF-8 bytes) sent to the LLM; bigger clipboards are refused |
 | allow_redirects |  | false | bool | follow HTTP redirects from api_url (true/false, yes/no, 1/0, on/off) |
 | secret_check | -s / --no-secret-check (turns it off) | true | bool | refuse clipboard text that looks like an API key, token, private key or URL with a password (see "Security") |
+| request_timeout | --timeout SECONDS | 30 | int | longest wait in seconds for the LLM's whole answer; 0 = no limit. Raise it for slow local models (e.g. a cold Ollama model load) |
 
 Command line options: `-s`/`--no-secret-check` skips the secret check for
-one run; `-h`/`--help` prints usage. Any other argument is an error.
+one run; `--timeout SECONDS` (or `--timeout=SECONDS`) sets the
+request timeout for one run, overriding `request_timeout` (0 = no limit);
+`-h`/`--help` prints usage. Any other argument is an error.
 
 The following are planned but **not yet implemented**: the `-c`/`-k`/`-t`/`-i`
 command line options, and a `name`/`include` system for multiple named

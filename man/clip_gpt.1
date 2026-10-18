@@ -1,0 +1,204 @@
+.\" SPDX-License-Identifier: AGPL-3.0-or-later
+.\"
+.\" clip_gpt(1) - keep in sync with src/cli.rs (USAGE) and
+.\" config.ini.example; tests in src/cli.rs and src/configfile.rs check
+.\" the options, config keys and defaults.
+.Dd October 19, 2026
+.Dt CLIP_GPT 1
+.Os
+.Sh NAME
+.Nm clip_gpt
+.Nd rewrite the clipboard text with an LLM
+.Sh SYNOPSIS
+.Nm
+.Op Fl s
+.Op Fl \-timeout Ar seconds
+.Nm
+.Fl h
+.Sh DESCRIPTION
+.Nm
+reads the text on the clipboard, sends it to an OpenAI-compatible chat
+completions API (OpenAI itself, or a local server such as Ollama) together
+with a configurable prompt, and replaces the clipboard contents with the
+response.
+It runs once and exits; it is meant to be bound to a desktop hotkey or a
+macro key rather than run interactively.
+.Pp
+A short high beep
+.Pq Cm beep_tone
+plays when the response is on the clipboard, a low one
+.Pq Cm error_tone
+when anything fails or the clipboard text was refused.
+Messages go to standard error.
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl s , Fl \-no\-secret\-check
+Do not refuse clipboard text that looks like an API key, token, private
+key or URL with a password, for this run.
+The password-manager and hidden-character checks still apply.
+.It Fl \-timeout Ar seconds , Fl \-timeout Ns = Ns Ar seconds
+Wait at most
+.Ar seconds
+for the LLM's whole answer;
+.Ar 0
+means no limit.
+Overrides
+.Cm request_timeout
+for this run.
+.It Fl h , Fl \-help
+Print a usage summary and exit.
+.El
+.Pp
+Any other argument is an error.
+The argument
+.Fl \-x11\-clipboard\-owner
+is internal (see
+.Sx CLIPBOARD )
+and must not be used directly.
+.Sh CONFIGURATION
+Settings are read from the
+.Bq openai
+section of an INI file, looked up first at
+.Pa ~/.config/clipgpt/config.ini
+and then at
+.Pa ./config.ini .
+If the file contains an
+.Cm api_key ,
+it must not be accessible by other users (mode 0600), or
+.Nm
+refuses to run:
+.Pp
+.Dl $ chmod 600 ~/.config/clipgpt/config.ini
+.Pp
+Keys:
+.Bl -tag -width Ds
+.It Cm model
+Required.
+The model name, e.g.\&
+.Ql gpt-4o-mini
+for OpenAI or a local model name for Ollama.
+.It Cm api_url
+Chat completions endpoint; default
+.Ql https://api.openai.com/v1/chat/completions .
+Only
+.Ql http
+and
+.Ql https
+are accepted; plain http to a host other than this computer prints a
+warning.
+.It Cm api_key
+Optional bearer token.
+Empty or missing means no key is sent (e.g.\& for a local Ollama).
+.It Cm api_type
+Only
+.Ql OpenAI
+(the default) is supported.
+.It Cm prompt_text
+Prompt sent as the system message; the clipboard text is sent separately
+as the user message.
+A literal
+.Ql \en
+becomes a newline.
+.It Cm prompt_image
+Reserved for image prompts; not used yet.
+.It Cm beep_tone
+Success beep frequency in Hz; default 1046.
+.It Cm error_tone
+Error beep frequency in Hz; default 131.
+.It Cm beep_duration
+Beep length in milliseconds; default 250, 0 disables the beeps.
+.It Cm max_input_bytes
+Largest clipboard text, in UTF-8 bytes, that is sent; default 65536.
+Larger clipboards are refused.
+.It Cm allow_redirects
+Follow HTTP redirects from
+.Cm api_url ,
+each hop checked like
+.Cm api_url
+itself, at most 10; default false.
+.It Cm secret_check
+Refuse clipboard text that looks like a secret; default true.
+.It Cm request_timeout
+Longest wait in whole seconds for the LLM's answer, from sending the
+request to the end of the response; default 30, 0 means no limit.
+Raise it for slow local models.
+.El
+.Pp
+Boolean values accept true/false, yes/no, 1/0 and on/off.
+.Sh CLIPBOARD
+On Linux and
+.Fx
+the Wayland clipboard is used when the compositor
+supports the ext-data-control or wlr-data-control protocol (KDE Plasma,
+Sway, Hyprland and others).
+Otherwise, if
+.Ev DISPLAY
+is set, the X11 clipboard is used: on GNOME through Xwayland, which keeps
+it in sync with the Wayland clipboard, and in plain X11 sessions.
+.Pp
+An X11 clipboard is served by the program that set it, so after writing
+the response
+.Nm
+leaves a copy of itself running in the background as
+.Ql clip_gpt \-\-x11\-clipboard\-owner .
+It exits as soon as anything else is copied.
+.Sh SECURITY
+Clipboard contents marked as secret by a password manager
+.Pq Ql x\-kde\-passwordManagerHint
+are never read or sent; the clipboard is replaced by a notice.
+Text containing invisible Unicode tag characters is refused the same way.
+Unless
+.Fl s
+or
+.Cm secret_check Ns =false
+is used, text that looks like an API key, token, private key, JSON Web
+Token or URL with a password is refused and the clipboard left as it was.
+Control, bidirectional-override and zero-width characters are removed
+from both the text sent and the response pasted.
+Responses over 1 MiB are discarded, and error messages never include the
+response body.
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Ev HOME
+Used to find
+.Pa ~/.config/clipgpt/config.ini .
+.It Ev WAYLAND_DISPLAY
+The Wayland compositor to use.
+.It Ev DISPLAY
+The X11 display used when Wayland clipboard access is not available.
+.El
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa ~/.config/clipgpt/config.ini
+Configuration file.
+.It Pa ./config.ini
+Used if the file above does not exist.
+.El
+.Sh EXIT STATUS
+.Nm
+exits 0 when the response is on the clipboard, or after
+.Fl h .
+It exits 1 on any error, including an invalid option or configuration, a
+failed request, and refused clipboard text (password, hidden characters,
+secret, too large).
+.Sh EXAMPLES
+A configuration for a local Ollama server with a slow model:
+.Bd -literal -offset indent
+[openai]
+api_url=http://127.0.0.1:11434/v1/chat/completions
+model=llama3
+prompt_text=Fix spelling and grammar. Reply with the text only.
+request_timeout=120
+.Ed
+.Pp
+Rewrite the clipboard once, waiting as long as the model needs:
+.Pp
+.Dl $ clip_gpt \-\-timeout 0
+.Sh SEE ALSO
+.Xr wl\-copy 1 ,
+.Xr xclip 1
+.Pp
+.Lk https://github.com/TheHolm/clipGPT
+.Sh AUTHORS
+.An TheHolm .
+Licensed under the GNU Affero General Public License, version 3 or later.

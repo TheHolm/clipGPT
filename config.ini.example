@@ -51,3 +51,9 @@ beep_duration=250
 # URL with a password (the clipboard is left as it is). Default true. The
 # -s / --no-secret-check command line option turns it off for one run.
 #secret_check=true
+
+# Longest wait, in whole seconds, for the LLM's answer (from sending the
+# request to the end of the response). 0 = no limit. Default 30. Raise it
+# for slow local models - loading an Ollama model cold can take longer. The
+# --timeout SECONDS command line option overrides it for one run.
+#request_timeout=30

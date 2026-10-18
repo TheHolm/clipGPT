@@ -118,7 +118,7 @@ fn main() {
         ),
     };
 
-    let config = configfile::read_ini().unwrap_or_else(|error| {
+    let mut config = configfile::read_ini().unwrap_or_else(|error| {
         fail(
             &format!("Failed to load config.ini: {}", error),
             configfile::DEFAULT_ERROR_TONE,
@@ -126,6 +126,9 @@ fn main() {
         )
     });
     let check_secrets = config.secret_check && !options.no_secret_check;
+    if let Some(timeout) = options.timeout {
+        config.request_timeout = timeout;
+    }
 
     let result = std::panic::catch_unwind(|| run(&config, check_secrets))
         .unwrap_or_else(|_| Err("Internal error (panic)".to_string()));
@@ -197,8 +200,14 @@ fn run(config: &Config, check_secrets: bool) -> Result<Outcome, String> {
     };
 
     let payload = build_request(config, input_text);
-    let client = net::build_client(config.allow_redirects)?;
-    let body = net::post_json(&client, &url, config.api_key.as_deref(), &payload)?;
+    let client = net::build_client(config.allow_redirects, config.request_timeout)?;
+    let body = net::post_json(
+        &client,
+        &url,
+        config.api_key.as_deref(),
+        &payload,
+        config.request_timeout,
+    )?;
     let content = parse_response(&body)?;
 
     let cleaned = sanitize::sanitize_output(&content);
@@ -274,6 +283,7 @@ mod tests {
             max_input_bytes: 100,
             allow_redirects: false,
             secret_check: true,
+            request_timeout: Some(std::time::Duration::from_secs(30)),
         }
     }
 

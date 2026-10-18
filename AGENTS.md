@@ -57,6 +57,12 @@ Mac hardware is available to this project's CI.
   input/output cleaning (`sanitize.rs`), secret-pattern detection
   (`secrets.rs`) and command-line parsing (`cli.rs`)
 - `config.ini.example` - the config template users copy and fill in
+- `man/clip_gpt.1` - the man page (hand-written mdoc; lint with
+  `mandoc -T lint -W warning`). Installed gzipped by both package types:
+  `.deb` to `/usr/share/man/man1` (cargo-deb compresses it), FreeBSD `.pkg`
+  to `/usr/local/share/man/man1` (`scripts/ci-freebsd.sh`). Tests in
+  `cli.rs` and `configfile.rs` fail if it misses an option, a config key
+  from `config.ini.example`, or a changed default - update it with them
 - `docker/` - a Dockerfile/compose setup for building in a clean container
   (build-only; clipboard/audio access isn't available from inside it)
 - `scripts/` - CI tooling: FreeBSD packaging (`fetch-freebsd-deps.py`,
@@ -64,7 +70,10 @@ Mac hardware is available to this project's CI.
   (`verify-freebsd-dist.sh`, `fetch-verified.sh`), a release-tag format
   guard (`check-release-tag.sh`), and release-notes extraction
   (`extract-release-notes.sh`). The Linux `.deb` uses `cargo-deb` directly
-  instead (see `[package.metadata.deb]` in `Cargo.toml`)
+  instead (see `[package.metadata.deb]` in `Cargo.toml`); it installs to
+  `/usr/bin` and `/usr/share`, never `/usr/local` (Debian Policy 9.1.2,
+  same on Ubuntu), while the FreeBSD `.pkg` uses `/usr/local` as FreeBSD
+  ports do
 - `debian/copyright` - the full AGPL-3.0-or-later text, installed into every
   `.deb` explicitly (Debian Policy 12.5 - `cargo-deb`'s own auto-generated
   copyright only names the licence, not its text)

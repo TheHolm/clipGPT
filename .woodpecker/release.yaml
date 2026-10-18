@@ -139,7 +139,8 @@ steps:
       # Build-time smoke test: confirm the binary actually landed in the
       # built package, and the licence text (not just its name) made it
       # into the auto-generated copyright file.
-      - dpkg-deb -c dist/*amd64.deb | grep -qF 'usr/local/bin/clip_gpt'
+      - dpkg-deb -c dist/*amd64.deb | grep -qF 'usr/bin/clip_gpt'
+      - dpkg-deb -c dist/*amd64.deb | grep -qF 'usr/share/man/man1/clip_gpt.1.gz'
       - dpkg-deb --fsys-tarfile dist/*amd64.deb | tar -xO ./usr/share/doc/clip-gpt/copyright | grep -qi 'GNU AFFERO GENERAL PUBLIC LICENSE'
       - lintian --info dist/*amd64.deb || true
 
@@ -161,7 +162,8 @@ steps:
       - cargo deb --target aarch64-unknown-linux-gnu --deb-revision "1~trixie"
       - mkdir -p dist
       - cp target/linux-arm64-trixie/aarch64-unknown-linux-gnu/debian/*.deb dist/
-      - dpkg-deb -c dist/*arm64.deb | grep -qF 'usr/local/bin/clip_gpt'
+      - dpkg-deb -c dist/*arm64.deb | grep -qF 'usr/bin/clip_gpt'
+      - dpkg-deb -c dist/*arm64.deb | grep -qF 'usr/share/man/man1/clip_gpt.1.gz'
       - dpkg-deb --fsys-tarfile dist/*arm64.deb | tar -xO ./usr/share/doc/clip-gpt/copyright | grep -qi 'GNU AFFERO GENERAL PUBLIC LICENSE'
       - lintian --info dist/*arm64.deb || true
 
@@ -182,7 +184,8 @@ steps:
       - cargo deb --deb-revision "1~ubuntu2604"
       - mkdir -p dist
       - cp target/linux-amd64-ubuntu2604/debian/*.deb dist/
-      - dpkg-deb -c dist/*amd64*ubuntu2604*.deb | grep -qF 'usr/local/bin/clip_gpt'
+      - dpkg-deb -c dist/*amd64*ubuntu2604*.deb | grep -qF 'usr/bin/clip_gpt'
+      - dpkg-deb -c dist/*amd64*ubuntu2604*.deb | grep -qF 'usr/share/man/man1/clip_gpt.1.gz'
       - dpkg-deb --fsys-tarfile dist/*amd64*ubuntu2604*.deb | tar -xO ./usr/share/doc/clip-gpt/copyright | grep -qi 'GNU AFFERO GENERAL PUBLIC LICENSE'
       - lintian --info dist/*amd64*ubuntu2604*.deb || true
 
@@ -207,7 +210,8 @@ steps:
       - cargo deb --target aarch64-unknown-linux-gnu --deb-revision "1~ubuntu2604"
       - mkdir -p dist
       - cp target/linux-arm64-ubuntu2604/aarch64-unknown-linux-gnu/debian/*.deb dist/
-      - dpkg-deb -c dist/*arm64*ubuntu2604*.deb | grep -qF 'usr/local/bin/clip_gpt'
+      - dpkg-deb -c dist/*arm64*ubuntu2604*.deb | grep -qF 'usr/bin/clip_gpt'
+      - dpkg-deb -c dist/*arm64*ubuntu2604*.deb | grep -qF 'usr/share/man/man1/clip_gpt.1.gz'
       - dpkg-deb --fsys-tarfile dist/*arm64*ubuntu2604*.deb | tar -xO ./usr/share/doc/clip-gpt/copyright | grep -qi 'GNU AFFERO GENERAL PUBLIC LICENSE'
       - lintian --info dist/*arm64*ubuntu2604*.deb || true
 
