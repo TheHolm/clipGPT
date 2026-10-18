@@ -218,11 +218,22 @@ mod imp {
     /// Read the clipboard via Wayland, falling back to X11 when Wayland
     /// clipboard access is unavailable (see [`paste_unavailable`]).
     pub fn get_text(max_bytes: usize) -> Result<Clip, String> {
-        match wayland_get_text(max_bytes) {
+        finish_get(wayland_get_text(max_bytes), have_display(), || {
+            x11::get_text(max_bytes)
+        })
+    }
+
+    /// Turn the Wayland read result into the final one: unavailable Wayland
+    /// goes to `x11_op` (if `display_set`), "nothing to paste" errors are
+    /// an empty text, other Wayland errors are reported.
+    pub(super) fn finish_get(
+        wayland: Result<Result<Clip, String>, PasteError>,
+        display_set: bool,
+        x11_op: impl FnOnce() -> Result<Clip, x11::Failure>,
+    ) -> Result<Clip, String> {
+        match wayland {
             Err(err) if paste_unavailable(&err) => {
-                with_x11_fallback("get", err.to_string(), have_display(), || {
-                    x11::get_text(max_bytes)
-                })
+                with_x11_fallback("get", err.to_string(), display_set, x11_op)
             }
             Err(err) if is_empty_error(&err) => Ok(Clip::Text(String::new())),
             Err(err) => Err(format!("Failed to get clipboard content: {err}")),
@@ -231,9 +242,8 @@ mod imp {
     }
 
     /// Check the offered MIME types for a password hint, then read the text
-    /// with a hard cap of `max_bytes + 1` so a huge or endless source
-    /// cannot exhaust memory. Wayland errors are returned as-is (outer
-    /// `Err`) for [`get_text`] to classify; read/size errors are final
+    /// (see [`read_capped`]). Wayland errors are returned as-is (outer
+    /// `Err`) for [`finish_get`] to classify; read/size errors are final
     /// (inner `Err`).
     fn wayland_get_text(max_bytes: usize) -> Result<Result<Clip, String>, PasteError> {
         let types = get_mime_types(ClipboardType::Regular, Seat::Unspecified)?;
@@ -241,24 +251,39 @@ mod imp {
             return Ok(Ok(Clip::Password));
         }
         let (pipe, _) = get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Text)?;
+        Ok(read_capped(pipe, max_bytes).map(Clip::Text))
+    }
+
+    /// Read text from `source` with a hard cap of `max_bytes + 1` bytes, so
+    /// a huge or endless source cannot exhaust memory; more than
+    /// `max_bytes` is an error.
+    pub(super) fn read_capped(source: impl Read, max_bytes: usize) -> Result<String, String> {
         let mut contents = Vec::new();
-        Ok(pipe
+        source
             .take(max_bytes as u64 + 1)
             .read_to_end(&mut contents)
-            .map_err(|e| format!("Failed to read clipboard contents: {e}"))
-            .and_then(|_| bytes_to_text(contents, max_bytes).map(Clip::Text)))
+            .map_err(|e| format!("Failed to read clipboard contents: {e}"))?;
+        bytes_to_text(contents, max_bytes)
     }
 
     /// Offer `text` as the new clipboard contents via Wayland, falling back
     /// to X11 when Wayland clipboard access is unavailable.
     pub fn set_text(text: String) -> Result<(), String> {
         let source = Source::Bytes(text.clone().into_bytes().into());
-        match Options::new().copy(source, CopyMimeType::Autodetect) {
+        let wayland = Options::new().copy(source, CopyMimeType::Autodetect);
+        finish_set(wayland, have_display(), || x11::set_text(text))
+    }
+
+    /// Copy-side counterpart of [`finish_get`].
+    pub(super) fn finish_set(
+        wayland: Result<(), CopyError>,
+        display_set: bool,
+        x11_op: impl FnOnce() -> Result<(), x11::Failure>,
+    ) -> Result<(), String> {
+        match wayland {
             Ok(()) => Ok(()),
             Err(err) if copy_unavailable(&err) => {
-                with_x11_fallback("set", err.to_string(), have_display(), || {
-                    x11::set_text(text)
-                })
+                with_x11_fallback("set", err.to_string(), display_set, x11_op)
             }
             Err(err) => Err(format!("Failed to set clipboard content: {err}")),
         }
@@ -448,6 +473,100 @@ mod tests {
             Err(x11::Failure::Other(too_large(10)))
         });
         assert_eq!(other, Err(too_large(10)));
+    }
+
+    /// A Wayland error meaning "this compositor has no data-control".
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn gnome_paste_error() -> wl_clipboard_rs::paste::Error {
+        wl_clipboard_rs::paste::Error::MissingProtocol {
+            name: "ext-data-control",
+            version: 1,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn finish_get_falls_back_to_x11() {
+        let got = imp::finish_get(Err(gnome_paste_error()), true, || {
+            Ok(Clip::Text("from x11".into()))
+        });
+        assert_eq!(got, Ok(Clip::Text("from x11".into())));
+        let no_display = imp::finish_get(Err(gnome_paste_error()), false, || {
+            panic!("X11 must not be tried without DISPLAY")
+        });
+        assert!(no_display.unwrap_err().contains("no X11 DISPLAY"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn finish_get_wayland_outcomes() {
+        use wl_clipboard_rs::paste::Error;
+        let never = || -> Result<Clip, x11::Failure> { panic!("no fallback expected") };
+        assert_eq!(
+            imp::finish_get(Ok(Ok(Clip::Password)), true, never),
+            Ok(Clip::Password)
+        );
+        assert_eq!(
+            imp::finish_get(Ok(Err(too_large(3))), true, never),
+            Err(too_large(3))
+        );
+        assert_eq!(
+            imp::finish_get(Err(Error::ClipboardEmpty), true, never),
+            Ok(Clip::Text(String::new()))
+        );
+        assert_eq!(
+            imp::finish_get(Err(Error::SeatNotFound), true, never),
+            Err("Failed to get clipboard content: The requested seat was not found".into())
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn finish_set_outcomes() {
+        use wl_clipboard_rs::copy::Error;
+        let never = || -> Result<(), x11::Failure> { panic!("no fallback expected") };
+        assert_eq!(imp::finish_set(Ok(()), true, never), Ok(()));
+        assert_eq!(
+            imp::finish_set(Err(Error::NoSeats), true, never),
+            Err("Failed to set clipboard content: There are no seats".into())
+        );
+        let gnome = Error::MissingProtocol {
+            name: "ext-data-control",
+            version: 1,
+        };
+        assert_eq!(imp::finish_set(Err(gnome), true, || Ok(())), Ok(()));
+        let gnome = Error::MissingProtocol {
+            name: "ext-data-control",
+            version: 1,
+        };
+        let err = imp::finish_set(Err(gnome), true, || {
+            Err(x11::Failure::Connect("refused".into()))
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("Wayland: A required Wayland protocol"),
+            "{err}"
+        );
+        assert!(err.ends_with("X11: refused"), "{err}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn read_capped_limits_and_errors() {
+        assert_eq!(imp::read_capped(&b"hello"[..], 5), Ok("hello".into()));
+        let err = imp::read_capped(&b"secret!"[..], 6).unwrap_err();
+        assert!(err.contains("max_input_bytes") && !err.contains("secret"));
+
+        /// A source whose reads always fail.
+        struct Broken;
+        impl std::io::Read for Broken {
+            /// Always fails.
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("pipe closed"))
+            }
+        }
+        let err = imp::read_capped(Broken, 5).unwrap_err();
+        assert_eq!(err, "Failed to read clipboard contents: pipe closed");
     }
 
     #[test]

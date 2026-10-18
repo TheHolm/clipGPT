@@ -198,12 +198,26 @@ fn wait_for<T>(
     mut pick: impl FnMut(&Event) -> Option<T>,
 ) -> Result<T, Failure> {
     conn.flush()?;
-    let deadline = Instant::now() + REPLY_TIMEOUT;
-    loop {
+    wait_until(REPLY_TIMEOUT, || {
         while let Some(event) = conn.poll_for_event()? {
             if let Some(value) = pick(&event) {
-                return Ok(value);
+                return Ok(Some(value));
             }
+        }
+        Ok(None)
+    })
+}
+
+/// Call `poll` (pausing [`POLL_INTERVAL`] between calls) until it returns a
+/// value or an error, giving up with a timeout error after `timeout`.
+fn wait_until<T>(
+    timeout: Duration,
+    mut poll: impl FnMut() -> Result<Option<T>, Failure>,
+) -> Result<T, Failure> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(value) = poll()? {
+            return Ok(value);
         }
         if Instant::now() >= deadline {
             return Err(Failure::Other(
@@ -271,13 +285,9 @@ impl Reader {
         let Some(reply) = self.convert(self.atoms.TARGETS, MAX_TARGETS)? else {
             return Ok(None);
         };
-        if reply.type_ == self.atoms.INCR {
-            return Ok(None);
-        }
-        let Some(atoms) = reply.value32() else {
+        let Some(atoms) = target_atoms(&reply, self.atoms.INCR) else {
             return Ok(None);
         };
-        let atoms: Vec<Atom> = atoms.collect();
         let cookies = atoms
             .iter()
             .map(|&atom| self.conn.get_atom_name(atom))
@@ -301,10 +311,7 @@ impl Reader {
         };
         let mut collector = Collector::new(max_bytes);
         if first.type_ != self.atoms.INCR {
-            if first.bytes_after > 0 {
-                return Err(Failure::Other(too_large(max_bytes)));
-            }
-            collector.push(&first.value).map_err(Failure::Other)?;
+            take_chunk(&mut collector, &first)?;
             return Ok(Some((collector.buf, first.type_)));
         }
 
@@ -328,13 +335,10 @@ impl Reader {
                 .conn
                 .get_property(true, win, prop, AtomEnum::ANY, 0, words)?
                 .reply()?;
-            if chunk.bytes_after > 0 {
-                return Err(Failure::Other(too_large(max_bytes)));
-            }
             if type_ == NONE {
                 type_ = chunk.type_;
             }
-            if collector.push(&chunk.value).map_err(Failure::Other)? {
+            if take_chunk(&mut collector, &chunk)? {
                 return Ok(Some((collector.buf, type_)));
             }
         }
@@ -354,28 +358,74 @@ pub fn get_text(max_bytes: usize) -> Result<Clip, Failure> {
     }
     let reader = Reader { conn, win, atoms };
 
-    let candidates = match reader.targets()? {
-        Some(targets) => {
-            let names: Vec<&str> = targets.iter().map(|(_, n)| n.as_str()).collect();
-            if marks_password(names.iter().copied()) {
-                return Ok(Clip::Password);
-            }
-            match choose_text_target(&names) {
-                Some(i) => vec![targets[i].0],
-                None => return Ok(Clip::Text(String::new())),
-            }
-        }
-        None => vec![atoms.UTF8_STRING, AtomEnum::STRING.into()],
+    let guesses = [atoms.UTF8_STRING, AtomEnum::STRING.into()];
+    let candidates = match plan_read(reader.targets()?.as_deref(), guesses) {
+        ReadPlan::Password => return Ok(Clip::Password),
+        ReadPlan::NoText => return Ok(Clip::Text(String::new())),
+        ReadPlan::Try(candidates) => candidates,
     };
     for target in candidates {
         if let Some((bytes, type_)) = reader.read(target, max_bytes)? {
-            let latin1 = type_ == Atom::from(AtomEnum::STRING);
-            return decode_text(bytes, latin1, max_bytes)
-                .map(Clip::Text)
-                .map_err(Failure::Other);
+            return decode_clip(bytes, type_, max_bytes);
         }
     }
     Ok(Clip::Text(String::new()))
+}
+
+/// What to do after looking at the owner's `TARGETS`.
+#[derive(Debug, PartialEq, Eq)]
+enum ReadPlan {
+    /// A password manager marked the contents; do not read them.
+    Password,
+    /// The owner offers no text format.
+    NoText,
+    /// Try converting to these targets in order.
+    Try(Vec<Atom>),
+}
+
+/// Decide how to read the clipboard from the owner's `TARGETS` (`None` if
+/// it did not answer them, in which case `guesses` are tried blindly).
+fn plan_read(targets: Option<&[(Atom, String)]>, guesses: [Atom; 2]) -> ReadPlan {
+    let Some(targets) = targets else {
+        return ReadPlan::Try(guesses.to_vec());
+    };
+    let names: Vec<&str> = targets.iter().map(|(_, n)| n.as_str()).collect();
+    if marks_password(names.iter().copied()) {
+        return ReadPlan::Password;
+    }
+    match choose_text_target(&names) {
+        Some(i) => ReadPlan::Try(vec![targets[i].0]),
+        None => ReadPlan::NoText,
+    }
+}
+
+/// The atoms of a `TARGETS` reply, or `None` if it is not a plain list of
+/// 32-bit atoms (e.g. an `INCR` announcement, which no sane owner uses for
+/// `TARGETS`).
+fn target_atoms(reply: &GetPropertyReply, incr: Atom) -> Option<Vec<Atom>> {
+    if reply.type_ == incr {
+        return None;
+    }
+    reply.value32().map(Iterator::collect)
+}
+
+/// Add one property read to `collector`. A read that left data behind
+/// (`bytes_after`) means more than the limit was offered. Returns `true`
+/// for the empty chunk that ends an `INCR` transfer.
+fn take_chunk(collector: &mut Collector, reply: &GetPropertyReply) -> Result<bool, Failure> {
+    if reply.bytes_after > 0 {
+        return Err(Failure::Other(too_large(collector.max_bytes)));
+    }
+    collector.push(&reply.value).map_err(Failure::Other)
+}
+
+/// Decode received bytes of type `type_` (Latin-1 for `STRING`, UTF-8
+/// otherwise) into the clipboard text.
+fn decode_clip(bytes: Vec<u8>, type_: Atom, max_bytes: usize) -> Result<Clip, Failure> {
+    let latin1 = type_ == Atom::from(AtomEnum::STRING);
+    decode_text(bytes, latin1, max_bytes)
+        .map(Clip::Text)
+        .map_err(Failure::Other)
 }
 
 /// Hand `text` to a background copy of clipGPT that owns the X11 clipboard
@@ -388,6 +438,14 @@ pub fn set_text(text: String) -> Result<(), Failure> {
     let exe = std::env::current_exe().map_err(|e| {
         Failure::Other(format!("Cannot find own executable for X11 clipboard: {e}"))
     })?;
+    hand_over(helper_command(exe), text.as_bytes())
+}
+
+/// The command that starts `exe` as the owner helper: the hidden argument,
+/// piped stdin/stdout, stderr discarded, cwd `/` (so it holds no directory
+/// busy), in its own process group (so a Ctrl-C in the terminal that
+/// started clipGPT does not take the clipboard down with it).
+fn helper_command(exe: std::path::PathBuf) -> Command {
     let mut command = Command::new(exe);
     command
         .arg(OWNER_HELPER_ARG)
@@ -395,10 +453,8 @@ pub fn set_text(text: String) -> Result<(), Failure> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .current_dir("/")
-        // Own process group: a Ctrl-C in the terminal that started clipGPT
-        // must not take the clipboard down with it.
         .process_group(0);
-    hand_over(command, text.as_bytes())
+    command
 }
 
 /// Start the owner helper `command`, feed it `data` and wait (at most
@@ -460,23 +516,42 @@ fn parse_status(line: &str) -> Result<(), String> {
 /// `error: <message>` on stdout, then serve paste requests until another
 /// client takes the clipboard. Returns the process exit status.
 pub fn serve_owner() -> i32 {
+    run_owner(
+        std::io::stdin(),
+        std::io::stdout(),
+        Owner::take,
+        Owner::serve,
+    )
+}
+
+/// The helper protocol of [`serve_owner`], with the I/O and the X11 parts
+/// (`take` the clipboard with the text, then `serve` it) passed in. The
+/// status line goes to `output` (one line, so newlines in an error are
+/// replaced); `serve` only runs once `ok` was written. Returns the exit
+/// status: 0 after serving, 1 on any failure.
+fn run_owner<O>(
+    mut input: impl Read,
+    mut output: impl Write,
+    take: impl FnOnce(Vec<u8>) -> Result<O, Failure>,
+    serve: impl FnOnce(O) -> Result<(), Failure>,
+) -> i32 {
     let mut data = Vec::new();
-    let owner = std::io::stdin()
+    let owner = input
         .read_to_end(&mut data)
         .map_err(|e| Failure::Other(format!("cannot read text: {e}")))
-        .and_then(|_| Owner::take(data));
-    let mut stdout = std::io::stdout();
+        .and_then(|_| take(data));
     let owner = match owner {
         Ok(owner) => owner,
         Err(Failure::Connect(m) | Failure::Other(m)) => {
-            let _ = writeln!(stdout, "error: {}", m.replace('\n', " "));
+            let _ = writeln!(output, "error: {}", m.replace('\n', " "));
+            let _ = output.flush();
             return 1;
         }
     };
-    if writeln!(stdout, "ok").and_then(|_| stdout.flush()).is_err() {
+    if writeln!(output, "ok").and_then(|_| output.flush()).is_err() {
         return 1;
     }
-    match owner.serve() {
+    match serve(owner) {
         Ok(()) => 0,
         Err(_) => 1,
     }
@@ -520,6 +595,142 @@ struct Transfer {
     property: Atom,
     type_: Atom,
     sender: IncrSender,
+}
+
+/// One step of an `INCR` transfer: write `chunk` with type `type_`; if
+/// `unwatch`, the requestor's window has no transfer left and need not be
+/// watched any more.
+#[derive(Debug, PartialEq, Eq)]
+struct Step<'a> {
+    type_: Atom,
+    chunk: &'a [u8],
+    unwatch: bool,
+}
+
+/// The `INCR` transfers in progress, any number of requestors at once.
+#[derive(Debug, Default)]
+struct Transfers(Vec<Transfer>);
+
+impl Transfers {
+    /// Begin a transfer to `property` on `requestor`, replacing an earlier
+    /// one to the same place.
+    fn start(&mut self, requestor: Window, property: Atom, type_: Atom) {
+        self.0
+            .retain(|t| !(t.requestor == requestor && t.property == property));
+        self.0.push(Transfer {
+            requestor,
+            property,
+            type_,
+            sender: IncrSender::default(),
+        });
+    }
+
+    /// The requestor deleted `property` on `window`, asking for the next
+    /// chunk of `data` (at most `chunk` bytes). `None` if no transfer goes
+    /// there. A transfer is dropped once its final empty chunk is handed
+    /// out.
+    fn advance<'a>(
+        &mut self,
+        window: Window,
+        property: Atom,
+        data: &'a [u8],
+        chunk: usize,
+    ) -> Option<Step<'a>> {
+        let i = self
+            .0
+            .iter()
+            .position(|t| t.requestor == window && t.property == property)?;
+        let t = &mut self.0[i];
+        let type_ = t.type_;
+        // Finished transfers are removed right away, so `next` always
+        // yields here; an empty chunk would end the transfer anyway.
+        let next = t.sender.next(data, chunk).unwrap_or_default();
+        let mut unwatch = false;
+        if t.sender.finished {
+            self.0.remove(i);
+            unwatch = !self.0.iter().any(|t| t.requestor == window);
+        }
+        Some(Step {
+            type_,
+            chunk: next,
+            unwatch,
+        })
+    }
+
+    /// Drop all transfers to a window that was destroyed.
+    fn forget_window(&mut self, window: Window) {
+        self.0.retain(|t| t.requestor != window);
+    }
+
+    /// Whether no transfer is in progress.
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// How the owner answers one `SelectionRequest`.
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    /// The list of [`offered_targets`].
+    Targets,
+    /// The time the selection was taken.
+    Timestamp,
+    /// The text, as type `type_`; through `INCR` if `incr`.
+    Text { type_: Atom, incr: bool },
+    /// Not a selection or format we serve.
+    Refuse,
+}
+
+/// The targets the owner offers, as listed in its `TARGETS` answer.
+fn offered_targets(a: &Atoms) -> [Atom; 5] {
+    [
+        a.TARGETS,
+        a.TIMESTAMP,
+        a.UTF8_STRING,
+        a.TEXT_PLAIN_UTF8,
+        a.TEXT,
+    ]
+}
+
+/// Decide the answer to a request for `target` of `selection`, holding
+/// `data_len` bytes of text and writing at most `chunk` bytes at once.
+/// `TEXT` lets the owner choose the type; it gets `UTF8_STRING`.
+fn decide_answer(
+    a: &Atoms,
+    selection: Atom,
+    target: Atom,
+    data_len: usize,
+    chunk: usize,
+) -> Answer {
+    if selection != a.CLIPBOARD {
+        Answer::Refuse
+    } else if target == a.TARGETS {
+        Answer::Targets
+    } else if target == a.TIMESTAMP {
+        Answer::Timestamp
+    } else if [a.UTF8_STRING, a.TEXT_PLAIN_UTF8, a.TEXT].contains(&target) {
+        let type_ = if target == a.TEXT {
+            a.UTF8_STRING
+        } else {
+            target
+        };
+        Answer::Text {
+            type_,
+            incr: data_len > chunk,
+        }
+    } else {
+        Answer::Refuse
+    }
+}
+
+/// The property to answer into: obsolete clients may pass none, and ICCCM
+/// says to use the target's name then.
+fn reply_property(property: Atom, target: Atom) -> Atom {
+    if property == NONE {
+        target
+    } else {
+        property
+    }
 }
 
 /// Owns the X11 clipboard and answers paste requests with `data`.
@@ -571,7 +782,7 @@ impl Owner {
     /// Answer requests until the clipboard is taken over and no transfer
     /// is still in progress, or the connection ends.
     fn serve(self) -> Result<(), Failure> {
-        let mut transfers: Vec<Transfer> = Vec::new();
+        let mut transfers = Transfers::default();
         let mut cleared = false;
         while !(cleared && transfers.is_empty()) {
             match self.conn.wait_for_event()? {
@@ -584,9 +795,7 @@ impl Owner {
                 Event::PropertyNotify(ev) if ev.state == Property::DELETE => {
                     self.continue_transfer(ev.window, ev.atom, &mut transfers)?;
                 }
-                Event::DestroyNotify(ev) => {
-                    transfers.retain(|t| t.requestor != ev.window);
-                }
+                Event::DestroyNotify(ev) => transfers.forget_window(ev.window),
                 // Errors of requests to vanished requestors etc.: ignore.
                 _ => {}
             }
@@ -595,82 +804,68 @@ impl Owner {
         Ok(())
     }
 
-    /// Answer one `SelectionRequest`: `TARGETS`, `TIMESTAMP`, or the text
-    /// (directly, or by starting an `INCR` transfer if it is large).
-    /// Anything else is refused. Always notifies the requestor.
+    /// Answer one `SelectionRequest` as [`decide_answer`] says: `TARGETS`,
+    /// `TIMESTAMP`, or the text (directly, or by starting an `INCR`
+    /// transfer if it is large). Always notifies the requestor.
     fn answer(
         &self,
         req: &SelectionRequestEvent,
-        transfers: &mut Vec<Transfer>,
+        transfers: &mut Transfers,
     ) -> Result<(), Failure> {
-        let a = &self.atoms;
-        // Obsolete clients may pass no property; ICCCM says use the target.
-        let property = if req.property == NONE {
-            req.target
-        } else {
-            req.property
-        };
-        let text_targets = [a.UTF8_STRING, a.TEXT_PLAIN_UTF8, a.TEXT];
-        let served = if req.selection != a.CLIPBOARD {
-            false
-        } else if req.target == a.TARGETS {
-            let targets = [
-                a.TARGETS,
-                a.TIMESTAMP,
-                a.UTF8_STRING,
-                a.TEXT_PLAIN_UTF8,
-                a.TEXT,
-            ];
-            self.conn.change_property32(
-                PropMode::REPLACE,
-                req.requestor,
-                property,
-                AtomEnum::ATOM,
-                &targets,
-            )?;
-            true
-        } else if req.target == a.TIMESTAMP {
-            self.conn.change_property32(
-                PropMode::REPLACE,
-                req.requestor,
-                property,
-                AtomEnum::INTEGER,
-                &[self.time],
-            )?;
-            true
-        } else if text_targets.contains(&req.target) {
-            let type_ = if req.target == a.TEXT {
-                a.UTF8_STRING
-            } else {
-                req.target
-            };
-            if self.data.len() <= self.chunk {
-                self.conn.change_property8(
-                    PropMode::REPLACE,
-                    req.requestor,
+        let property = reply_property(req.property, req.target);
+        let (requestor, replace) = (req.requestor, PropMode::REPLACE);
+        let answer = decide_answer(
+            &self.atoms,
+            req.selection,
+            req.target,
+            self.data.len(),
+            self.chunk,
+        );
+        match answer {
+            Answer::Targets => {
+                let targets = offered_targets(&self.atoms);
+                self.conn.change_property32(
+                    replace,
+                    requestor,
                     property,
-                    type_,
-                    &self.data,
+                    AtomEnum::ATOM,
+                    &targets,
                 )?;
-            } else {
-                self.start_transfer(req.requestor, property, type_, transfers)?;
             }
-            true
-        } else {
-            false
-        };
+            Answer::Timestamp => {
+                self.conn.change_property32(
+                    replace,
+                    requestor,
+                    property,
+                    AtomEnum::INTEGER,
+                    &[self.time],
+                )?;
+            }
+            Answer::Text { type_, incr: false } => {
+                self.conn
+                    .change_property8(replace, requestor, property, type_, &self.data)?;
+            }
+            Answer::Text { type_, incr: true } => {
+                self.start_transfer(requestor, property, type_, transfers)?;
+            }
+            Answer::Refuse => {}
+        }
 
         let notify = SelectionNotifyEvent {
             response_type: SELECTION_NOTIFY_EVENT,
             sequence: 0,
             time: req.time,
-            requestor: req.requestor,
+            requestor,
             selection: req.selection,
             target: req.target,
-            property: if served { property } else { NONE },
+            property: if answer == Answer::Refuse {
+                NONE
+            } else {
+                property
+            },
         };
         self.conn
-            .send_event(false, req.requestor, EventMask::NO_EVENT, notify)?;
+            .send_event(false, requestor, EventMask::NO_EVENT, notify)?;
         Ok(())
     }
 
@@ -681,7 +876,7 @@ impl Owner {
         requestor: Window,
         property: Atom,
         type_: Atom,
-        transfers: &mut Vec<Transfer>,
+        transfers: &mut Transfers,
     ) -> Result<(), Failure> {
         self.conn.change_window_attributes(
             requestor,
@@ -696,44 +891,29 @@ impl Owner {
             self.atoms.INCR,
             &[size],
         )?;
-        transfers.retain(|t| !(t.requestor == requestor && t.property == property));
-        transfers.push(Transfer {
-            requestor,
-            property,
-            type_,
-            sender: IncrSender::default(),
-        });
+        transfers.start(requestor, property, type_);
         Ok(())
     }
 
     /// The requestor deleted `property` on `window`: if that belongs to an
-    /// `INCR` transfer, send the next chunk; finish the transfer after the
-    /// final empty chunk.
+    /// `INCR` transfer, send the next chunk, and stop watching the window
+    /// once it has no transfer left.
     fn continue_transfer(
         &self,
         window: Window,
         property: Atom,
-        transfers: &mut Vec<Transfer>,
+        transfers: &mut Transfers,
     ) -> Result<(), Failure> {
-        let Some(i) = transfers
-            .iter()
-            .position(|t| t.requestor == window && t.property == property)
-        else {
+        let Some(step) = transfers.advance(window, property, &self.data, self.chunk) else {
             return Ok(());
         };
-        let t = &mut transfers[i];
-        if let Some(chunk) = t.sender.next(&self.data, self.chunk) {
-            self.conn
-                .change_property8(PropMode::REPLACE, window, property, t.type_, chunk)?;
-        }
-        if t.sender.finished {
-            transfers.remove(i);
-            if !transfers.iter().any(|t| t.requestor == window) {
-                self.conn.change_window_attributes(
-                    window,
-                    &ChangeWindowAttributesAux::new().event_mask(EventMask::NO_EVENT),
-                )?;
-            }
+        self.conn
+            .change_property8(PropMode::REPLACE, window, property, step.type_, step.chunk)?;
+        if step.unwatch {
+            self.conn.change_window_attributes(
+                window,
+                &ChangeWindowAttributesAux::new().event_mask(EventMask::NO_EVENT),
+            )?;
         }
         Ok(())
     }
@@ -742,6 +922,309 @@ impl Owner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Made-up atom numbers, as a server would assign them.
+    fn atoms() -> Atoms {
+        Atoms {
+            CLIPBOARD: 101,
+            TARGETS: 102,
+            TIMESTAMP: 103,
+            INCR: 104,
+            UTF8_STRING: 105,
+            TEXT: 106,
+            TEXT_PLAIN_UTF8: 107,
+            CLIPGPT_PROPERTY: 108,
+        }
+    }
+
+    /// A `GetProperty` reply of `type_` and `format` holding `value`.
+    fn reply(type_: Atom, format: u8, value: Vec<u8>, bytes_after: u32) -> GetPropertyReply {
+        GetPropertyReply {
+            format,
+            sequence: 0,
+            length: 0,
+            type_,
+            bytes_after,
+            value_len: 0,
+            value,
+        }
+    }
+
+    /// `atoms` as the bytes of a 32-bit property value.
+    fn atom_bytes(atoms: &[Atom]) -> Vec<u8> {
+        atoms.iter().flat_map(|a| a.to_ne_bytes()).collect()
+    }
+
+    #[test]
+    fn failure_conversions_are_final_errors() {
+        let f = Failure::from(ConnectionError::UnknownError);
+        assert!(matches!(&f, Failure::Other(m) if m.starts_with("X11 clipboard error: ")));
+        let f = Failure::from(ReplyError::from(ConnectionError::UnknownError));
+        assert!(matches!(&f, Failure::Other(m) if m.starts_with("X11 clipboard error: ")));
+        let f = Failure::from(ReplyOrIdError::IdsExhausted);
+        assert!(matches!(&f, Failure::Other(m) if m.starts_with("X11 clipboard error: ")));
+    }
+
+    #[test]
+    fn wait_until_returns_first_value() {
+        let mut calls = 0;
+        let got = wait_until(Duration::from_secs(5), || {
+            calls += 1;
+            Ok((calls == 3).then_some("v"))
+        });
+        assert_eq!(got, Ok("v"));
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn wait_until_times_out() {
+        let start = Instant::now();
+        let got = wait_until::<()>(Duration::from_millis(20), || Ok(None));
+        assert!(matches!(got, Err(Failure::Other(m)) if m.contains("Timed out")));
+        assert!(start.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn wait_until_passes_errors_on() {
+        let got = wait_until::<()>(Duration::from_secs(5), || Err(Failure::Other("x".into())));
+        assert_eq!(got, Err(Failure::Other("x".into())));
+    }
+
+    #[test]
+    fn target_atoms_parses_list_only() {
+        let list = reply(4, 32, atom_bytes(&[7, 9]), 0);
+        assert_eq!(target_atoms(&list, 104), Some(vec![7, 9]));
+        assert_eq!(
+            target_atoms(&reply(104, 32, atom_bytes(&[5]), 0), 104),
+            None
+        );
+        assert_eq!(target_atoms(&reply(31, 8, b"nope".to_vec(), 0), 104), None);
+    }
+
+    #[test]
+    fn plan_read_choices() {
+        let guesses = [1, 2];
+        assert_eq!(plan_read(None, guesses), ReadPlan::Try(vec![1, 2]));
+        let named = |names: &[&str]| -> Vec<(Atom, String)> {
+            (10..).zip(names.iter().map(|n| n.to_string())).collect()
+        };
+        let t = named(&["TARGETS", "STRING", "UTF8_STRING"]);
+        assert_eq!(plan_read(Some(&t), guesses), ReadPlan::Try(vec![12]));
+        let t = named(&["UTF8_STRING", "x-kde-passwordManagerHint"]);
+        assert_eq!(plan_read(Some(&t), guesses), ReadPlan::Password);
+        let t = named(&["TARGETS", "image/png"]);
+        assert_eq!(plan_read(Some(&t), guesses), ReadPlan::NoText);
+        assert_eq!(plan_read(Some(&[]), guesses), ReadPlan::NoText);
+    }
+
+    #[test]
+    fn take_chunk_checks_leftover_and_limit() {
+        let mut c = Collector::new(5);
+        assert_eq!(
+            take_chunk(&mut c, &reply(1, 8, b"abc".to_vec(), 0)),
+            Ok(false)
+        );
+        let left_over = take_chunk(&mut c, &reply(1, 8, b"d".to_vec(), 1));
+        assert_eq!(left_over, Err(Failure::Other(too_large(5))));
+        let over = take_chunk(&mut c, &reply(1, 8, b"defg".to_vec(), 0));
+        assert_eq!(over, Err(Failure::Other(too_large(5))));
+        assert_eq!(take_chunk(&mut c, &reply(1, 8, Vec::new(), 0)), Ok(true));
+        assert_eq!(c.buf, b"abc");
+    }
+
+    #[test]
+    fn decode_clip_by_type() {
+        let string = Atom::from(AtomEnum::STRING);
+        assert_eq!(
+            decode_clip(vec![0xE9], string, 10),
+            Ok(Clip::Text("é".into()))
+        );
+        assert_eq!(decode_clip("é".into(), 105, 10), Ok(Clip::Text("é".into())));
+        assert_eq!(
+            decode_clip(vec![b'x'; 3], 105, 2),
+            Err(Failure::Other(too_large(2)))
+        );
+    }
+
+    #[test]
+    fn answers_targets_timestamp_and_refusals() {
+        let a = atoms();
+        assert_eq!(decide_answer(&a, 101, 102, 5, 10), Answer::Targets);
+        assert_eq!(decide_answer(&a, 101, 103, 5, 10), Answer::Timestamp);
+        // Unknown target, or not the CLIPBOARD selection (e.g. PRIMARY).
+        assert_eq!(decide_answer(&a, 101, 999, 5, 10), Answer::Refuse);
+        let primary = Atom::from(AtomEnum::PRIMARY);
+        assert_eq!(decide_answer(&a, primary, 105, 5, 10), Answer::Refuse);
+        assert_eq!(decide_answer(&a, primary, 102, 5, 10), Answer::Refuse);
+    }
+
+    #[test]
+    fn answers_text_directly_or_incr() {
+        let a = atoms();
+        let text = |type_, incr| Answer::Text { type_, incr };
+        assert_eq!(decide_answer(&a, 101, 105, 10, 10), text(105, false));
+        assert_eq!(decide_answer(&a, 101, 107, 10, 10), text(107, false));
+        // TEXT is answered as UTF8_STRING.
+        assert_eq!(decide_answer(&a, 101, 106, 10, 10), text(105, false));
+        assert_eq!(decide_answer(&a, 101, 105, 11, 10), text(105, true));
+    }
+
+    #[test]
+    fn offered_targets_are_all_answerable() {
+        let a = atoms();
+        for target in offered_targets(&a) {
+            assert_ne!(decide_answer(&a, 101, target, 1, 10), Answer::Refuse);
+        }
+        assert!(!offered_targets(&a).contains(&a.INCR));
+    }
+
+    #[test]
+    fn reply_property_defaults_to_target() {
+        assert_eq!(reply_property(NONE, 105), 105);
+        assert_eq!(reply_property(42, 105), 42);
+    }
+
+    #[test]
+    fn transfers_send_chunks_then_unwatch() {
+        let data = b"abcde";
+        let mut t = Transfers::default();
+        t.start(1, 50, 105);
+        assert_eq!(t.advance(2, 50, data, 3), None, "other window");
+        assert_eq!(t.advance(1, 51, data, 3), None, "other property");
+        let step = |chunk: &'static [u8], unwatch| Step {
+            type_: 105,
+            chunk,
+            unwatch,
+        };
+        assert_eq!(t.advance(1, 50, data, 3), Some(step(b"abc", false)));
+        assert_eq!(t.advance(1, 50, data, 3), Some(step(b"de", false)));
+        assert_eq!(t.advance(1, 50, data, 3), Some(step(b"", true)));
+        assert!(t.is_empty());
+        assert_eq!(t.advance(1, 50, data, 3), None);
+    }
+
+    #[test]
+    fn transfers_keep_watching_window_with_other_transfer() {
+        let mut t = Transfers::default();
+        t.start(1, 50, 105);
+        t.start(1, 60, 107);
+        assert_eq!(t.advance(1, 50, b"", 3).map(|s| s.unwatch), Some(false));
+        assert_eq!(t.advance(1, 60, b"", 3).map(|s| s.unwatch), Some(true));
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn transfers_restart_and_forget() {
+        let mut t = Transfers::default();
+        t.start(1, 50, 105);
+        assert!(t.advance(1, 50, b"abcdef", 2).is_some());
+        // A new request to the same place starts over from the beginning.
+        t.start(1, 50, 107);
+        assert_eq!(t.0.len(), 1);
+        let step = t.advance(1, 50, b"abcdef", 2).unwrap();
+        assert_eq!((step.type_, step.chunk), (107, &b"ab"[..]));
+        t.start(2, 50, 105);
+        t.forget_window(1);
+        assert_eq!(t.0.len(), 1);
+        t.forget_window(2);
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn helper_command_runs_hidden_mode_from_root() {
+        let command = helper_command("/opt/clip_gpt".into());
+        assert_eq!(command.get_program(), "/opt/clip_gpt");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, [OWNER_HELPER_ARG]);
+        assert_eq!(command.get_current_dir(), Some(std::path::Path::new("/")));
+    }
+
+    /// Run [`run_owner`] on `input`; returns exit status, output, and what
+    /// `take` received (if it ran) and whether `serve` ran.
+    fn owner_run(
+        input: &[u8],
+        take: Result<(), Failure>,
+        serve: Result<(), Failure>,
+    ) -> (i32, String, Option<Vec<u8>>, bool) {
+        let mut out = Vec::new();
+        let mut taken = None;
+        let mut served = false;
+        let status = run_owner(
+            input,
+            &mut out,
+            |data| {
+                taken = Some(data);
+                take
+            },
+            |()| {
+                served = true;
+                serve
+            },
+        );
+        (status, String::from_utf8(out).unwrap(), taken, served)
+    }
+
+    #[test]
+    fn run_owner_reports_ok_then_serves() {
+        let (status, out, taken, served) = owner_run(b"text", Ok(()), Ok(()));
+        assert_eq!((status, out.as_str(), served), (0, "ok\n", true));
+        assert_eq!(taken.as_deref(), Some(&b"text"[..]));
+        assert_eq!(parse_status(&out), Ok(()));
+        let (status, _, _, served) = owner_run(b"t", Ok(()), Err(Failure::Other("lost".into())));
+        assert_eq!((status, served), (1, true));
+    }
+
+    #[test]
+    fn run_owner_reports_take_failure_on_one_line() {
+        let fail = Err(Failure::Connect("no\ndisplay".into()));
+        let (status, out, _, served) = owner_run(b"t", fail, Ok(()));
+        assert_eq!(
+            (status, out.as_str(), served),
+            (1, "error: no display\n", false)
+        );
+        assert_eq!(parse_status(&out), Err("no display".into()));
+    }
+
+    #[test]
+    fn run_owner_input_and_output_errors() {
+        /// Reads and writes that always fail.
+        struct Broken;
+        impl Read for Broken {
+            /// Always fails.
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("closed"))
+            }
+        }
+        impl Write for Broken {
+            /// Always fails.
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("closed"))
+            }
+            /// Nothing to flush.
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut out = Vec::new();
+        let status = run_owner(
+            Broken,
+            &mut out,
+            |_| -> Result<(), _> { panic!() },
+            |_| panic!(),
+        );
+        assert_eq!(status, 1);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "error: cannot read text: closed\n"
+        );
+        let status = run_owner(
+            &b"t"[..],
+            Broken,
+            |_| Ok(()),
+            |_| panic!("not after failed ok"),
+        );
+        assert_eq!(status, 1);
+    }
 
     #[test]
     fn prefers_utf8_target() {

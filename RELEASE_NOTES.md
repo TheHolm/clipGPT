@@ -64,6 +64,14 @@ User-facing changes:
   `--x11-clipboard-owner` is the sole argument, and kept out of `--help`.
   `main.rs` handles it before loading the config and never beeps in that
   mode.
+- The decisions in the clipboard code are pure functions with unit tests,
+  separate from the X11/Wayland I/O: Wayland result -> fallback/empty/error
+  (`finish_get`/`finish_set`), capped pipe reads (`read_capped`), poll
+  timeouts (`wait_until`), `TARGETS` parsing and the read plan
+  (`target_atoms`, `plan_read`), chunk intake (`take_chunk`), the owner's
+  answer to each request (`decide_answer`, `reply_property`), `INCR`
+  bookkeeping for several requestors (`Transfers`), the helper command line
+  (`helper_command`) and the helper's status protocol (`run_owner`).
 - Tests: unit tests for fallback classification, `DISPLAY` detection,
   combined error messages, target choice, Latin-1/UTF-8 decoding and size
   limits, `INCR` reassembly and chunking, the helper status protocol and
