@@ -3,6 +3,41 @@
 This file lists user-facing changes for each tagged release. See `AGENTS.md`
 for the versioning and tagging convention.
 
+## v0.4.1 - Audible beeps after the sound device has been idle
+
+User-facing changes:
+
+- **Fixed: the success/error beep was often silent or just a click.**
+  Sound servers (e.g. PipeWire/WirePlumber) suspend the output after a few
+  seconds of silence, and clipGPT always beeps after such a pause while it
+  waits for the LLM. Waking the device swallowed the start of the sound, so
+  a 250 ms beep was lost. Every beep now starts with 250 ms of silence, so
+  it plays about 250 ms later than before but is audible.
+- Problems during playback are now reported as "Could not play beep: ..."
+  instead of being ignored silently.
+
+### Details
+
+- `beep.rs`: every beep is laid out as `LEAD_IN_MILLIS` (250) of silence,
+  the tone with a 5 ms fade-in/out, then silence. Measured on a USB sink
+  behind `pipewire-alsa` after 12 s of silence: no lead-in gave a click,
+  150 ms and more gave the full tone, reproducibly; once the device was
+  awake every variant played.
+- The stream is kept open until cpal's playback clock (`Stream::now()`)
+  passes the reported playback time of the last tone frame plus 50 ms,
+  instead of sleeping for the tone length and dropping the stream (a drop
+  halts output immediately). Bounded by a 2 s timeout past the expected
+  end, so a stalled device or broken timestamps cannot hang the program.
+- The stream's error callback forwards errors over a channel instead of
+  discarding them; they become the `Could not play beep: ...` message.
+- The device's default buffer size is used. cpal 0.18's ALSA backend
+  already limits it to two periods and starts at two periods, so the
+  start threshold was never the problem.
+- Tests: tone layout, fade envelope, sample generation (silence before and
+  after the tone), end-of-tone playback time and the finish check, all
+  without an audio device.
+- No config keys, options or defaults change.
+
 ## v0.4.0 - Configurable request timeout
 
 User-facing changes:
