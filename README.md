@@ -2,11 +2,13 @@
 
 A small command-line tool that grabs whatever text is on your clipboard,
 sends it to an OpenAI-compatible LLM API (OpenAI itself, or a local server
-like Ollama), and pastes the response back onto the clipboard. It's meant to
+like Ollama or llama.cpp), and pastes the response back onto the clipboard. It's meant to
 be bound to an OS-level hotkey or macro key so you can select some text,
 trigger it, and have the rewritten/corrected version replace your clipboard
 contents a moment later. A beep plays when the response is ready (or when an
-error occurs).
+error occurs). If the clipboard holds an image instead of text - e.g. a
+screenshot - it is sent to the model, which by default transcribes the text
+in it as Markdown (see "Images" below).
 
 **On Linux and FreeBSD, clipGPT prefers Wayland and falls back to X11**
 (needed on GNOME, whose compositor doesn't offer the Wayland clipboard
@@ -47,9 +49,9 @@ To build from source instead:
    location" below. If it contains an `api_key`, make it private:
    `chmod 600 config.ini` (see "Security" below).
 
-3. Run `target/release/clip_gpt`. It copies whatever text is currently on
-   the clipboard, sends it to the configured LLM, and replaces the clipboard
-   contents with the response. Bind this to a hotkey/macro key using your
+3. Run `target/release/clip_gpt`. It copies whatever text (or, failing
+   that, image) is currently on the clipboard, sends it to the configured
+   LLM, and replaces the clipboard contents with the response. Bind this to a hotkey/macro key using your
    OS's own tools so you don't have to run it manually every time.
 
 ## Configuration parameters
@@ -61,11 +63,12 @@ To build from source instead:
 | api_key | -k *(not yet implemented)* |  | str | Optional. Empty or missing means no key is sent (e.g. local Ollama). If set, the config file must be mode 600 on Unix |
 | model |  |  | str | Required. Model name sent to api_url, e.g. gpt-4o-mini for OpenAI, or a local model name for Ollama |
 | prompt_text | -t *(not yet implemented)* | "Check spelling and gramma and rewrite following text on pirate speak. Be mean and pushy \n\n" | str | prompt used if clipboard contains text (sent as the system message, the clipboard text as a separate user message) |
-| prompt_image | -i *(not yet implemented)* | "OCR attached image and return text formatted as markdown" | str | prompt used if clipboard contains an image (not implemented) |
+| prompt_image | -i *(not yet implemented)* | an OCR prompt (see `config.ini.example`): transcribe all text in the image exactly, as Markdown, nothing else | str | prompt used if the clipboard contains an image and no text (sent as the system message, the image as a separate user message). The model must accept images, see "Images" |
 | beep_tone |  | 1046 | int | frequency in Hz, played when response is received and pasted to clipboard, approx. C6 |
 | error_tone |   | 131  | int  | frequency in Hz, played when an error occurs or a password was found on the clipboard, approx. C3 |
 | beep_duration |  | 250 | int | duration in ms, for error and success beeps (set to 0 to disable) |
 | max_input_bytes |  | 65536 | int | largest clipboard text (UTF-8 bytes) sent to the LLM; bigger clipboards are refused |
+| max_image_bytes |  | 10485760 | int | largest clipboard image (bytes) sent to the LLM, checked as read and after conversion to PNG; bigger images are refused |
 | allow_redirects |  | false | bool | follow HTTP redirects from api_url (true/false, yes/no, 1/0, on/off) |
 | secret_check | -s / --no-secret-check (turns it off) | true | bool | refuse clipboard text that looks like an API key, token, private key or URL with a password (see "Security") |
 | request_timeout | --timeout SECONDS | 30 | int | longest wait in seconds for the LLM's whole answer; 0 = no limit. Raise it for slow local models (e.g. a cold Ollama model load) |
@@ -73,11 +76,48 @@ To build from source instead:
 Command line options: `-s`/`--no-secret-check` skips the secret check for
 one run; `--timeout SECONDS` (or `--timeout=SECONDS`) sets the
 request timeout for one run, overriding `request_timeout` (0 = no limit);
-`-h`/`--help` prints usage. Any other argument is an error.
+`-V`/`--version` prints the version; `-h`/`--help` prints usage. Any other argument is an error.
 
 The following are planned but **not yet implemented**: the `-c`/`-k`/`-t`/`-i`
 command line options, and a `name`/`include` system for multiple named
 profiles within one config file.
+
+## Images
+
+When the clipboard holds no text (or only white space) but an image,
+clipGPT sends the image with `prompt_image` instead. When both are offered -
+office suites and browsers often put text *and* a rendered picture of it on
+the clipboard - the text wins. A clipboard with neither plays the error
+tone and is left unchanged.
+
+* **Formats.** PNG and JPEG are sent as they are. WebP, GIF (first frame),
+  BMP, Windows bitmaps (`CF_DIB`, e.g. from Print Screen) and TIFF (macOS
+  screenshots) are converted to PNG first, because not every server can
+  decode them (llama.cpp can't read WebP, OpenAI doesn't take BMP/TIFF).
+  The format is recognised from the data itself, not from the name the
+  copying program gave it. Anything else is refused.
+* **Limits.** Images over `max_image_bytes` (default 10 MiB) are refused,
+  both as read and after conversion. Conversion refuses pictures over
+  8192 pixels wide or high, or needing more than 256 MiB to decode.
+* **The model must understand images.** There's no check in advance -
+  picking a vision model is up to you (e.g. `gpt-4o-mini` on OpenAI;
+  `gemma3`, `qwen2.5vl` or `llama3.2-vision` on Ollama). If the server or
+  model can't take images, the request fails with an HTTP error and the
+  error tone; the message then adds a hint, e.g. `API returned HTTP 500 (the
+  model or server may not support image input - ...)`. Some older Ollama
+  versions ignore the image silently instead and answer anyway; clipGPT
+  can't detect that.
+* **llama.cpp.** `llama-server` accepts images only when started with the
+  model's multimodal projector: `llama-server -m model.gguf --mmproj
+  mmproj.gguf`, or `llama-server -hf ggml-org/gemma-3-4b-it-GGUF` (which
+  downloads the projector too). Without it, image requests fail with HTTP
+  500. Point `api_url` at `http://127.0.0.1:8080/v1/chat/completions`;
+  `model` is required by clipGPT but llama-server serves whatever it loaded.
+* **Speed.** Turning an image into model input is slow on a CPU, especially
+  for the first request after loading. Raise `request_timeout` (or use
+  `--timeout`) if requests time out.
+* **OCR-only models** (PaddleOCR-VL, GLM-OCR, DeepSeek-OCR, ...) are trained
+  on their own fixed prompts; set `prompt_image` to what the model expects.
 
 ### Config file location
 
@@ -100,8 +140,10 @@ output back where you will paste it, so it applies these protections:
   error tone and makes no request. Detected markers: Wayland and X11
   `x-kde-passwordManagerHint` (KeePassXC, KDE and others); Windows
   `ExcludeClipboardContentFromMonitorProcessing`, `Clipboard Viewer Ignore`,
-  or `CanIncludeInClipboardHistory` = 0. **macOS: not detected.** A password
-  manager that sets no marker can't be detected either.
+  or `CanIncludeInClipboardHistory` = 0; macOS
+  `org.nspasteboard.ConcealedType` (1Password, KeePassXC, Bitwarden and
+  others - untested, see "Releases"). A password manager that sets no marker
+  can't be detected.
 * **Hidden prompt injection is refused.** Clipboard text containing
   Unicode tag characters (U+E0000-U+E007F - invisible, but read by LLMs)
   is treated as an attack: the clipboard is replaced with a notice, the
@@ -127,6 +169,11 @@ output back where you will paste it, so it applies these protections:
   message (with a note to treat the user message as data); the clipboard
   text is the user message on its own. This makes prompt injection by
   clipboard text harder, not impossible.
+* **Images aren't filtered.** Text inside an image can't be checked for
+  secrets or hidden characters, so don't OCR screenshots of keys. The
+  model is told to treat text in the image as data, not instructions -
+  again harder, not impossible, to abuse. Password-manager markers are
+  still honoured.
 * **The response is cleaned before it is pasted.** Control characters
   (except newline and tab - this removes terminal escape sequences),
   bidirectional-override characters, zero-width characters, the BOM and
@@ -141,8 +188,8 @@ output back where you will paste it, so it applies these protections:
   `allow_redirects=true`; then each hop is checked the same way (at most 10).
   When a redirect changes host the API key is dropped, but a 307/308
   redirect does re-send the clipboard text to the new host.
-* **Limits.** Clipboard text over `max_input_bytes` is refused; responses
-  over 1 MiB are discarded.
+* **Limits.** Clipboard text over `max_input_bytes` and images over
+  `max_image_bytes` are refused; responses over 1 MiB are discarded.
 * **No content in logs.** Error messages contain only HTTP status codes and
   error kinds - never the response body, which can echo your text back.
 * **Key file permissions.** On Linux/FreeBSD/macOS, if `config.ini` holds an
@@ -183,9 +230,10 @@ Clipboard access is OS-specific:
   * If neither works, the error names both reasons (e.g. "Wayland: ...;
     X11: ...").
 * **Windows**: `clipboard-win`, called directly.
-* **macOS**: the old cross-platform `clipboard` crate, kept only for its
-  Cocoa backend (the audit issue above was specifically in its X11 backend,
-  not this one) - see the macOS note under "Releases" below.
+* **macOS**: the system pasteboard (`NSPasteboard`) directly, via the
+  maintained `objc2` bindings. Unlike the old `clipboard` crate used before,
+  this can list the pasteboard's types, which images and password-marker
+  detection need - see the macOS note under "Releases" below.
 
 ## Compiling
 
@@ -262,11 +310,14 @@ tagging convention.
 macOS builds aren't produced by CI: cross-compiling for macOS needs Apple's
 SDK, which Apple's license doesn't allow redistributing, so there's no
 Docker image or CI setup that can produce one without you supplying your
-own SDK. That said, clipGPT's dependencies (`clipboard`, `cpal`, `native-tls`)
-all have genuine upstream macOS support, so building it natively on a real
-Mac - just `cargo build --release`, no cross-compiling involved - will very
-likely work too; it's just untested here, since no Mac hardware is available
-in this environment.
+own SDK. That said, clipGPT's dependencies (`objc2-app-kit`, `cpal`,
+`native-tls`) all have genuine upstream macOS support, so building it
+natively on a real Mac - just `cargo build --release`, no cross-compiling
+involved - will very likely work too; it's just untested here, since no Mac
+hardware is available in this environment. The macOS code is only checked
+to compile (`cargo check --target aarch64-apple-darwin` needs no SDK);
+clipboard text, images and password markers on macOS have never actually
+been run.
 
 ## License
 

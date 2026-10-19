@@ -1,6 +1,6 @@
 [package]
 name = "clip_gpt"
-version = "0.4.1"
+version = "0.5.0"
 authors = [ "TheHolm" ]
 license = "AGPL-3.0-or-later"
 rust-version = "1.92"
@@ -15,6 +15,12 @@ pretty_ini = "0.1"
 native-tls = "0.2.13"
 cpal = "0.18"
 regex = "1.12"
+base64 = "0.23"
+# Clipboard images other than PNG/JPEG (WebP, GIF, BMP/Windows DIB, TIFF)
+# are converted to PNG, the one format every OpenAI-compatible server
+# decodes. Only these pure-Rust codecs are enabled - no native library on
+# any target, and no JPEG/AVIF/EXR code that is never used.
+image = { version = "0.25", default-features = false, features = ["png", "gif", "webp", "bmp", "tiff"] }
 
 # Clipboard access is OS-specific: Linux/FreeBSD use wl-clipboard-rs
 # (Wayland data-control) first and x11rb (X11/Xwayland) as fallback, e.g.
@@ -23,9 +29,10 @@ regex = "1.12"
 # crates it does not pull in xcb 0.8.2, unmaintained since 2022 with real
 # soundness advisories (RUSTSEC-2021-0019). Windows keeps the same underlying backend the old
 # cross-platform `clipboard` crate used there (clipboard-win), just called
-# directly instead of through that abstraction. macOS keeps the old
-# `clipboard` crate purely for its Cocoa backend, since the audit problem
-# was specifically in its X11 backend, not here.
+# directly instead of through that abstraction. macOS talks to
+# NSPasteboard directly through the maintained objc2 bindings, which (unlike
+# the old unmaintained `clipboard` crate) can list the clipboard's types -
+# needed for images and for password-manager markers.
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 wl-clipboard-rs = "0.9"
 x11rb = "0.14"
@@ -34,7 +41,9 @@ x11rb = "0.14"
 clipboard-win = "5.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-clipboard = "0.5"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSData", "NSEnumerator", "NSString"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard"] }
 
 [package.metadata.deb]
 maintainer = "TheHolm"

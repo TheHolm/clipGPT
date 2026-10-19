@@ -5,10 +5,13 @@
 //! (`clipboard`/`x11-clipboard`, built on the `xcb` crate) is unmaintained
 //! since 2022 and has real, published soundness advisories (e.g.
 //! RUSTSEC-2021-0019). See README.md "Clipboard backend" for the full
-//! reasoning, including why Linux/FreeBSD are Wayland-only now (X11 is
-//! Wayland is tried first; X11 (`x11rb`, see the `x11` submodule) is the
-//! fallback for compositors without a data-control protocol (GNOME) and for
-//! pure X11 sessions.
+//! reasoning. On Linux/FreeBSD Wayland is tried first; X11 (`x11rb`, see
+//! the `x11` submodule) is the fallback for compositors without a
+//! data-control protocol (GNOME) and for pure X11 sessions.
+//!
+//! Reading prefers text: an image is read only when no text, or only
+//! white space, is offered (apps such as office suites and browsers often
+//! offer both, the image being a rendering of the text).
 //!
 //! Reading also detects clipboard contents that a password manager has
 //! marked as sensitive, so they are never sent to the LLM:
@@ -17,16 +20,82 @@
 //! * Windows: the `ExcludeClipboardContentFromMonitorProcessing` and
 //!   `Clipboard Viewer Ignore` formats, or `CanIncludeInClipboardHistory`
 //!   set to 0
-//! * macOS: not detected - the `clipboard` crate cannot list formats
+//! * macOS: the `org.nspasteboard.ConcealedType` pasteboard type
+
+use crate::imagefile::{too_large as image_too_large, ClipImage};
 
 /// What was found on the clipboard.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Clip {
-    /// Plain text (empty if the clipboard held no text).
+    /// Plain text (empty if the clipboard held neither text nor an image).
     Text(String),
+    /// An image (only when there was no non-blank text).
+    Image(ClipImage),
     /// Contents a password manager marked as sensitive. The text itself is
     /// never read.
     Password,
+}
+
+/// Size limits for reading the clipboard, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Largest text, in UTF-8 (`max_input_bytes`).
+    pub text: usize,
+    /// Largest image as read (`max_image_bytes`).
+    pub image: usize,
+}
+
+/// Image MIME types (Wayland) / targets (X11) we can read, most preferred
+/// first: formats sent as-is before those that need converting.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "freebsd", test)),
+    allow(dead_code)
+)]
+const IMAGE_MIME_PREFERENCE: [&str; 6] = [
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "image/bmp",
+    "image/tiff",
+];
+
+/// macOS pasteboard type of plain text.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+const MACOS_TEXT_TYPE: &str = "public.utf8-plain-text";
+
+/// macOS pasteboard image types we can read, most preferred first. Screen
+/// shots are usually offered as PNG and TIFF.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+const MACOS_IMAGE_PREFERENCE: [&str; 3] = ["public.png", "public.jpeg", "public.tiff"];
+
+/// macOS pasteboard type password managers add to mark a secret (see
+/// nspasteboard.org).
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+const MACOS_CONCEALED_TYPE: &str = "org.nspasteboard.ConcealedType";
+
+/// The first entry of `preference` that is among `offered`, if any.
+#[cfg_attr(not(any(unix, test)), allow(dead_code))]
+fn pick<'a>(preference: &[&'a str], offered: &[&str]) -> Option<&'a str> {
+    preference
+        .iter()
+        .copied()
+        .find(|wanted| offered.contains(wanted))
+}
+
+/// The image MIME type / X11 target to read among `offered`, if any.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "freebsd", test)),
+    allow(dead_code)
+)]
+fn choose_image_type(offered: &[&str]) -> Option<&'static str> {
+    pick(&IMAGE_MIME_PREFERENCE, offered)
+}
+
+/// Whether to use the `text` read rather than an available image: text
+/// wins unless it is blank or there is no image to fall back to.
+fn use_text(text: &str, image_available: bool) -> bool {
+    !image_available || !text.trim().is_empty()
 }
 
 /// MIME type (Wayland) / target (X11) password managers add to mark a
@@ -48,10 +117,10 @@ const WINDOWS_EXCLUDE_FORMATS: [&str; 2] = [
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const WINDOWS_HISTORY_FORMAT: &str = "CanIncludeInClipboardHistory";
 
-/// Read the current clipboard contents. Text longer than `max_bytes` (in
-/// UTF-8) is an error; it is never returned in part.
-pub fn get_text(max_bytes: usize) -> Result<Clip, String> {
-    imp::get_text(max_bytes)
+/// Read the current clipboard contents. Text or an image over its limit
+/// is an error; it is never returned in part.
+pub fn get(limits: Limits) -> Result<Clip, String> {
+    imp::get(limits)
 }
 
 /// Replace the clipboard contents with `text`.
@@ -173,7 +242,10 @@ fn display_is_set(display: Option<std::ffi::OsString>) -> bool {
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod imp {
-    use super::{bytes_to_text, display_is_set, marks_password, with_x11_fallback, x11, Clip};
+    use super::{
+        bytes_to_text, choose_image_type, display_is_set, image_too_large, marks_password,
+        too_large, use_text, with_x11_fallback, x11, Clip, ClipImage, Limits,
+    };
     use std::io::Read;
     use wl_clipboard_rs::copy::{Error as CopyError, MimeType as CopyMimeType, Options, Source};
     use wl_clipboard_rs::paste::{
@@ -217,10 +289,8 @@ mod imp {
 
     /// Read the clipboard via Wayland, falling back to X11 when Wayland
     /// clipboard access is unavailable (see [`paste_unavailable`]).
-    pub fn get_text(max_bytes: usize) -> Result<Clip, String> {
-        finish_get(wayland_get_text(max_bytes), have_display(), || {
-            x11::get_text(max_bytes)
-        })
+    pub fn get(limits: Limits) -> Result<Clip, String> {
+        finish_get(wayland_get(limits), have_display(), || x11::get(limits))
     }
 
     /// Turn the Wayland read result into the final one: unavailable Wayland
@@ -242,28 +312,61 @@ mod imp {
     }
 
     /// Check the offered MIME types for a password hint, then read the text
-    /// (see [`read_capped`]). Wayland errors are returned as-is (outer
-    /// `Err`) for [`finish_get`] to classify; read/size errors are final
-    /// (inner `Err`).
-    fn wayland_get_text(max_bytes: usize) -> Result<Result<Clip, String>, PasteError> {
+    /// and, if that is blank, an offered image (see [`read_capped`]).
+    /// Wayland errors are returned as-is (outer `Err`) for [`finish_get`]
+    /// to classify; read/size errors are final (inner `Err`).
+    fn wayland_get(limits: Limits) -> Result<Result<Clip, String>, PasteError> {
         let types = get_mime_types(ClipboardType::Regular, Seat::Unspecified)?;
-        if marks_password(types.iter().map(String::as_str)) {
+        let offered: Vec<&str> = types.iter().map(String::as_str).collect();
+        if marks_password(offered.iter().copied()) {
             return Ok(Ok(Clip::Password));
         }
-        let (pipe, _) = get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Text)?;
-        Ok(read_capped(pipe, max_bytes).map(Clip::Text))
+        let image_type = choose_image_type(&offered);
+        let text = match get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Text) {
+            Ok((pipe, _)) => match read_capped(pipe, limits.text) {
+                Ok(text) => text,
+                Err(e) => return Ok(Err(e)),
+            },
+            // No text type offered at all: an image may still be.
+            Err(PasteError::NoMimeType) if image_type.is_some() => String::new(),
+            Err(err) => return Err(err),
+        };
+        let image_type = match image_type {
+            Some(image_type) if !use_text(&text, true) => image_type,
+            _ => return Ok(Ok(Clip::Text(text))),
+        };
+        let (pipe, _) = get_contents(
+            ClipboardType::Regular,
+            Seat::Unspecified,
+            MimeType::Specific(image_type),
+        )?;
+        Ok(read_bytes_capped(pipe, limits.image, image_too_large)
+            .map(|bytes| Clip::Image(ClipImage::File(bytes))))
     }
 
-    /// Read text from `source` with a hard cap of `max_bytes + 1` bytes, so
-    /// a huge or endless source cannot exhaust memory; more than
-    /// `max_bytes` is an error.
-    pub(super) fn read_capped(source: impl Read, max_bytes: usize) -> Result<String, String> {
+    /// Read from `source` with a hard cap of `max_bytes + 1` bytes, so a
+    /// huge or endless source cannot exhaust memory; more than `max_bytes`
+    /// is the error `too_big(max_bytes)`.
+    pub(super) fn read_bytes_capped(
+        source: impl Read,
+        max_bytes: usize,
+        too_big: fn(usize) -> String,
+    ) -> Result<Vec<u8>, String> {
         let mut contents = Vec::new();
         source
             .take(max_bytes as u64 + 1)
             .read_to_end(&mut contents)
             .map_err(|e| format!("Failed to read clipboard contents: {e}"))?;
-        bytes_to_text(contents, max_bytes)
+        if contents.len() > max_bytes {
+            return Err(too_big(max_bytes));
+        }
+        Ok(contents)
+    }
+
+    /// Read text from `source` like [`read_bytes_capped`], with the text
+    /// size limit.
+    pub(super) fn read_capped(source: impl Read, max_bytes: usize) -> Result<String, String> {
+        read_bytes_capped(source, max_bytes, too_large).and_then(|b| bytes_to_text(b, max_bytes))
     }
 
     /// Offer `text` as the new clipboard contents via Wayland, falling back
@@ -295,20 +398,26 @@ mod imp {
     }
 }
 
+/// Registered Windows clipboard format names under which applications
+/// offer PNG data, most common first.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const WINDOWS_PNG_FORMATS: [&str; 2] = ["PNG", "image/png"];
+
 #[cfg(target_os = "windows")]
 mod imp {
     use super::{
-        check_text_size, too_large, windows_marks_password, Clip, WINDOWS_EXCLUDE_FORMATS,
-        WINDOWS_HISTORY_FORMAT,
+        check_text_size, image_too_large, too_large, use_text, windows_marks_password, Clip,
+        ClipImage, Limits, WINDOWS_EXCLUDE_FORMATS, WINDOWS_HISTORY_FORMAT, WINDOWS_PNG_FORMATS,
     };
     use clipboard_win::{formats, raw, Clipboard, Getter};
 
     /// Open the clipboard, check the password-manager markers, and read the
-    /// text if there is any. The size is checked before copying: UTF-16
-    /// takes at most twice the bytes of the same text in UTF-8, so a UTF-16
-    /// buffer over `2 * (max_bytes + 1)` bytes (incl. the terminator) is
-    /// certainly too large.
-    pub fn get_text(max_bytes: usize) -> Result<Clip, String> {
+    /// text if there is any, else an image (see [`read_image`]). The text
+    /// size is checked before copying: UTF-16 takes at most twice the bytes
+    /// of the same text in UTF-8, so a UTF-16 buffer over
+    /// `2 * (max_bytes + 1)` bytes (incl. the terminator) is certainly too
+    /// large.
+    pub fn get(limits: Limits) -> Result<Clip, String> {
         let _clip =
             Clipboard::new_attempts(10).map_err(|e| format!("Failed to open clipboard: {e}"))?;
 
@@ -324,19 +433,65 @@ mod imp {
             return Ok(Clip::Password);
         }
 
-        if !raw::is_format_avail(formats::CF_UNICODETEXT) {
-            return Ok(Clip::Text(String::new()));
-        }
-        if let Some(size) = raw::size(formats::CF_UNICODETEXT) {
-            if size.get() / 2 > max_bytes + 1 {
-                return Err(too_large(max_bytes));
-            }
-        }
+        let image_format = image_format();
         let mut text = String::new();
-        formats::Unicode
-            .read_clipboard(&mut text)
-            .map_err(|e| format!("Failed to get clipboard content: {e}"))?;
-        check_text_size(text, max_bytes).map(Clip::Text)
+        if raw::is_format_avail(formats::CF_UNICODETEXT) {
+            if let Some(size) = raw::size(formats::CF_UNICODETEXT) {
+                if size.get() / 2 > limits.text + 1 {
+                    return Err(too_large(limits.text));
+                }
+            }
+            formats::Unicode
+                .read_clipboard(&mut text)
+                .map_err(|e| format!("Failed to get clipboard content: {e}"))?;
+            text = check_text_size(text, limits.text)?;
+        }
+        match image_format {
+            Some(image) if !use_text(&text, true) => {
+                read_image(image, limits.image).map(Clip::Image)
+            }
+            _ => Ok(Clip::Text(text)),
+        }
+    }
+
+    /// An image format on the clipboard: registered PNG data, or a bitmap
+    /// (`CF_DIB`, which Windows also synthesises from `CF_BITMAP` and
+    /// `CF_DIBV5`).
+    #[derive(Clone, Copy)]
+    enum ImageFormat {
+        Png(u32),
+        Dib,
+    }
+
+    /// The best image format available, PNG preferred.
+    fn image_format() -> Option<ImageFormat> {
+        WINDOWS_PNG_FORMATS
+            .iter()
+            .filter_map(|name| raw::register_format(name))
+            .map(|f| f.get())
+            .find(|&f| raw::is_format_avail(f))
+            .map(ImageFormat::Png)
+            .or_else(|| raw::is_format_avail(formats::CF_DIB).then_some(ImageFormat::Dib))
+    }
+
+    /// Read `format` (size checked against `max_bytes` before copying).
+    fn read_image(format: ImageFormat, max_bytes: usize) -> Result<ClipImage, String> {
+        let id = match format {
+            ImageFormat::Png(id) => id,
+            ImageFormat::Dib => formats::CF_DIB,
+        };
+        if raw::size(id).is_some_and(|size| size.get() > max_bytes) {
+            return Err(image_too_large(max_bytes));
+        }
+        let mut bytes = Vec::new();
+        raw::get_vec(id, &mut bytes).map_err(|e| format!("Failed to get clipboard image: {e}"))?;
+        if bytes.len() > max_bytes {
+            return Err(image_too_large(max_bytes));
+        }
+        Ok(match format {
+            ImageFormat::Png(_) => ClipImage::File(bytes),
+            ImageFormat::Dib => ClipImage::Dib(bytes),
+        })
     }
 
     /// Replace the clipboard contents with `text`.
@@ -351,27 +506,86 @@ mod imp {
     }
 }
 
+/// What to read from the macOS pasteboard, decided from its type names.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+enum MacPlan {
+    /// A password manager marked the contents; do not read them.
+    Password,
+    /// Read the text if `text` is set, and fall back to this image type.
+    Read {
+        text: bool,
+        image: Option<&'static str>,
+    },
+}
+
+/// Decide what to read from the pasteboard's offered `types`.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn plan_macos(types: &[&str]) -> MacPlan {
+    if types.contains(&MACOS_CONCEALED_TYPE) {
+        return MacPlan::Password;
+    }
+    MacPlan::Read {
+        text: types.contains(&MACOS_TEXT_TYPE),
+        image: pick(&MACOS_IMAGE_PREFERENCE, types),
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
-    use super::{check_text_size, Clip};
-    use clipboard::{ClipboardContext, ClipboardProvider};
+    use super::{
+        check_text_size, image_too_large, plan_macos, use_text, Clip, ClipImage, Limits, MacPlan,
+        MACOS_TEXT_TYPE,
+    };
+    use objc2_app_kit::NSPasteboard;
+    use objc2_foundation::NSString;
 
-    /// Read the clipboard text. Password markers cannot be detected here.
-    pub fn get_text(max_bytes: usize) -> Result<Clip, String> {
-        let mut ctx: ClipboardContext =
-            ClipboardProvider::new().map_err(|e| format!("Failed to initialize clipboard: {e}"))?;
-        let text = ctx
-            .get_contents()
-            .map_err(|e| format!("Failed to get clipboard content: {e}"))?;
-        check_text_size(text, max_bytes).map(Clip::Text)
+    /// Read the general pasteboard: password marker first, then text, then
+    /// (if the text is blank) an image. The image size is checked before
+    /// copying its bytes.
+    pub fn get(limits: Limits) -> Result<Clip, String> {
+        let pasteboard = NSPasteboard::generalPasteboard();
+        let types: Vec<String> = pasteboard
+            .types()
+            .map(|types| types.iter().map(|t| t.to_string()).collect())
+            .unwrap_or_default();
+        let types: Vec<&str> = types.iter().map(String::as_str).collect();
+        let (want_text, image) = match plan_macos(&types) {
+            MacPlan::Password => return Ok(Clip::Password),
+            MacPlan::Read { text, image } => (text, image),
+        };
+        let mut text = String::new();
+        if want_text {
+            if let Some(string) = pasteboard.stringForType(&NSString::from_str(MACOS_TEXT_TYPE)) {
+                text = check_text_size(string.to_string(), limits.text)?;
+            }
+        }
+        let image = match image {
+            Some(image) if !use_text(&text, true) => image,
+            _ => return Ok(Clip::Text(text)),
+        };
+        let Some(data) = pasteboard.dataForType(&NSString::from_str(image)) else {
+            return Ok(Clip::Text(text));
+        };
+        if data.length() > limits.image {
+            return Err(image_too_large(limits.image));
+        }
+        Ok(Clip::Image(ClipImage::File(data.to_vec())))
     }
 
-    /// Replace the clipboard contents with `text`.
+    /// Replace the pasteboard contents with `text`.
     pub fn set_text(text: String) -> Result<(), String> {
-        let mut ctx: ClipboardContext =
-            ClipboardProvider::new().map_err(|e| format!("Failed to initialize clipboard: {e}"))?;
-        ctx.set_contents(text)
-            .map_err(|e| format!("Failed to set clipboard content: {e}"))
+        let pasteboard = NSPasteboard::generalPasteboard();
+        pasteboard.clearContents();
+        let written = pasteboard.setString_forType(
+            &NSString::from_str(&text),
+            &NSString::from_str(MACOS_TEXT_TYPE),
+        );
+        if written {
+            Ok(())
+        } else {
+            Err("Failed to set clipboard content".to_string())
+        }
     }
 
     /// The X11 owner helper does not exist on macOS.
@@ -506,6 +720,12 @@ mod tests {
             imp::finish_get(Ok(Ok(Clip::Password)), true, never),
             Ok(Clip::Password)
         );
+        let image = || Clip::Image(ClipImage::File(b"\x89PNG".to_vec()));
+        assert_eq!(imp::finish_get(Ok(Ok(image())), true, never), Ok(image()));
+        assert_eq!(
+            imp::finish_get(Err(Error::NoMimeType), true, never),
+            Ok(Clip::Text(String::new()))
+        );
         assert_eq!(
             imp::finish_get(Ok(Err(too_large(3))), true, never),
             Err(too_large(3))
@@ -567,6 +787,72 @@ mod tests {
         }
         let err = imp::read_capped(Broken, 5).unwrap_err();
         assert_eq!(err, "Failed to read clipboard contents: pipe closed");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn read_bytes_capped_uses_given_error() {
+        assert_eq!(
+            imp::read_bytes_capped(&b"\x89PNG"[..], 3, image_too_large),
+            Err(image_too_large(3))
+        );
+        assert_eq!(
+            imp::read_bytes_capped(&b"\x89PNG"[..], 4, image_too_large),
+            Ok(b"\x89PNG".to_vec())
+        );
+        assert!(image_too_large(4).contains("max_image_bytes"));
+    }
+
+    #[test]
+    fn text_wins_unless_blank_with_image() {
+        assert!(use_text("hello", true));
+        assert!(use_text("hello", false));
+        assert!(use_text("", false));
+        assert!(use_text(" \n\t", false));
+        assert!(!use_text("", true));
+        assert!(!use_text(" \r\n", true));
+    }
+
+    #[test]
+    fn image_type_preference() {
+        let offered = ["text/html", "image/bmp", "image/png", "image/webp"];
+        assert_eq!(choose_image_type(&offered), Some("image/png"));
+        assert_eq!(
+            choose_image_type(&["image/gif", "image/webp"]),
+            Some("image/webp")
+        );
+        assert_eq!(choose_image_type(&["image/tiff"]), Some("image/tiff"));
+        assert_eq!(choose_image_type(&["image/svg+xml", "text/plain"]), None);
+        assert_eq!(choose_image_type(&[]), None);
+    }
+
+    #[test]
+    fn macos_plan() {
+        assert_eq!(
+            plan_macos(&["public.utf8-plain-text", "org.nspasteboard.ConcealedType"]),
+            MacPlan::Password
+        );
+        assert_eq!(
+            plan_macos(&["public.tiff", "public.png", "public.utf8-plain-text"]),
+            MacPlan::Read {
+                text: true,
+                image: Some("public.png")
+            }
+        );
+        assert_eq!(
+            plan_macos(&["public.tiff"]),
+            MacPlan::Read {
+                text: false,
+                image: Some("public.tiff")
+            }
+        );
+        assert_eq!(
+            plan_macos(&["com.adobe.pdf"]),
+            MacPlan::Read {
+                text: false,
+                image: None
+            }
+        );
     }
 
     #[test]
