@@ -61,11 +61,17 @@ when:
   - event: tag
     ref: refs/tags/v*
 
+# Steps run in two lanes so at most two builds share the CI host at once
+# (all seven in parallel overloaded it). Each step waits for the previous
+# one in its lane; publish waits for every build:
+#
+#   lane A: build-freebsd-pkg -> build-windows-amd64 -> build-windows-arm64
+#   lane B: build-ci-tools -> linux-amd64-trixie -> linux-arm64-trixie
+#           -> linux-amd64-ubuntu2604 -> linux-arm64-ubuntu2604
+#
+# A failing step skips the rest of its lane, and so the publish step: every
+# target stays hard-required. FreeBSD, the slowest step, starts lane A.
 steps:
-  # Declared first since it is the slowest (downloads a FreeBSD base set
-  # plus a dependency closure before compiling anything) - Woodpecker tends
-  # to favor declaration order when queuing under limited concurrency, so
-  # the slowest step should not be left waiting behind faster ones.
   - name: build-freebsd-pkg
     image: rust:1.92-trixie
     depends_on: []
@@ -121,17 +127,33 @@ steps:
       - rustup target add x86_64-unknown-freebsd
       - ./scripts/ci-freebsd.sh /opt/freebsd-sysroot /opt/freebsd-stage dist /opt/freebsd-deps.json
 
-  - name: build-linux-amd64-trixie
+  # cargo-deb and cargo-audit are compiled once here into the shared
+  # workspace (.ci-tools/bin) instead of in every .deb step. Built against
+  # trixie's glibc, they also run in the ubuntu:26.04 steps (newer glibc);
+  # the arm64 steps cross-compile on the amd64 host, so they run the same
+  # amd64 tools. Removed first: the workspace can persist between runs, and
+  # a stale or half-built tool must never be reused.
+  - name: build-ci-tools
     image: rust:1.92-trixie
     depends_on: []
+    commands:
+      - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
+      - rm -rf .ci-tools
+      - cargo install cargo-deb --locked --version 3.8.0 --root .ci-tools
+      - cargo install cargo-audit --locked --version 0.22.2 --root .ci-tools
+      - .ci-tools/bin/cargo-deb --version
+      - .ci-tools/bin/cargo-audit --version
+
+  - name: build-linux-amd64-trixie
+    image: rust:1.92-trixie
+    depends_on: [build-ci-tools]
     environment:
       CARGO_TARGET_DIR: target/linux-amd64-trixie
     commands:
       - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
       - apt-get update && apt-get install -y --no-install-recommends libasound2-dev libssl-dev pkg-config lintian
-      - cargo install cargo-deb --locked
+      - export PATH="$CI_WORKSPACE/.ci-tools/bin:$PATH"
       # Fails the release when a dependency in Cargo.lock has a published advisory.
-      - cargo install cargo-audit --locked --version 0.22.2
       - cargo audit
       - cargo deb --target x86_64-unknown-linux-gnu --deb-revision "1~trixie"
       - mkdir -p dist
@@ -146,7 +168,7 @@ steps:
 
   - name: build-linux-arm64-trixie
     image: rust:1.92-trixie
-    depends_on: []
+    depends_on: [build-linux-amd64-trixie]
     environment:
       CARGO_TARGET_DIR: target/linux-arm64-trixie
     commands:
@@ -158,7 +180,7 @@ steps:
       - export PKG_CONFIG_ALLOW_CROSS=1
       - export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
       - export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig
-      - cargo install cargo-deb --locked
+      - export PATH="$CI_WORKSPACE/.ci-tools/bin:$PATH"
       - cargo deb --target aarch64-unknown-linux-gnu --deb-revision "1~trixie"
       - mkdir -p dist
       - cp target/linux-arm64-trixie/aarch64-unknown-linux-gnu/debian/*.deb dist/
@@ -169,7 +191,7 @@ steps:
 
   - name: build-linux-amd64-ubuntu2604
     image: ubuntu:26.04
-    depends_on: []
+    depends_on: [build-linux-arm64-trixie]
     environment:
       CARGO_TARGET_DIR: target/linux-amd64-ubuntu2604
     commands:
@@ -180,7 +202,7 @@ steps:
       - sh scripts/fetch-verified.sh https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init /tmp/rustup-init
       - chmod +x /tmp/rustup-init && /tmp/rustup-init -y --profile minimal --default-toolchain 1.92.0
       - . "$HOME/.cargo/env"
-      - cargo install cargo-deb --locked
+      - export PATH="$CI_WORKSPACE/.ci-tools/bin:$PATH"
       - cargo deb --deb-revision "1~ubuntu2604"
       - mkdir -p dist
       - cp target/linux-amd64-ubuntu2604/debian/*.deb dist/
@@ -191,7 +213,7 @@ steps:
 
   - name: build-linux-arm64-ubuntu2604
     image: ubuntu:26.04
-    depends_on: []
+    depends_on: [build-linux-amd64-ubuntu2604]
     environment:
       CARGO_TARGET_DIR: target/linux-arm64-ubuntu2604
     commands:
@@ -206,7 +228,7 @@ steps:
       - export PKG_CONFIG_ALLOW_CROSS=1
       - export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
       - export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig
-      - cargo install cargo-deb --locked
+      - export PATH="$CI_WORKSPACE/.ci-tools/bin:$PATH"
       - cargo deb --target aarch64-unknown-linux-gnu --deb-revision "1~ubuntu2604"
       - mkdir -p dist
       - cp target/linux-arm64-ubuntu2604/aarch64-unknown-linux-gnu/debian/*.deb dist/
@@ -217,7 +239,7 @@ steps:
 
   - name: build-windows-amd64
     image: rust:1.92-trixie
-    depends_on: []
+    depends_on: [build-freebsd-pkg]
     commands:
       - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
       - apt-get update && apt-get install -y --no-install-recommends mingw-w64
@@ -232,7 +254,7 @@ steps:
 
   - name: build-windows-arm64
     image: rust:1.92-trixie
-    depends_on: []
+    depends_on: [build-windows-amd64]
     commands:
       - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
       # Classic GNU mingw-w64 has no ARM64 Windows support at all - only the
@@ -256,6 +278,7 @@ steps:
   - name: publish-github-release
     image: rust:1.92-trixie
     depends_on:
+      - build-ci-tools
       - build-freebsd-pkg
       - build-linux-amd64-trixie
       - build-linux-arm64-trixie

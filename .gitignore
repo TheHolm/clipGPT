@@ -4,3 +4,4 @@ execute.sh
 *.swp
 *.swo
 *~
+.ci-tools
