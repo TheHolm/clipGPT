@@ -300,6 +300,19 @@ steps:
       - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
       - apt-get update && apt-get install -y --no-install-recommends gh
       - ./scripts/extract-release-notes.sh "$CI_COMMIT_TAG" RELEASE_NOTES.md > /tmp/release-notes.md
+      # GitHub replaces '~' with '.' in release asset file names on upload
+      # (observed on the v0.4.0 release: dist/clip-gpt_0.4.0-1~trixie_amd64.deb
+      # was published as clip-gpt_0.4.0-1.trixie_amd64.deb) - only the .deb
+      # names contain '~' (the FreeBSD .pkg, the .exe files and SHA256SUMS
+      # itself never do). Rename here first, before SHA256SUMS is written,
+      # so its names already match what gh uploads and `sha256sum -c
+      # SHA256SUMS` works against the files as actually downloaded.
+      - |
+        for f in dist/*; do
+          case "$f" in
+            *'~'*) mv -- "$f" "$(printf '%s' "$f" | tr '~' '.')" ;;
+          esac
+        done
       # Checksums of everything released, so downloads can be checked.
       - cd dist && sha256sum -- * > SHA256SUMS && cd ..
       # Idempotent: create the release, or update it in place when a tag is
