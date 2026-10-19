@@ -3,6 +3,95 @@
 This file lists user-facing changes for each tagged release. See `AGENTS.md`
 for the versioning and tagging convention.
 
+## v0.5.0 - Clipboard images (OCR) and an empty-clipboard fix
+
+User-facing changes:
+
+- **New: clipboard images are sent to the model.** When the clipboard
+  holds an image and no text (e.g. a screenshot), clipGPT sends the image
+  with `prompt_image` and puts the answer on the clipboard. When both text
+  and an image are offered (office suites, browsers), the text wins.
+- **New default `prompt_image`** makes the model act as an OCR engine:
+  transcribe all text in the image exactly as written, laid out as
+  Markdown, with no comments; `[illegible]` for unreadable parts and
+  `[no text found]` for images without text.
+- **New option `max_image_bytes`** (default 10485760, 10 MiB): bigger
+  images are refused with the error tone.
+- PNG and JPEG are sent as they are; WebP, GIF, BMP, Windows bitmaps and
+  TIFF are converted to PNG, so llama.cpp, Ollama and OpenAI can all read
+  them. Other image formats are refused.
+- **The model must understand images** - choosing one is up to you. If the
+  server or model refuses an image (e.g. llama.cpp started without
+  `--mmproj`), the error tone plays and the message adds a hint that the
+  model or server may not support image input.
+- **Fixed: an empty clipboard (or one holding only an image) used to be
+  sent as an empty message,** and the model's reply ("please provide the
+  text...") replaced the clipboard with the success beep. A clipboard with
+  no usable text and no image now plays the error tone and is left
+  unchanged; so is text that is only white space or invisible characters.
+- **macOS:** the clipboard is now read and written through the system
+  pasteboard directly. This adds images (PNG, JPEG, TIFF) and detection of
+  password-manager markers (`org.nspasteboard.ConcealedType`) on macOS.
+  macOS is still not built by CI and this code has not been run on a Mac.
+- **New option `-V`/`--version`** prints the version (`clip_gpt version 0.5.0`).
+
+### Details
+
+- `imagefile.rs` (new): `ClipImage::{File, Dib}` from the backends,
+  `prepare` sniffs the format from its magic bytes (the clipboard's type
+  name is never trusted), passes PNG/JPEG through, and decodes
+  WebP/GIF/BMP/TIFF/DIB with the `image` crate (only its pure-Rust
+  `png`, `gif`, `webp`, `bmp`, `tiff` codecs, no default features) and
+  re-encodes them as 8-bit RGB or RGBA PNG. Decoding is bounded by
+  `image::Limits`: 8192x8192 pixels and 256 MiB allocation, so a small
+  file with huge declared dimensions is refused without allocating. The
+  size limit is checked on the raw bytes and again on the converted PNG.
+  `Prepared::data_url` encodes with the `base64` crate.
+- `clipboard_backend.rs`: `get_text(max_bytes)` became `get(Limits { text,
+  image })`, and `Clip` gained `Image(ClipImage)`. All backends check the
+  password marker first, read text, and read an image only if the text is
+  blank (`use_text`).
+  - Wayland: the offered MIME types pick the image type (`image/png`,
+    `jpeg`, `webp`, `gif`, `bmp`, `tiff`, in that order); a clipboard
+    offering an image but no text type no longer counts as empty.
+  - X11: `plan_read` returns the text targets and an image target from
+    `TARGETS`; the image is read through the same chunked (`INCR`) reader,
+    capped at `max_image_bytes` with an image-specific error.
+  - Windows: registered `PNG`/`image/png` formats first, else `CF_DIB`;
+    the size is checked before copying.
+  - macOS: the unmaintained `clipboard` crate is replaced by
+    `objc2-app-kit`'s `NSPasteboard`. `plan_macos` (unit-tested on every
+    platform) checks `org.nspasteboard.ConcealedType`, then
+    `public.utf8-plain-text`, then `public.png`/`public.jpeg`/
+    `public.tiff`. Writing clears the pasteboard and sets the string.
+    Only compile-checked (`cargo clippy --target aarch64-apple-darwin`).
+- `main.rs`: `Message.content` is an untagged `Content::{Text, Parts}`,
+  so text requests serialise exactly as before; images are sent as
+  `[{"type":"image_url","image_url":{"url":"data:<mime>;base64,..."}}]`
+  with `prompt_image` plus `IMAGE_DATA_NOTICE` (treat text in the image
+  as data) as the system message. New `Block::Empty`, raised when the
+  cleaned text is blank. Image requests pass a status hint to
+  `net::post_json`, which appends it in parentheses to non-2xx errors
+  (the response body is still never shown). llama.cpp answers a request
+  with an image but no vision projector with HTTP 500 ("image input is not
+  supported"), OpenAI typically with 400.
+- `configfile.rs`: `max_image_bytes` (positive size, like
+  `max_input_bytes`); `prompt_image` is no longer reserved. Tests check
+  that `config.ini.example` carries the default prompt verbatim and that
+  the INI parser keeps it whole.
+- Dependencies: added `image` 0.25 and `base64` 0.23 (all targets) and
+  `objc2`/`objc2-foundation`/`objc2-app-kit` (macOS only); removed
+  `clipboard` 0.5, which drops `xcb`/`x11-clipboard` from `Cargo.lock`
+  entirely, so `.cargo/audit.toml` and its RUSTSEC-2021-0019 exception are
+  gone. Still builds with the minimum Rust version, 1.92.
+- Docs: README "Images" section (formats, limits, vision models,
+  llama.cpp `--mmproj`/`-hf`, timeouts, OCR-only models), man page
+  `IMAGES` section and a llama.cpp example, `config.ini.example`.
+- `cli.rs`: `Command::Version` for `-V`/`--version`; `version_text()`
+  takes the version from `CARGO_PKG_VERSION` at build time, so it always
+  matches `Cargo.toml`. The `--help` text mentions images and lists the new
+  option.
+
 ## v0.4.1 - Audible beeps after the sound device has been idle
 
 User-facing changes:

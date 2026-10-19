@@ -8,8 +8,8 @@ use std::time::Duration;
 pub const USAGE: &str = "\
 Usage: clip_gpt [OPTIONS]
 
-Sends the clipboard text to the LLM configured in config.ini and replaces
-the clipboard with the response.
+Sends the clipboard text (or, if there is none, the clipboard image) to the
+LLM configured in config.ini and replaces the clipboard with the response.
 
 Options:
   -s, --no-secret-check  Do not refuse clipboard text that looks like an API
@@ -18,7 +18,14 @@ Options:
                          still apply)
       --timeout SECONDS  Wait at most SECONDS for the LLM's answer (0 = no
                          limit); overrides request_timeout in config.ini
+  -V, --version          Print the version and exit
   -h, --help             Print this help and exit";
+
+/// The `-V`/`--version` output. The version comes from `Cargo.toml` at
+/// build time, so it always matches the package.
+pub fn version_text() -> String {
+    format!("clip_gpt version {}", env!("CARGO_PKG_VERSION"))
+}
 
 /// Hidden argument that runs clipGPT as the background X11 clipboard owner
 /// (see `clipboard_backend`'s `x11` module). Deliberately not in [`USAGE`]:
@@ -42,6 +49,8 @@ pub enum Command {
     Run(Options),
     /// Print [`USAGE`] and exit successfully.
     Help,
+    /// Print [`version_text`] and exit successfully.
+    Version,
     /// Serve the X11 clipboard ([`OWNER_HELPER_ARG`], must be the only
     /// argument).
     ClipboardOwner,
@@ -66,6 +75,7 @@ where
     while let Some(arg) = args.next() {
         match arg {
             "-h" | "--help" => return Ok(Command::Help),
+            "-V" | "--version" => return Ok(Command::Version),
             "-s" | "--no-secret-check" => options.no_secret_check = true,
             "--timeout" => {
                 let value = args.next().ok_or_else(|| {
@@ -116,6 +126,26 @@ mod tests {
         assert_eq!(parse(["-h"]), Ok(Command::Help));
         assert_eq!(parse(["--help"]), Ok(Command::Help));
         assert_eq!(parse(["-s", "--help"]), Ok(Command::Help));
+    }
+
+    #[test]
+    fn version_flags() {
+        assert_eq!(parse(["-V"]), Ok(Command::Version));
+        assert_eq!(parse(["--version"]), Ok(Command::Version));
+        assert_eq!(parse(["-s", "--version"]), Ok(Command::Version));
+        assert!(parse(["-v"]).is_err());
+    }
+
+    #[test]
+    fn version_text_names_the_version() {
+        let text = version_text();
+        assert_eq!(
+            text,
+            format!("clip_gpt version {}", env!("CARGO_PKG_VERSION"))
+        );
+        let version = text.rsplit(' ').next().unwrap();
+        assert_eq!(version.split('.').count(), 3, "{version}");
+        assert!(!USAGE.contains(version));
     }
 
     #[test]
@@ -179,7 +209,15 @@ mod tests {
     #[test]
     fn man_page_documents_every_option() {
         let man = include_str!("../man/clip_gpt.1").replace("\\-", "-");
-        for flag in ["-s", "--no-secret-check", "--timeout", "-h", "--help"] {
+        for flag in [
+            "-s",
+            "--no-secret-check",
+            "--timeout",
+            "-V",
+            "--version",
+            "-h",
+            "--help",
+        ] {
             let macro_form = format!("Fl {}", &flag[1..]);
             assert!(man.contains(&macro_form), "{flag} missing from man page");
         }
@@ -192,7 +230,15 @@ mod tests {
 
     #[test]
     fn usage_mentions_all_flags() {
-        for flag in ["-s", "--no-secret-check", "--timeout", "-h", "--help"] {
+        for flag in [
+            "-s",
+            "--no-secret-check",
+            "--timeout",
+            "-V",
+            "--version",
+            "-h",
+            "--help",
+        ] {
             assert!(USAGE.contains(flag), "{flag}");
         }
     }

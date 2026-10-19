@@ -9,8 +9,8 @@
 //! so it adds no native library to build or package.
 //!
 //! Reading is a plain selection conversion: ask for `TARGETS` (to spot the
-//! password-manager hint and pick a text format), then convert to that
-//! format, including the `INCR` protocol for large transfers. Every wait is
+//! password-manager hint and pick a text and an image format), then convert
+//! to that format, including the `INCR` protocol for large transfers. Every wait is
 //! bounded by [`REPLY_TIMEOUT`], so an owner that never answers cannot hang
 //! clipGPT.
 //!
@@ -22,8 +22,11 @@
 //! serves requests until another client takes the clipboard over.
 //! Re-executing avoids `fork()` in a multi-threaded process.
 
-use super::{marks_password, too_large, Clip};
+use super::{
+    choose_image_type, image_too_large, marks_password, too_large, use_text, Clip, Limits,
+};
 use crate::cli::OWNER_HELPER_ARG;
+use crate::imagefile::ClipImage;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
@@ -156,14 +159,17 @@ fn words_for(max_bytes: usize) -> u32 {
 struct Collector {
     buf: Vec<u8>,
     max_bytes: usize,
+    /// The error for data over the limit (text or image wording).
+    too_big: fn(usize) -> String,
 }
 
 impl Collector {
-    /// An empty collector with the given limit.
-    fn new(max_bytes: usize) -> Self {
+    /// An empty collector with the given limit and over-limit error.
+    fn new(max_bytes: usize, too_big: fn(usize) -> String) -> Self {
         Collector {
             buf: Vec::new(),
             max_bytes,
+            too_big,
         }
     }
 
@@ -171,7 +177,7 @@ impl Collector {
     /// lower bound) more than the limit.
     fn expect(&self, announced: usize) -> Result<(), String> {
         if announced > self.max_bytes {
-            Err(too_large(self.max_bytes))
+            Err((self.too_big)(self.max_bytes))
         } else {
             Ok(())
         }
@@ -184,7 +190,7 @@ impl Collector {
             return Ok(true);
         }
         if self.buf.len() + chunk.len() > self.max_bytes {
-            return Err(too_large(self.max_bytes));
+            return Err((self.too_big)(self.max_bytes));
         }
         self.buf.extend_from_slice(chunk);
         Ok(false)
@@ -302,14 +308,20 @@ impl Reader {
         Ok(Some(targets))
     }
 
-    /// Read the clipboard as `target`, `INCR` included. `None` if the
-    /// owner refused that format; otherwise the bytes and their type.
-    fn read(&self, target: Atom, max_bytes: usize) -> Result<Option<(Vec<u8>, Atom)>, Failure> {
+    /// Read the clipboard as `target`, `INCR` included, at most
+    /// `max_bytes` (else the error `too_big`). `None` if the owner refused
+    /// that format; otherwise the bytes and their type.
+    fn read(
+        &self,
+        target: Atom,
+        max_bytes: usize,
+        too_big: fn(usize) -> String,
+    ) -> Result<Option<(Vec<u8>, Atom)>, Failure> {
         let words = words_for(max_bytes);
         let Some(first) = self.convert(target, words)? else {
             return Ok(None);
         };
-        let mut collector = Collector::new(max_bytes);
+        let mut collector = Collector::new(max_bytes, too_big);
         if first.type_ != self.atoms.INCR {
             take_chunk(&mut collector, &first)?;
             return Ok(Some((collector.buf, first.type_)));
@@ -345,11 +357,12 @@ impl Reader {
     }
 }
 
-/// Read the clipboard text through X11, detecting the password-manager
-/// hint among the offered formats. Text longer than `max_bytes` is an
-/// error, never returned in part. If the owner does not answer `TARGETS`,
-/// the hint cannot be checked and `UTF8_STRING`, then `STRING` are tried.
-pub fn get_text(max_bytes: usize) -> Result<Clip, Failure> {
+/// Read the clipboard through X11, detecting the password-manager hint
+/// among the offered formats: the text, or an image if the text is blank.
+/// Data over its limit is an error, never returned in part. If the owner
+/// does not answer `TARGETS`, the hint cannot be checked and `UTF8_STRING`,
+/// then `STRING` are tried (no image).
+pub fn get(limits: Limits) -> Result<Clip, Failure> {
     let (conn, screen_num) = connect()?;
     let win = create_window(&conn, screen_num)?;
     let atoms = Atoms::new(&conn)?.reply()?;
@@ -359,17 +372,26 @@ pub fn get_text(max_bytes: usize) -> Result<Clip, Failure> {
     let reader = Reader { conn, win, atoms };
 
     let guesses = [atoms.UTF8_STRING, AtomEnum::STRING.into()];
-    let candidates = match plan_read(reader.targets()?.as_deref(), guesses) {
+    let (candidates, image) = match plan_read(reader.targets()?.as_deref(), guesses) {
         ReadPlan::Password => return Ok(Clip::Password),
-        ReadPlan::NoText => return Ok(Clip::Text(String::new())),
-        ReadPlan::Try(candidates) => candidates,
+        ReadPlan::Try { text, image } => (text, image),
     };
+    let mut text = String::new();
     for target in candidates {
-        if let Some((bytes, type_)) = reader.read(target, max_bytes)? {
-            return decode_clip(bytes, type_, max_bytes);
+        if let Some((bytes, type_)) = reader.read(target, limits.text, too_large)? {
+            text = decode_clip(bytes, type_, limits.text)?;
+            break;
         }
     }
-    Ok(Clip::Text(String::new()))
+    match image {
+        Some(image) if !use_text(&text, true) => {
+            match reader.read(image, limits.image, image_too_large)? {
+                Some((bytes, _)) => Ok(Clip::Image(ClipImage::File(bytes))),
+                None => Ok(Clip::Text(text)),
+            }
+        }
+        _ => Ok(Clip::Text(text)),
+    }
 }
 
 /// What to do after looking at the owner's `TARGETS`.
@@ -377,25 +399,35 @@ pub fn get_text(max_bytes: usize) -> Result<Clip, Failure> {
 enum ReadPlan {
     /// A password manager marked the contents; do not read them.
     Password,
-    /// The owner offers no text format.
-    NoText,
-    /// Try converting to these targets in order.
-    Try(Vec<Atom>),
+    /// Try converting to the `text` targets in order (the first one the
+    /// owner answers is used), then, if the text is blank, to `image`.
+    Try {
+        text: Vec<Atom>,
+        image: Option<Atom>,
+    },
 }
 
 /// Decide how to read the clipboard from the owner's `TARGETS` (`None` if
 /// it did not answer them, in which case `guesses` are tried blindly).
 fn plan_read(targets: Option<&[(Atom, String)]>, guesses: [Atom; 2]) -> ReadPlan {
     let Some(targets) = targets else {
-        return ReadPlan::Try(guesses.to_vec());
+        return ReadPlan::Try {
+            text: guesses.to_vec(),
+            image: None,
+        };
     };
     let names: Vec<&str> = targets.iter().map(|(_, n)| n.as_str()).collect();
     if marks_password(names.iter().copied()) {
         return ReadPlan::Password;
     }
-    match choose_text_target(&names) {
-        Some(i) => ReadPlan::Try(vec![targets[i].0]),
-        None => ReadPlan::NoText,
+    let image = choose_image_type(&names)
+        .and_then(|wanted| targets.iter().find(|(_, name)| name == wanted))
+        .map(|(atom, _)| *atom);
+    ReadPlan::Try {
+        text: choose_text_target(&names)
+            .map(|i| vec![targets[i].0])
+            .unwrap_or_default(),
+        image,
     }
 }
 
@@ -414,18 +446,16 @@ fn target_atoms(reply: &GetPropertyReply, incr: Atom) -> Option<Vec<Atom>> {
 /// for the empty chunk that ends an `INCR` transfer.
 fn take_chunk(collector: &mut Collector, reply: &GetPropertyReply) -> Result<bool, Failure> {
     if reply.bytes_after > 0 {
-        return Err(Failure::Other(too_large(collector.max_bytes)));
+        return Err(Failure::Other((collector.too_big)(collector.max_bytes)));
     }
     collector.push(&reply.value).map_err(Failure::Other)
 }
 
 /// Decode received bytes of type `type_` (Latin-1 for `STRING`, UTF-8
 /// otherwise) into the clipboard text.
-fn decode_clip(bytes: Vec<u8>, type_: Atom, max_bytes: usize) -> Result<Clip, Failure> {
+fn decode_clip(bytes: Vec<u8>, type_: Atom, max_bytes: usize) -> Result<String, Failure> {
     let latin1 = type_ == Atom::from(AtomEnum::STRING);
-    decode_text(bytes, latin1, max_bytes)
-        .map(Clip::Text)
-        .map_err(Failure::Other)
+    decode_text(bytes, latin1, max_bytes).map_err(Failure::Other)
 }
 
 /// Hand `text` to a background copy of clipGPT that owns the X11 clipboard
@@ -1004,22 +1034,27 @@ mod tests {
     #[test]
     fn plan_read_choices() {
         let guesses = [1, 2];
-        assert_eq!(plan_read(None, guesses), ReadPlan::Try(vec![1, 2]));
+        let plan = |text: Vec<Atom>, image: Option<Atom>| ReadPlan::Try { text, image };
+        assert_eq!(plan_read(None, guesses), plan(vec![1, 2], None));
         let named = |names: &[&str]| -> Vec<(Atom, String)> {
             (10..).zip(names.iter().map(|n| n.to_string())).collect()
         };
         let t = named(&["TARGETS", "STRING", "UTF8_STRING"]);
-        assert_eq!(plan_read(Some(&t), guesses), ReadPlan::Try(vec![12]));
-        let t = named(&["UTF8_STRING", "x-kde-passwordManagerHint"]);
+        assert_eq!(plan_read(Some(&t), guesses), plan(vec![12], None));
+        let t = named(&["UTF8_STRING", "x-kde-passwordManagerHint", "image/png"]);
         assert_eq!(plan_read(Some(&t), guesses), ReadPlan::Password);
         let t = named(&["TARGETS", "image/png"]);
-        assert_eq!(plan_read(Some(&t), guesses), ReadPlan::NoText);
-        assert_eq!(plan_read(Some(&[]), guesses), ReadPlan::NoText);
+        assert_eq!(plan_read(Some(&t), guesses), plan(vec![], Some(11)));
+        let t = named(&["image/bmp", "UTF8_STRING", "image/jpeg", "image/png"]);
+        assert_eq!(plan_read(Some(&t), guesses), plan(vec![11], Some(13)));
+        let t = named(&["TARGETS", "image/x-unknown"]);
+        assert_eq!(plan_read(Some(&t), guesses), plan(vec![], None));
+        assert_eq!(plan_read(Some(&[]), guesses), plan(vec![], None));
     }
 
     #[test]
     fn take_chunk_checks_leftover_and_limit() {
-        let mut c = Collector::new(5);
+        let mut c = Collector::new(5, too_large);
         assert_eq!(
             take_chunk(&mut c, &reply(1, 8, b"abc".to_vec(), 0)),
             Ok(false)
@@ -1030,16 +1065,16 @@ mod tests {
         assert_eq!(over, Err(Failure::Other(too_large(5))));
         assert_eq!(take_chunk(&mut c, &reply(1, 8, Vec::new(), 0)), Ok(true));
         assert_eq!(c.buf, b"abc");
+        let mut c = Collector::new(2, image_too_large);
+        let left_over = take_chunk(&mut c, &reply(1, 8, b"ab".to_vec(), 1));
+        assert_eq!(left_over, Err(Failure::Other(image_too_large(2))));
     }
 
     #[test]
     fn decode_clip_by_type() {
         let string = Atom::from(AtomEnum::STRING);
-        assert_eq!(
-            decode_clip(vec![0xE9], string, 10),
-            Ok(Clip::Text("é".into()))
-        );
-        assert_eq!(decode_clip("é".into(), 105, 10), Ok(Clip::Text("é".into())));
+        assert_eq!(decode_clip(vec![0xE9], string, 10), Ok("é".into()));
+        assert_eq!(decode_clip("é".into(), 105, 10), Ok("é".into()));
         assert_eq!(
             decode_clip(vec![b'x'; 3], 105, 2),
             Err(Failure::Other(too_large(2)))
@@ -1272,7 +1307,7 @@ mod tests {
 
     #[test]
     fn collector_reassembles_chunks() {
-        let mut c = Collector::new(10);
+        let mut c = Collector::new(10, too_large);
         assert_eq!(c.push(b"hello "), Ok(false));
         assert_eq!(c.push(b"you"), Ok(false));
         assert_eq!(c.push(b""), Ok(true));
@@ -1281,7 +1316,7 @@ mod tests {
 
     #[test]
     fn collector_enforces_limit_without_content() {
-        let mut c = Collector::new(5);
+        let mut c = Collector::new(5, too_large);
         assert_eq!(c.push(b"abc"), Ok(false));
         let err = c.push(b"secret").unwrap_err();
         assert!(err.contains("max_input_bytes"));
@@ -1292,9 +1327,9 @@ mod tests {
 
     #[test]
     fn collector_rejects_announced_size() {
-        let c = Collector::new(5);
+        let c = Collector::new(5, image_too_large);
         assert!(c.expect(5).is_ok());
-        assert!(c.expect(6).is_err());
+        assert_eq!(c.expect(6), Err(image_too_large(5)));
     }
 
     #[test]
@@ -1381,7 +1416,7 @@ mod tests {
     }
 
     /// Own the clipboard in a thread with `data`, read it back through
-    /// [`get_text`], then take it over again so the first owner exits.
+    /// [`get`], then take it over again so the first owner exits.
     /// Needs a real X server: run with `xvfb-run cargo test -- --ignored`.
     /// Serialised, since all tests share the one X clipboard.
     fn round_trip(data: Vec<u8>, max_bytes: usize) -> Result<Clip, Failure> {
@@ -1389,7 +1424,10 @@ mod tests {
         let _guard = CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner());
         let owner = Owner::take(data)?;
         let server = std::thread::spawn(move || owner.serve());
-        let result = get_text(max_bytes);
+        let result = get(Limits {
+            text: max_bytes,
+            image: max_bytes,
+        });
         let other = Owner::take(Vec::new())?;
         server.join().unwrap()?;
         drop(other);

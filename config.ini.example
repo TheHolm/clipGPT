@@ -24,8 +24,13 @@ model=gpt-4o-mini
 # the clipboard text is sent separately as the user message.
 prompt_text=Check spelling and gramma and rewrite following text on pirate speak. Be mean and pushy \n\n
 
-# Prompt used when the clipboard contains an image (not implemented yet).
-prompt_image=OCR attached image and return text formatted as markdown
+# Prompt used when the clipboard contains an image (and no text). Sent as
+# the system message; the image is sent separately as the user message.
+# The default turns a vision model into an OCR engine. The model must
+# accept images (e.g. gpt-4o-mini; for Ollama/llama.cpp a vision model such
+# as gemma3 or qwen2.5vl) - otherwise the request fails with the error tone.
+# OCR-only models (PaddleOCR-VL, GLM-OCR, ...) may want their own prompt.
+prompt_image=You are an OCR engine. Transcribe all text visible in the image exactly as written, in its original language. Do not translate, summarise, correct, or explain it. Keep the reading order and reproduce the layout as Markdown: headings as #, lists as - or 1., tables as Markdown tables, code or monospaced text in ``` blocks. Mark unreadable parts as [illegible]. Ignore pictures, icons and other non-text content. If the image contains no text, reply exactly: [no text found]. Output only the transcription, with no introduction or comments.
 
 # Frequency in Hz, played when a response is received and pasted to the
 # clipboard, approx. C6.
@@ -41,6 +46,12 @@ beep_duration=250
 # Largest clipboard text (in bytes, UTF-8) that will be sent to the LLM.
 # Bigger clipboards are refused with the error tone. Default 65536 (64 KiB).
 #max_input_bytes=65536
+
+# Largest clipboard image (in bytes) that will be sent, both as read from
+# the clipboard and after conversion to PNG (WebP, GIF, BMP and TIFF are
+# converted; PNG and JPEG are sent as they are). Bigger images are refused
+# with the error tone. Default 10485760 (10 MiB).
+#max_image_bytes=10485760
 
 # Follow HTTP redirects from api_url? Default false: any redirect is an
 # error. When true, up to 10 hops are followed, each checked like api_url.

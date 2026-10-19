@@ -43,10 +43,12 @@ dependency.
 macOS is not built by CI: cross-compiling for it needs Apple's SDK, which
 Apple's license doesn't allow redistributing, so there's no CI setup that
 can produce one without someone supplying their own SDK. `cpal` and the
-macOS-specific `clipboard` crate (see README.md "Clipboard backend") do have
-genuine upstream macOS support though, so building natively on a real Mac
-(no cross-compiling involved) will likely work too - just untested, since no
-Mac hardware is available to this project's CI.
+macOS-specific `objc2-app-kit` NSPasteboard bindings (see README.md
+"Clipboard backend") do have genuine upstream macOS support though, so
+building natively on a real Mac (no cross-compiling involved) will likely
+work too - just untested, since no Mac hardware is available to this
+project's CI. `cargo check --target aarch64-apple-darwin` needs no SDK and
+should pass before merging anything touching the macOS backend.
 
 ## Layout
 
@@ -54,6 +56,7 @@ Mac hardware is available to this project's CI.
   tone generation (`beep.rs`), per-OS clipboard access and password-marker
   detection (`clipboard_backend.rs`, with the X11 fallback and its
   background clipboard-owner helper in `clipboard_backend/x11.rs`), HTTP transport checks (`net.rs`),
+  clipboard image checks and conversion to PNG (`imagefile.rs`),
   input/output cleaning (`sanitize.rs`), secret-pattern detection
   (`secrets.rs`) and command-line parsing (`cli.rs`)
 - `config.ini.example` - the config template users copy and fill in
@@ -77,8 +80,6 @@ Mac hardware is available to this project's CI.
 - `debian/copyright` - the full AGPL-3.0-or-later text, installed into every
   `.deb` explicitly (Debian Policy 12.5 - `cargo-deb`'s own auto-generated
   copyright only names the licence, not its text)
-- `.cargo/audit.toml` - `cargo audit`'s ignore list (one documented
-  exception; see the comment in that file)
 - `.woodpecker/release.yaml` - tag-triggered CI: builds Linux `.deb`,
   Windows binaries, and FreeBSD `.pkg` artifacts and publishes a GitHub
   release

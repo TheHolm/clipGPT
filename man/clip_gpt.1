@@ -3,24 +3,27 @@
 .\" clip_gpt(1) - keep in sync with src/cli.rs (USAGE) and
 .\" config.ini.example; tests in src/cli.rs and src/configfile.rs check
 .\" the options, config keys and defaults.
-.Dd October 19, 2026
+.Dd October 20, 2026
 .Dt CLIP_GPT 1
 .Os
 .Sh NAME
 .Nm clip_gpt
-.Nd rewrite the clipboard text with an LLM
+.Nd rewrite the clipboard text, or read an image's text, with an LLM
 .Sh SYNOPSIS
 .Nm
 .Op Fl s
 .Op Fl \-timeout Ar seconds
 .Nm
-.Fl h
+.Fl h | V
 .Sh DESCRIPTION
 .Nm
 reads the text on the clipboard, sends it to an OpenAI-compatible chat
-completions API (OpenAI itself, or a local server such as Ollama) together
-with a configurable prompt, and replaces the clipboard contents with the
-response.
+completions API (OpenAI itself, or a local server such as Ollama or
+llama.cpp) together with a configurable prompt, and replaces the clipboard
+contents with the response.
+An image on the clipboard is sent to the model instead when there is no
+text (see
+.Sx IMAGES ) .
 It runs once and exits; it is meant to be bound to a desktop hotkey or a
 macro key rather than run interactively.
 .Pp
@@ -45,6 +48,8 @@ means no limit.
 Overrides
 .Cm request_timeout
 for this run.
+.It Fl V , Fl \-version
+Print the version and exit.
 .It Fl h , Fl \-help
 Print a usage summary and exit.
 .El
@@ -100,7 +105,12 @@ A literal
 .Ql \en
 becomes a newline.
 .It Cm prompt_image
-Reserved for image prompts; not used yet.
+Prompt sent as the system message when the clipboard holds an image and
+no text; the image is sent separately as the user message.
+The default makes the model transcribe the text in the image as Markdown,
+like an OCR program.
+The model must accept images; see
+.Sx IMAGES .
 .It Cm beep_tone
 Success beep frequency in Hz; default 1046.
 .It Cm error_tone
@@ -110,6 +120,10 @@ Beep length in milliseconds; default 250, 0 disables the beeps.
 .It Cm max_input_bytes
 Largest clipboard text, in UTF-8 bytes, that is sent; default 65536.
 Larger clipboards are refused.
+.It Cm max_image_bytes
+Largest clipboard image, in bytes, that is sent, checked both as read and
+after conversion to PNG; default 10485760.
+Larger images are refused.
 .It Cm allow_redirects
 Follow HTTP redirects from
 .Cm api_url ,
@@ -142,9 +156,36 @@ the response
 leaves a copy of itself running in the background as
 .Ql clip_gpt \-\-x11\-clipboard\-owner .
 It exits as soon as anything else is copied.
+.Sh IMAGES
+If the clipboard holds no text (or only white space) but an image,
+the image is sent instead, with
+.Cm prompt_image .
+PNG and JPEG images are sent as they are; WebP, GIF (first frame), BMP,
+Windows bitmaps and TIFF are converted to PNG first.
+Images to convert that are over 8192 pixels wide or high are refused.
+If the clipboard holds neither text nor an image,
+.Nm
+plays the error tone and leaves the clipboard unchanged.
+.Pp
+Which model can see images is up to the configuration: there is no check
+in advance.
+A server or model that does not accept images answers with an HTTP error,
+reported with a hint and the error tone.
+For llama.cpp's
+.Ql llama\-server ,
+load the model with its multimodal projector
+.Pq Fl \-mmproj ,
+otherwise image requests fail.
+Some older Ollama versions silently ignore the image instead; the answer
+is then not based on it.
 .Sh SECURITY
 Clipboard contents marked as secret by a password manager
-.Pq Ql x\-kde\-passwordManagerHint
+.Po
+.Ql x\-kde\-passwordManagerHint
+on Wayland and X11,
+.Ql org.nspasteboard.ConcealedType
+on macOS
+.Pc
 are never read or sent; the clipboard is replaced by a notice.
 Text containing invisible Unicode tag characters is refused the same way.
 Unless
@@ -155,6 +196,8 @@ is used, text that looks like an API key, token, private key, JSON Web
 Token or URL with a password is refused and the clipboard left as it was.
 Control, bidirectional-override and zero-width characters are removed
 from both the text sent and the response pasted.
+Text inside an image cannot be checked this way; the model is told not to
+follow instructions found in it.
 Responses over 1 MiB are discarded, and error messages never include the
 response body.
 .Sh ENVIRONMENT
@@ -177,10 +220,12 @@ Used if the file above does not exist.
 .Sh EXIT STATUS
 .Nm
 exits 0 when the response is on the clipboard, or after
-.Fl h .
+.Fl h
+or
+.Fl V .
 It exits 1 on any error, including an invalid option or configuration, a
-failed request, and refused clipboard text (password, hidden characters,
-secret, too large).
+failed request, and refused clipboard contents (password, hidden
+characters, secret, too large, unsupported image, empty clipboard).
 .Sh EXAMPLES
 A configuration for a local Ollama server with a slow model:
 .Bd -literal -offset indent
@@ -188,6 +233,17 @@ A configuration for a local Ollama server with a slow model:
 api_url=http://127.0.0.1:11434/v1/chat/completions
 model=llama3
 prompt_text=Fix spelling and grammar. Reply with the text only.
+request_timeout=120
+.Ed
+.Pp
+A local llama.cpp server with a vision model, for reading text off
+screenshots:
+.Bd -literal -offset indent
+$ llama\-server \-hf ggml\-org/gemma\-3\-4b\-it\-GGUF
+
+[openai]
+api_url=http://127.0.0.1:8080/v1/chat/completions
+model=gemma\-3\-4b\-it
 request_timeout=120
 .Ed
 .Pp

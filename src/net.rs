@@ -236,14 +236,16 @@ fn error_chain(err: &dyn std::error::Error) -> String {
 }
 
 /// POST `body` as JSON to `url` and return the response body as text.
-/// Non-2xx statuses are errors that report only the status code - never
-/// the body, which may echo the clipboard text back.
+/// Non-2xx statuses are errors that report only the status code (plus
+/// `status_hint`, if given, in parentheses) - never the body, which may
+/// echo the clipboard text back.
 pub fn post_json<T: serde::Serialize>(
     client: &Client,
     url: &Url,
     api_key: Option<&str>,
     body: &T,
     timeout: Option<Duration>,
+    status_hint: Option<&str>,
 ) -> Result<String, String> {
     let mut request = client.post(url.clone()).json(body);
     if let Some(key) = api_key {
@@ -265,7 +267,10 @@ pub fn post_json<T: serde::Serialize>(
         ));
     }
     if !status.is_success() {
-        return Err(format!("API returned HTTP {}", status.as_u16()));
+        return Err(match status_hint {
+            Some(hint) => format!("API returned HTTP {} ({})", status.as_u16(), hint),
+            None => format!("API returned HTTP {}", status.as_u16()),
+        });
     }
     if response
         .content_length()
@@ -461,11 +466,11 @@ mod tests {
         let client = build_client(false, None).unwrap();
         let body = serde_json::json!({"x": 1});
         assert_eq!(
-            post_json(&client, &base, Some("sk-test"), &body, None),
+            post_json(&client, &base, Some("sk-test"), &body, None, None),
             Ok("{\"ok\":1}".to_string())
         );
         assert_eq!(
-            post_json(&client, &base, None, &body, None),
+            post_json(&client, &base, None, &body, None, None),
             Ok("{\"ok\":2}".to_string())
         );
         let requests = handle.join().unwrap();
@@ -483,10 +488,27 @@ mod tests {
             "{\"error\":\"your secret clipboard text\"}",
         )]);
         let client = build_client(false, None).unwrap();
-        let err = post_json(&client, &base, None, &serde_json::json!({}), None).unwrap_err();
+        let err = post_json(&client, &base, None, &serde_json::json!({}), None, None).unwrap_err();
         handle.join().unwrap();
         assert!(err.contains("400"));
         assert!(!err.contains("secret"));
+    }
+
+    #[test]
+    fn post_json_error_status_carries_hint_not_body() {
+        let (base, handle) = serve(vec![http_response(
+            "500 Internal Server Error",
+            "",
+            "{\"error\":{\"message\":\"image input is not supported\"}}",
+        )]);
+        let client = build_client(false, None).unwrap();
+        let hint = Some("the model may not accept images");
+        let err = post_json(&client, &base, None, &serde_json::json!({}), None, hint).unwrap_err();
+        handle.join().unwrap();
+        assert_eq!(
+            err,
+            "API returned HTTP 500 (the model may not accept images)"
+        );
     }
 
     #[test]
@@ -502,6 +524,7 @@ mod tests {
             &base,
             Some("sk-test"),
             &serde_json::json!({}),
+            None,
             None,
         )
         .unwrap_err();
@@ -519,7 +542,7 @@ mod tests {
             "",
         )]);
         let client = build_client(true, None).unwrap();
-        let result = post_json(&client, &base, None, &serde_json::json!({}), None);
+        let result = post_json(&client, &base, None, &serde_json::json!({}), None, None);
         handle.join().unwrap();
         let requests = target_handle.join().unwrap();
         assert_eq!(result, Ok("done".to_string()));
@@ -534,7 +557,7 @@ mod tests {
             "",
         )]);
         let client = build_client(true, None).unwrap();
-        let err = post_json(&client, &base, None, &serde_json::json!({}), None).unwrap_err();
+        let err = post_json(&client, &base, None, &serde_json::json!({}), None, None).unwrap_err();
         handle.join().unwrap();
         assert!(err.contains("Redirect refused"), "{err}");
     }
@@ -544,7 +567,7 @@ mod tests {
         let big = "a".repeat(MAX_RESPONSE_BYTES + 1);
         let (base, handle) = serve(vec![http_response("200 OK", "", &big)]);
         let client = build_client(false, None).unwrap();
-        let err = post_json(&client, &base, None, &serde_json::json!({}), None).unwrap_err();
+        let err = post_json(&client, &base, None, &serde_json::json!({}), None, None).unwrap_err();
         let _ = handle.join();
         assert!(err.contains("larger than"));
     }
@@ -577,7 +600,7 @@ mod tests {
         let limit = Some(Duration::from_secs(1));
         let client = build_client(false, limit).unwrap();
         let start = std::time::Instant::now();
-        let err = post_json(&client, &base, None, &serde_json::json!({}), limit).unwrap_err();
+        let err = post_json(&client, &base, None, &serde_json::json!({}), limit, None).unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(4));
         assert!(err.contains("did not answer within 1 s"), "{err}");
         assert!(
@@ -593,7 +616,7 @@ mod tests {
         let base = serve_slow(Duration::ZERO, partial, Duration::from_secs(5));
         let limit = Some(Duration::from_secs(1));
         let client = build_client(false, limit).unwrap();
-        let err = post_json(&client, &base, None, &serde_json::json!({}), limit).unwrap_err();
+        let err = post_json(&client, &base, None, &serde_json::json!({}), limit, None).unwrap_err();
         assert!(err.contains("did not answer within 1 s"), "{err}");
     }
 
@@ -606,7 +629,7 @@ mod tests {
             Duration::ZERO,
         );
         let client = build_client(false, None).unwrap();
-        let body = post_json(&client, &base, None, &serde_json::json!({}), None);
+        let body = post_json(&client, &base, None, &serde_json::json!({}), None, None);
         assert_eq!(body, Ok("slow but fine".to_string()));
     }
 

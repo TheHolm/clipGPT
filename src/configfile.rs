@@ -14,13 +14,21 @@ const DEFAULT_API_TYPE: &str = "OpenAI";
 const DEFAULT_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_PROMPT_TEXT: &str =
     "Check spelling and gramma and rewrite following text on pirate speak. Be mean and pushy \n\n";
-const DEFAULT_PROMPT_IMAGE: &str = "OCR attached image and return text formatted as markdown";
+/// Default prompt for clipboard images: make a vision model act as OCR.
+const DEFAULT_PROMPT_IMAGE: &str = "You are an OCR engine. Transcribe all text visible in the \
+     image exactly as written, in its original language. Do not translate, summarise, correct, or \
+     explain it. Keep the reading order and reproduce the layout as Markdown: headings as #, lists \
+     as - or 1., tables as Markdown tables, code or monospaced text in ``` blocks. Mark unreadable \
+     parts as [illegible]. Ignore pictures, icons and other non-text content. If the image \
+     contains no text, reply exactly: [no text found]. Output only the transcription, with no \
+     introduction or comments.";
 const DEFAULT_BEEP_TONE: u32 = 1046;
 /// Error tone, also used when the config itself could not be loaded.
 pub const DEFAULT_ERROR_TONE: u32 = 131;
 /// Beep duration, also used when the config itself could not be loaded.
 pub const DEFAULT_BEEP_DURATION: u32 = 250;
 const DEFAULT_MAX_INPUT_BYTES: usize = 64 * 1024;
+const DEFAULT_MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_ALLOW_REDIRECTS: bool = false;
 const DEFAULT_SECRET_CHECK: bool = true;
 /// Default for `request_timeout`, in seconds (the same as reqwest's own
@@ -46,9 +54,8 @@ impl ApiType {
     }
 }
 
-// api_type and prompt_image are not used by main.rs yet (there is only one
-// API type, and image prompts aren't implemented) - kept here as reserved
-// config surface for when those land.
+// api_type is not used by main.rs yet (there is only one API type) - kept
+// here as reserved config surface for when more land.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct Config {
@@ -59,7 +66,9 @@ pub struct Config {
     /// then.
     pub api_key: Option<String>,
     pub model: String,
+    /// System prompt for clipboard text.
     pub prompt_text: String,
+    /// System prompt for clipboard images.
     pub prompt_image: String,
     pub beep_tone: u32,
     pub error_tone: u32,
@@ -67,6 +76,9 @@ pub struct Config {
     /// Maximum clipboard text size in bytes (UTF-8) that will be sent to
     /// the LLM. Larger clipboards are refused.
     pub max_input_bytes: usize,
+    /// Maximum clipboard image size in bytes, both as read and after any
+    /// conversion to PNG. Larger images are refused.
+    pub max_image_bytes: usize,
     /// Whether HTTP redirects from `api_url` are followed.
     pub allow_redirects: bool,
     /// Whether clipboard text that looks like a secret (API key, token,
@@ -310,6 +322,7 @@ fn load_from_path(path: &str) -> Result<Config, String> {
     let error_tone = get_u32(&ini, SECTION, "error_tone", DEFAULT_ERROR_TONE);
     let beep_duration = get_u32(&ini, SECTION, "beep_duration", DEFAULT_BEEP_DURATION);
     let max_input_bytes = get_size(&ini, SECTION, "max_input_bytes", DEFAULT_MAX_INPUT_BYTES)?;
+    let max_image_bytes = get_size(&ini, SECTION, "max_image_bytes", DEFAULT_MAX_IMAGE_BYTES)?;
     let allow_redirects = get_bool(&ini, SECTION, "allow_redirects", DEFAULT_ALLOW_REDIRECTS)?;
     let secret_check = get_bool(&ini, SECTION, "secret_check", DEFAULT_SECRET_CHECK)?;
     let request_timeout = get_timeout(
@@ -330,6 +343,7 @@ fn load_from_path(path: &str) -> Result<Config, String> {
         error_tone,
         beep_duration,
         max_input_bytes,
+        max_image_bytes,
         allow_redirects,
         secret_check,
         request_timeout,
@@ -415,6 +429,8 @@ mod tests {
         assert_eq!(cfg.model, "llama3");
         assert_eq!(cfg.api_url, DEFAULT_API_URL);
         assert_eq!(cfg.max_input_bytes, DEFAULT_MAX_INPUT_BYTES);
+        assert_eq!(cfg.max_image_bytes, 10_485_760);
+        assert_eq!(cfg.prompt_image, DEFAULT_PROMPT_IMAGE);
         assert!(!cfg.allow_redirects);
         assert!(cfg.secret_check);
         assert_eq!(cfg.error_tone, DEFAULT_ERROR_TONE);
@@ -450,6 +466,7 @@ mod tests {
             ("error_tone", DEFAULT_ERROR_TONE.to_string()),
             ("beep_duration", DEFAULT_BEEP_DURATION.to_string()),
             ("max_input_bytes", DEFAULT_MAX_INPUT_BYTES.to_string()),
+            ("max_image_bytes", DEFAULT_MAX_IMAGE_BYTES.to_string()),
             ("allow_redirects", DEFAULT_ALLOW_REDIRECTS.to_string()),
             ("secret_check", DEFAULT_SECRET_CHECK.to_string()),
             ("request_timeout", DEFAULT_REQUEST_TIMEOUT_SECS.to_string()),
@@ -536,13 +553,16 @@ mod tests {
     fn new_keys_are_parsed() {
         let path = temp_config(
             "newkeys",
-            "[openai]\nmodel=m\nallow_redirects=yes\nmax_input_bytes=1000\nsecret_check=off\n",
+            "[openai]\nmodel=m\nallow_redirects=yes\nmax_input_bytes=1000\nsecret_check=off\n\
+             max_image_bytes=2000\nprompt_image=Describe it\n",
             0o600,
         );
         let cfg = load_from_path(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         assert!(cfg.allow_redirects);
         assert_eq!(cfg.max_input_bytes, 1000);
+        assert_eq!(cfg.max_image_bytes, 2000);
+        assert_eq!(cfg.prompt_image, "Describe it");
         assert!(!cfg.secret_check);
     }
 
@@ -564,6 +584,30 @@ mod tests {
         let err = load_from_path(&path).unwrap_err();
         std::fs::remove_file(&path).unwrap();
         assert!(err.contains("allow_redirects"));
+    }
+
+    #[test]
+    fn zero_max_image_bytes_is_an_error() {
+        let path = temp_config("zeroimg", "[openai]\nmodel=m\nmax_image_bytes=0\n", 0o600);
+        let err = load_from_path(&path).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        assert!(err.contains("max_image_bytes"));
+    }
+
+    #[test]
+    fn config_example_prompt_image_matches_default() {
+        let example = include_str!("../config.ini.example");
+        let line = example
+            .lines()
+            .find_map(|l| l.strip_prefix("prompt_image="))
+            .expect("prompt_image in config.ini.example");
+        assert_eq!(line, DEFAULT_PROMPT_IMAGE);
+        // And the INI parser keeps it whole ('#', '[', '`' included).
+        let path = temp_config("example", example, 0o600);
+        let cfg = load_from_path(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(cfg.prompt_image, DEFAULT_PROMPT_IMAGE);
+        assert_eq!(cfg.max_image_bytes, DEFAULT_MAX_IMAGE_BYTES);
     }
 
     #[test]
