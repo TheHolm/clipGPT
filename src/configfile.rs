@@ -56,7 +56,7 @@ const INPUT_NONE: &str = "none";
 
 /// Every key a profile may contain, in the order `--show-profile` prints
 /// them.
-pub const KEYS: [&str; 17] = [
+pub const KEYS: [&str; 18] = [
     "include",
     "clear",
     "input",
@@ -74,7 +74,12 @@ pub const KEYS: [&str; 17] = [
     "allow_redirects",
     "secret_check",
     "request_timeout",
+    "request_extra_body",
 ];
+
+/// Top-level request body fields clipGPT sets itself (or, for `stream`,
+/// cannot handle), so `request_extra_body` may not contain them.
+const RESERVED_BODY_KEYS: [&str; 3] = ["model", "messages", "stream"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiType {
@@ -152,6 +157,10 @@ pub struct Config {
     /// of the response. `None` means no limit (`request_timeout = 0`). The
     /// `--timeout` command line option overrides it for one run.
     pub request_timeout: Option<Duration>,
+    /// Extra top-level fields added to the JSON request body
+    /// (`request_extra_body`), e.g. Ollama's `keep_alive`. Empty by
+    /// default: nothing extra is sent.
+    pub request_extra_body: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The type a key's value must have.
@@ -175,6 +184,8 @@ enum KeyType {
     Profiles,
     /// A list of key names (`clear`).
     Keys,
+    /// A table of extra JSON request body fields (`request_extra_body`).
+    JsonTable,
 }
 
 /// The type of `key`'s value, or `None` for an unknown key.
@@ -189,13 +200,14 @@ fn key_type(key: &str) -> Option<KeyType> {
         "max_input_bytes" | "max_image_bytes" => KeyType::Size,
         "allow_redirects" | "secret_check" => KeyType::Bool,
         "request_timeout" => KeyType::Timeout,
+        "request_extra_body" => KeyType::JsonTable,
         _ => return None,
     })
 }
 
 /// The built-in default of a setting, as a TOML value. `None` for keys
-/// without one (`api_url`, `api_key`, `model`) and for `input`, whose default is
-/// "every kind" (see [`InputKind::ALL`]).
+/// without one (`api_url`, `api_key`, `model`, `request_extra_body`) and
+/// for `input`, whose default is "every kind" (see [`InputKind::ALL`]).
 fn default_value(key: &str) -> Option<Value> {
     Some(match key {
         "api_type" => Value::from(DEFAULT_API_TYPE),
@@ -471,6 +483,53 @@ fn parse_file(path: &str, contents: &str) -> Result<ConfigFile, String> {
     Ok(file)
 }
 
+/// Check a `request_extra_body` value: a table without the reserved keys
+/// ([`RESERVED_BODY_KEYS`]) whose values all have a JSON equivalent (see
+/// [`toml_to_json`]). Names a reserved key, never a value.
+fn check_extra_body(value: &Value) -> Result<(), String> {
+    let Some(table) = value.as_table() else {
+        return Err("must be a table, e.g. { keep_alive = \"8h\" }".into());
+    };
+    if let Some(key) = table
+        .keys()
+        .find(|k| RESERVED_BODY_KEYS.contains(&k.as_str()))
+    {
+        return Err(format!(
+            "cannot set '{key}' (clipGPT sets model and messages itself and cannot read a \
+             streamed reply)"
+        ));
+    }
+    toml_to_json(value).map(drop)
+}
+
+/// Convert a TOML value to the matching JSON value: strings, integers,
+/// booleans, arrays and tables map directly, floats become JSON numbers.
+/// Dates and times, and floats JSON cannot hold (NaN, infinity), have no
+/// JSON equivalent and are an error.
+fn toml_to_json(value: &Value) -> Result<serde_json::Value, String> {
+    use serde_json::Value as Json;
+    Ok(match value {
+        Value::String(s) => Json::String(s.clone()),
+        Value::Integer(n) => Json::from(*n),
+        Value::Boolean(b) => Json::Bool(*b),
+        Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(Json::Number)
+            .ok_or("contains a number JSON cannot hold (nan or inf)")?,
+        Value::Datetime(_) => {
+            return Err("contains a date or time, which JSON has no type for".into())
+        }
+        Value::Array(items) => {
+            Json::Array(items.iter().map(toml_to_json).collect::<Result<_, _>>()?)
+        }
+        Value::Table(table) => Json::Object(
+            table
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), toml_to_json(v)?)))
+                .collect::<Result<_, String>>()?,
+        ),
+    })
+}
+
 /// Check one profile's keys and value types.
 fn parse_profile(path: &str, name: String, table: Table) -> Result<Profile, String> {
     let at = |key: &str| format!("{path}: profile [{name}], '{key}'");
@@ -546,6 +605,7 @@ fn check_value(kind: KeyType, value: &Value) -> Result<(), String> {
             _ => Err("must be a whole number of seconds (0 = no limit)".into()),
         },
         KeyType::Input => check_input(value),
+        KeyType::JsonTable => check_extra_body(value),
         KeyType::Profiles => {
             let names = unique_strings(value, "profile names")?;
             match names.iter().find(|n| !valid_profile_name(n)) {
@@ -919,6 +979,11 @@ impl ConfigFile {
             request_timeout: timeout_from_secs(
                 u64::try_from(int("request_timeout")).unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
             ),
+            // Checked by check_extra_body when the file was parsed.
+            request_extra_body: match get("request_extra_body").map(|v| toml_to_json(&v)) {
+                Some(Ok(serde_json::Value::Object(map))) => map,
+                _ => serde_json::Map::new(),
+            },
         })
     }
 
@@ -1059,8 +1124,33 @@ fn display_value(value: &Value) -> String {
         ),
         Value::Integer(n) => n.to_string(),
         Value::Boolean(b) => b.to_string(),
-        // Other types never pass check_value.
+        // Debug keeps a ".0" or exponent, so it stays a TOML float.
+        Value::Float(f) => format!("{f:?}"),
+        Value::Table(table) if table.is_empty() => "{}".to_string(),
+        Value::Table(table) => format!(
+            "{{ {} }}",
+            table
+                .iter()
+                .map(|(k, v)| format!("{} = {}", display_key(k), display_value(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        // Dates never pass check_value.
         other => format!("{other:?}"),
+    }
+}
+
+/// A table key in TOML syntax: bare if it only has letters, digits, `_`
+/// and `-`, else quoted like a string.
+fn display_key(key: &str) -> String {
+    let bare = !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if bare {
+        key.to_string()
+    } else {
+        display_value(&Value::from(key))
     }
 }
 
@@ -1592,6 +1682,97 @@ mod tests {
     }
 
     #[test]
+    fn request_extra_body_is_empty_by_default() {
+        let cfg =
+            default_config("[default]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n");
+        assert!(cfg.request_extra_body.is_empty());
+        assert_eq!(default_value("request_extra_body"), None);
+    }
+
+    #[test]
+    fn request_extra_body_converts_to_json() {
+        let cfg = default_config(
+            "[default]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n\
+             [default.request_extra_body]\nkeep_alive = \"8h\"\ntemperature = 0.2\n\
+             seed = 7\nthink = false\nstop = [\"a\", 1]\noptions = { num_ctx = 8192 }\n",
+        );
+        assert_eq!(
+            serde_json::Value::Object(cfg.request_extra_body),
+            serde_json::json!({
+                "keep_alive": "8h", "temperature": 0.2, "seed": 7, "think": false,
+                "stop": ["a", 1], "options": {"num_ctx": 8192}
+            })
+        );
+    }
+
+    #[test]
+    fn request_extra_body_errors() {
+        for (value, expect) in [
+            ("\"8h\"", "must be a table"),
+            ("{ model = \"x\" }", "cannot set 'model'"),
+            ("{ messages = [] }", "cannot set 'messages'"),
+            ("{ stream = true }", "cannot set 'stream'"),
+            ("{ when = 2026-01-01 }", "date or time"),
+            ("{ a = [{ b = 1979-05-27T07:32:00Z }] }", "date or time"),
+            ("{ x = nan }", "nan or inf"),
+            ("{ x = inf }", "nan or inf"),
+        ] {
+            let err = parse(&format!(
+                "[default]\nmodel = \"m\"\nrequest_extra_body = {value}\n"
+            ))
+            .unwrap_err();
+            assert!(
+                err.contains("'request_extra_body'") && err.contains(expect),
+                "{value}: {err}"
+            );
+        }
+        // A reserved name nested deeper is just data.
+        assert!(parse("[default]\nrequest_extra_body = { options = { model = 1 } }\n").is_ok());
+    }
+
+    #[test]
+    fn request_extra_body_is_replaced_by_own_and_cleared() {
+        let base =
+            "[base]\ninput = [\"none\"]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n\
+                    request_extra_body = { keep_alive = \"8h\", seed = 1 }\n";
+        let own = default_config(&format!(
+            "{base}[default]\ninclude = [\"base\"]\nclear = [\"input\"]\nrequest_extra_body = {{ seed = 2 }}\n"
+        ));
+        assert_eq!(
+            serde_json::Value::Object(own.request_extra_body),
+            serde_json::json!({"seed": 2})
+        );
+        let cleared = default_config(&format!(
+            "{base}[default]\ninclude = [\"base\"]\nclear = [\"input\", \"request_extra_body\"]\n"
+        ));
+        assert!(cleared.request_extra_body.is_empty());
+    }
+
+    #[test]
+    fn show_prints_request_extra_body() {
+        let parsed = parse(
+            "[default]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n\
+             request_extra_body = { keep_alive = \"8h\", options = { num_ctx = 8192 }, \"a b\" = 0.5 }\n",
+        )
+        .unwrap();
+        let out = parsed.show(&parsed.select(None).unwrap());
+        assert!(
+            out.contains(
+                "request_extra_body = { keep_alive = \"8h\", options = { num_ctx = 8192 }, \
+                 \"a b\" = 0.5 }  # [default]"
+            ),
+            "{out}"
+        );
+        let parsed =
+            parse("[default]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n").unwrap();
+        let out = parsed.show(&parsed.select(None).unwrap());
+        assert!(
+            out.contains("request_extra_body = (not set)  # built-in default"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn display_value_is_one_line_toml() {
         assert_eq!(
             display_value(&Value::from("a\"b\\c\nd\te\u{1}")),
@@ -1804,6 +1985,10 @@ mod tests {
         assert_eq!(image.model, "qwen2.5vl");
         assert_eq!(image.api_key, None, "api_key = \"\" in [local]");
         assert!(image.api_url.starts_with("http://127.0.0.1:"));
+        // [local]'s keep_alive reaches [ocr] through include; [default]
+        // (OpenAI) sends nothing extra.
+        assert_eq!(image.request_extra_body["keep_alive"], "8h");
+        assert!(text.request_extra_body.is_empty());
     }
 
     #[test]

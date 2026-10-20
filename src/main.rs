@@ -45,7 +45,11 @@ const IMAGE_STATUS_HINT: &str = "the model or server may not support image input
 struct OpenAIRequest {
     model: String,
     messages: Vec<Message>,
-    keep_alive: Option<String>,
+    /// The profile's `request_extra_body` fields, added at the top level
+    /// (none by default). Never holds `model` or `messages`: the config
+    /// check refuses those.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -425,7 +429,7 @@ fn build_request(config: &Config, input: Input) -> OpenAIRequest {
                 content,
             },
         ],
-        keep_alive: Some("8h".to_string()),
+        extra: config.request_extra_body.clone(),
     }
 }
 
@@ -470,7 +474,33 @@ mod tests {
             allow_redirects: false,
             secret_check: true,
             request_timeout: Some(std::time::Duration::from_secs(30)),
+            request_extra_body: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn request_has_only_model_and_messages_by_default() {
+        let request = build_request(&config_with_prompt("p"), Input::Text("x".into()));
+        let json = serde_json::to_value(&request).unwrap();
+        let mut keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["messages", "model"], "no keep_alive or other extras");
+    }
+
+    #[test]
+    fn request_extra_body_is_added_at_top_level() {
+        let mut config = config_with_prompt("p");
+        let serde_json::Value::Object(extra) =
+            serde_json::json!({"keep_alive": "8h", "options": {"num_ctx": 8192}})
+        else {
+            unreachable!()
+        };
+        config.request_extra_body = extra;
+        let json = serde_json::to_value(build_request(&config, Input::Text("x".into()))).unwrap();
+        assert_eq!(json["keep_alive"], "8h");
+        assert_eq!(json["options"]["num_ctx"], 8192);
+        assert_eq!(json["model"], "test-model");
+        assert_eq!(json["messages"].as_array().unwrap().len(), 2);
     }
 
     #[test]

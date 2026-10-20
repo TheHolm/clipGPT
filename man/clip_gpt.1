@@ -261,6 +261,18 @@ Refuse clipboard text that looks like a secret; default true.
 Longest wait in whole seconds for the LLM's answer, from sending the
 request to the end of the response; default 30, 0 means no limit.
 Raise it for slow local models.
+.It Cm request_extra_body
+A table of extra top-level fields for the JSON request body, for server
+options without a key of their own, e.g.\&
+.Ql request_extra_body = { keep_alive = \(dq8h\(dq }
+to keep an Ollama model loaded for 8 hours.
+Values keep their TOML type; dates and times are refused, and so are
+.Ql model ,
+.Ql messages
+and
+.Ql stream .
+A profile's own table replaces an included one as a whole.
+Not set by default: nothing extra is sent.
 .El
 .Sh PROFILES
 Without
