@@ -30,8 +30,9 @@ Options:
                          key, token, private key or URL with a password
                          (password-manager and hidden-character checks
                          still apply)
-      --timeout SECONDS  Wait at most SECONDS for the LLM's answer (0 = no
-                         limit); overrides request_timeout in config.toml
+      --timeout SECONDS  Wait at most SECONDS (up to 3600) for the LLM's
+                         answer (0 = no limit); overrides request_timeout
+                         in config.toml
   -V, --version          Print the version and exit
   -h, --help             Print this help and exit";
 
@@ -302,6 +303,13 @@ mod tests {
         );
         assert!(err.contains("Usage:"));
         assert!(parse(["--timeout=-1"]).is_err());
+        let err = parse(["--timeout", "3601"]).unwrap_err();
+        assert!(
+            err.contains("from 0 to 3600") && err.contains("Usage:"),
+            "{err}"
+        );
+        assert!(parse(["--timeout=3600"]).is_ok());
+        assert!(USAGE.contains("up to 3600"));
         assert!(parse(["--timeout="]).is_err());
         // The value is taken as-is, even if it looks like a flag.
         assert!(parse(["--timeout", "-s"]).is_err());

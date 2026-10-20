@@ -151,7 +151,7 @@ errors. Error messages never quote setting values.
 | max_image_bytes |  | 10485760 | int | largest clipboard image (bytes) sent to the LLM, checked as read and after conversion to PNG; bigger images are refused |
 | allow_redirects |  | false | bool | follow HTTP redirects from api_url (never from https to http) |
 | secret_check | -s / --no-secret-check (turns it off) | true | bool | refuse clipboard text that looks like an API key, token, private key or URL with a password (see "Security") |
-| request_timeout | --timeout SECONDS | 30 | int | longest wait in seconds for the LLM's whole answer; 0 = no limit. Raise it for slow local models (e.g. a cold Ollama model load) |
+| request_timeout | --timeout SECONDS | 30 | int | longest wait in seconds for the LLM's whole answer, at most 3600 (1 hour); 0 = no limit. Raise it for slow local models (e.g. a cold Ollama model load) |
 | request_extra_body |  |  | table | extra top-level fields for the JSON request body, e.g. `{ keep_alive = "8h" }` to keep an Ollama model loaded for 8 hours. Values keep their TOML type; dates, `model`, `messages` and `stream` are refused. Not set: nothing extra is sent. A profile's own table replaces an included one |
 
 Strings are quoted (`"..."` takes escapes such as `\n`, `'...'` doesn't);

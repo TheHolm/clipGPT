@@ -52,6 +52,11 @@ const DEFAULT_SECRET_CHECK: bool = true;
 /// Default for `request_timeout`, in seconds (the same as reqwest's own
 /// default, which applied before the option existed).
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Largest `request_timeout` / `--timeout`, in seconds (1 hour). Without a
+/// cap a huge value could overflow the HTTP client's deadline arithmetic
+/// (a panic); no clipboard round trip needs longer, and 0 still means no
+/// limit at all.
+const MAX_REQUEST_TIMEOUT_SECS: u64 = 3600;
 
 /// The `input` value marking a profile that handles nothing (one meant
 /// only to be included by others).
@@ -179,7 +184,8 @@ enum KeyType {
     Size,
     /// `true` or `false`.
     Bool,
-    /// A whole number of seconds, 0 = no limit.
+    /// A whole number of seconds up to [`MAX_REQUEST_TIMEOUT_SECS`],
+    /// 0 = no limit.
     Timeout,
     /// The list of input kinds (`input`).
     Input,
@@ -323,15 +329,23 @@ fn check_key_file_mode(mode: u32, path: &str) -> Result<(), String> {
     }
 }
 
-/// Parse a timeout given as a whole number of seconds; `0` means no limit
-/// (`None`). Anything else (negative, fractional, text) is an error naming
-/// `key`. Used by the `--timeout` command line option.
+/// What a timeout must be, for error messages.
+fn timeout_expected() -> String {
+    format!("a whole number of seconds from 0 to {MAX_REQUEST_TIMEOUT_SECS} (1 hour; 0 = no limit)")
+}
+
+/// Parse a timeout given as a whole number of seconds up to
+/// [`MAX_REQUEST_TIMEOUT_SECS`]; `0` means no limit (`None`). Anything
+/// else (negative, fractional, text, too large) is an error naming `key`.
+/// Used by the `--timeout` command line option.
 pub fn parse_timeout(key: &str, value: &str) -> Result<Option<Duration>, String> {
     match value.trim().parse::<u64>() {
-        Ok(secs) => Ok(timeout_from_secs(secs)),
-        Err(_) => Err(format!(
-            "Invalid value '{}' for '{}': expected a whole number of seconds (0 = no limit)",
-            value, key
+        Ok(secs) if secs <= MAX_REQUEST_TIMEOUT_SECS => Ok(timeout_from_secs(secs)),
+        _ => Err(format!(
+            "Invalid value '{}' for '{}': expected {}",
+            value,
+            key,
+            timeout_expected()
         )),
     }
 }
@@ -604,8 +618,8 @@ fn check_value(kind: KeyType, value: &Value) -> Result<(), String> {
             .map(drop)
             .ok_or("must be true or false (without quotes)".into()),
         KeyType::Timeout => match integer {
-            Some(n) if n >= 0 => Ok(()),
-            _ => Err("must be a whole number of seconds (0 = no limit)".into()),
+            Some(n) if u64::try_from(n).is_ok_and(|n| n <= MAX_REQUEST_TIMEOUT_SECS) => Ok(()),
+            _ => Err(format!("must be {}", timeout_expected())),
         },
         KeyType::Input => check_input(value),
         KeyType::JsonTable => check_extra_body(value),
@@ -1276,6 +1290,10 @@ mod tests {
 
     #[test]
     fn wrong_types_are_errors_without_values() {
+        let cfg = default_config(
+            "[default]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\nrequest_timeout = 3600\n",
+        );
+        assert_eq!(cfg.request_timeout, Some(Duration::from_secs(3600)));
         for (line, expect) in [
             ("beep_tone = \"abc\"", "whole number"),
             ("beep_tone = -1", "whole number"),
@@ -1287,6 +1305,8 @@ mod tests {
             ("secret_check = 1", "true or false"),
             ("request_timeout = -1", "0 = no limit"),
             ("request_timeout = \"30s\"", "0 = no limit"),
+            ("request_timeout = 3601", "from 0 to 3600 (1 hour"),
+            ("request_timeout = 9223372036854775807", "from 0 to 3600"),
             ("api_url = 5", "must be a string"),
             ("api_key = 12345678", "must be a string"),
             ("api_type = \"Claude\"", "OpenAI"),
@@ -1802,7 +1822,19 @@ mod tests {
             parse_timeout("k", " 120 "),
             Ok(Some(Duration::from_secs(120)))
         );
-        for bad in ["-1", "1.5", "ten", "", "30s"] {
+        assert_eq!(
+            parse_timeout("k", "3600"),
+            Ok(Some(Duration::from_secs(MAX_REQUEST_TIMEOUT_SECS)))
+        );
+        for bad in [
+            "-1",
+            "1.5",
+            "ten",
+            "",
+            "30s",
+            "3601",
+            "18446744073709551615",
+        ] {
             let err = parse_timeout("--timeout", bad).unwrap_err();
             assert!(
                 err.contains("--timeout") && err.contains("0 = no limit"),

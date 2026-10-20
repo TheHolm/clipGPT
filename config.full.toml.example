@@ -107,7 +107,8 @@ prompt_image = "You are an OCR engine. Transcribe all text visible in the image 
 #secret_check = true
 
 # Longest wait, in whole seconds, for the LLM's answer (from sending the
-# request to the end of the response). 0 = no limit. Default 30. Raise it
+# request to the end of the response), at most 3600 (1 hour). 0 = no
+# limit. Default 30. Raise it
 # for slow local models - loading an Ollama model cold can take longer. The
 # --timeout SECONDS command line option overrides it for one run.
 #request_timeout = 30

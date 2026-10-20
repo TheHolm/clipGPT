@@ -95,7 +95,7 @@ The password-manager and hidden-character checks still apply.
 .It Fl \-timeout Ar seconds , Fl \-timeout Ns = Ns Ar seconds
 Wait at most
 .Ar seconds
-for the LLM's whole answer;
+for the LLM's whole answer, at most 3600 (1 hour);
 .Ar 0
 means no limit.
 Overrides
@@ -266,7 +266,8 @@ A redirect from https to plain http is always refused.
 Refuse clipboard text that looks like a secret; default true.
 .It Cm request_timeout
 Longest wait in whole seconds for the LLM's answer, from sending the
-request to the end of the response; default 30, 0 means no limit.
+request to the end of the response; default 30, at most 3600 (1 hour),
+0 means no limit.
 Raise it for slow local models.
 .It Cm request_extra_body
 A table of extra top-level fields for the JSON request body, for server
