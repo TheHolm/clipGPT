@@ -335,7 +335,7 @@ fn decide_text<'a>(
 /// computer, if any.
 fn check_api_url(config: &Config) -> Result<(Url, Option<String>), String> {
     let url = Url::parse(&config.api_url).map_err(|e| format!("Invalid api_url: {}", e))?;
-    let warning = net::check_url(&url, &net::host_is_local)?;
+    let warning = net::check_url(&url, config.api_key.is_some(), &net::host_is_local)?;
     Ok((url, warning))
 }
 
@@ -420,7 +420,11 @@ fn run_with<'a>(
     }
     let hint = status_hint(&input);
     let payload = build_request(config, input);
-    let client = net::build_client(config.allow_redirects, config.request_timeout)?;
+    let client = net::build_client(
+        config.allow_redirects,
+        config.api_key.is_some(),
+        config.request_timeout,
+    )?;
     let body = net::post_json(
         &client,
         &url,
