@@ -185,7 +185,9 @@ or
 .Ql [\(dqnone\(dq]
 for a profile that handles nothing and only exists to be included by
 others (such a profile cannot be selected, and needs no
-.Cm model ) .
+.Cm model
+or
+.Cm api_url ) .
 Without
 .Cm input
 a profile handles every kind, including kinds added in later versions.
@@ -203,8 +205,11 @@ The model name, e.g.\&
 .Ql gpt-4o-mini
 for OpenAI or a local model name for Ollama.
 .It Cm api_url
-Chat completions endpoint; default
-.Ql https://api.openai.com/v1/chat/completions .
+Required in every profile that handles input (set there or included);
+there is no default, so requests only go to a server that was chosen.
+The chat completions endpoint, e.g.\&
+.Ql https://api.openai.com/v1/chat/completions
+for OpenAI.
 Only
 .Ql http
 and

@@ -43,8 +43,8 @@ To build from source instead:
    ```
    The binary will be at `target/release/clip_gpt`.
 
-2. Copy `config.toml.example` to `config.toml` and fill in `model`
-   (required) and `api_key` (if your server needs one - a local Ollama
+2. Copy `config.toml.example` to `config.toml` and fill in `api_url` and
+   `model` (both required, there is no default server) and `api_key` (if your server needs one - a local Ollama
    doesn't) in its `[default]` profile. `config.expanded.toml.example`
    shows several profiles with includes, `config.full.toml.example` every
    key with its default. Place it at one of the locations
@@ -89,9 +89,9 @@ Every `[name]` table is a profile. Without `-p` clipGPT uses `[default]`
   (`api_key = ""` means no key, which also drops an included one).
 * `input = [...]` - what the profile handles: `"text"`, `"image"`, or
   `["none"]` for a profile that only exists to be included (it can't be
-  selected with `-p` and needs no `model`). Without `input` a profile handles
-  every kind, including kinds added in later versions. `input` is passed on
-  by `include` like any other key.
+  selected with `-p` and needs no `model` or `api_url`). Without `input` a
+  profile handles every kind, including kinds added in later versions.
+  `input` is passed on by `include` like any other key.
 
 With several profiles, each kind of clipboard content goes to the **last**
 listed profile whose `input` accepts it, and every setting of that run
@@ -137,7 +137,7 @@ errors. Error messages never quote setting values.
 | clear |  |  | list of str | included keys to reset to their built-in default |
 | input |  | every kind | list of str | `"text"`, `"image"`, or `["none"]` |
 | api_type |  | OpenAI | str | Only OpenAI is currently supported (works with Ollama too, since it exposes an OpenAI-compatible API) |
-| api_url |  | https://api.openai.com/v1/chat/completions | str | http or https only; plain http to another computer prints a warning (see "Security") |
+| api_url |  |  | str | Required in every profile that handles input; no default. Chat completions endpoint, e.g. https://api.openai.com/v1/chat/completions for OpenAI. http or https only; plain http to another computer prints a warning (see "Security") |
 | api_key | -k *(not yet implemented)* |  | str | Optional. Empty or missing means no key is sent (e.g. local Ollama). If any profile sets one, the config file must be mode 600 on Unix |
 | model |  |  | str | Required in every profile that handles input. Model name sent to api_url, e.g. gpt-4o-mini for OpenAI, or a local model name for Ollama |
 | prompt_text | -t *(not yet implemented)* | "Check spelling and gramma and rewrite following text on pirate speak. Be mean and pushy \n\n" | str | prompt used if clipboard contains text (sent as the system message, the clipboard text as a separate user message) |

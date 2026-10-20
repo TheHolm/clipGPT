@@ -24,6 +24,7 @@ beep_duration = 250
 [default]
 include = ["beeps"]
 clear = ["input"]          # don't inherit "none" from [beeps]
+api_url = "https://api.openai.com/v1/chat/completions"
 api_key = "sk-your-key-here"
 model = "gpt-4o-mini"
 prompt_text = "Fix spelling and grammar. Reply with the corrected text only."

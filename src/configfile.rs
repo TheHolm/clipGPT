@@ -27,7 +27,6 @@ const CONFIG_FILE: &str = "config.toml";
 pub const DEFAULT_PROFILE: &str = "default";
 
 const DEFAULT_API_TYPE: &str = "OpenAI";
-const DEFAULT_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_PROMPT_TEXT: &str =
     "Check spelling and gramma and rewrite following text on pirate speak. Be mean and pushy \n\n";
 /// Default prompt for clipboard images: make a vision model act as OCR.
@@ -195,12 +194,11 @@ fn key_type(key: &str) -> Option<KeyType> {
 }
 
 /// The built-in default of a setting, as a TOML value. `None` for keys
-/// without one (`api_key`, `model`) and for `input`, whose default is
+/// without one (`api_url`, `api_key`, `model`) and for `input`, whose default is
 /// "every kind" (see [`InputKind::ALL`]).
 fn default_value(key: &str) -> Option<Value> {
     Some(match key {
         "api_type" => Value::from(DEFAULT_API_TYPE),
-        "api_url" => Value::from(DEFAULT_API_URL),
         "prompt_text" => Value::from(DEFAULT_PROMPT_TEXT),
         "prompt_image" => Value::from(DEFAULT_PROMPT_IMAGE),
         "beep_tone" => Value::from(i64::from(DEFAULT_BEEP_TONE)),
@@ -868,7 +866,11 @@ impl ConfigFile {
     }
 
     /// Build the run settings of profile `name` from its `resolved`
-    /// settings; `handles` is only used in the missing-model message.
+    /// settings; `handles` is only used in the missing-model and
+    /// missing-api_url messages. `model` and `api_url` have no built-in
+    /// default: a profile that handles input must get both from its own
+    /// keys or its includes, so a request never goes to a server the user
+    /// did not choose.
     fn build_config(
         &self,
         name: &str,
@@ -885,20 +887,22 @@ impl ConfigFile {
         let int = |key: &str| get(key).and_then(|v| v.as_integer()).unwrap_or(0);
         let boolean = |key: &str| get(key).and_then(|v| v.as_bool()).unwrap_or(false);
 
-        let model = string("model")
-            .filter(|m| !m.trim().is_empty())
-            .ok_or_else(|| {
+        let required = |key: &str| {
+            string(key).filter(|v| !v.trim().is_empty()).ok_or_else(|| {
                 let kinds: Vec<&str> = handles.iter().map(|k| k.name()).collect();
                 format!(
-                    "Profile [{name}] handles {} but has no model: set model in [{name}] or in a \
+                    "Profile [{name}] handles {} but has no {key}: set {key} in [{name}] or in a \
                      profile it includes ({})",
                     kinds.join(" and "),
                     self.path
                 )
-            })?;
+            })
+        };
+        let model = required("model")?;
+        let api_url = required("api_url")?;
         Ok(Config {
             api_type: ApiType::OpenAI,
-            api_url: string("api_url").unwrap_or_default(),
+            api_url,
             api_key: normalize_api_key(string("api_key")),
             model,
             prompt_text: string("prompt_text").unwrap_or_default(),
@@ -1129,10 +1133,11 @@ mod tests {
 
     #[test]
     fn defaults_apply_to_unset_keys() {
-        let cfg = default_config("[default]\nmodel = \"llama3\"\n");
+        let cfg =
+            default_config("[default]\nmodel = \"llama3\"\napi_url = \"https://llm.example/v1\"\n");
         assert_eq!(cfg.api_key, None);
         assert_eq!(cfg.model, "llama3");
-        assert_eq!(cfg.api_url, DEFAULT_API_URL);
+        assert_eq!(cfg.api_url, "https://llm.example/v1");
         assert_eq!(cfg.prompt_text, DEFAULT_PROMPT_TEXT);
         assert_eq!(cfg.prompt_image, DEFAULT_PROMPT_IMAGE);
         assert_eq!(cfg.beep_tone, DEFAULT_BEEP_TONE);
@@ -1171,7 +1176,7 @@ mod tests {
 
     #[test]
     fn empty_strings_are_real_values() {
-        let cfg = default_config("[default]\nmodel = \"m\"\nprompt_text = \"\"\napi_key = \"\"\n");
+        let cfg = default_config("[default]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\nprompt_text = \"\"\napi_key = \"\"\n");
         assert_eq!(cfg.prompt_text, "");
         assert_eq!(cfg.api_key, None);
     }
@@ -1235,7 +1240,7 @@ mod tests {
     #[test]
     fn blank_lines_comments_crlf_and_indentation_are_fine() {
         let cfg = default_config(
-            "# comment\r\n \t \r\n  [default]  # trailing\r\n\tmodel = \"m\" \t\r\n",
+            "# comment\r\n \t \r\n  [default]  # trailing\r\n\tmodel = \"m\" \t\r\napi_url = \"https://llm.example/v1\"\r\n",
         );
         assert_eq!(cfg.model, "m");
     }
@@ -1252,7 +1257,7 @@ mod tests {
 
     #[test]
     fn includes_apply_in_order_and_own_keys_win() {
-        let file = "[a]\ninput = [\"none\"]\nbeep_tone = 1\nerror_tone = 1\nmodel = \"a\"\n\
+        let file = "[a]\ninput = [\"none\"]\nbeep_tone = 1\nerror_tone = 1\nmodel = \"a\"\napi_url = \"https://llm.example/v1\"\n\
                     [b]\ninput = [\"none\"]\nbeep_tone = 2\nbeep_duration = 2\n\
                     [default]\ninclude = [\"a\", \"b\"]\nclear = [\"input\"]\nbeep_duration = 3\n";
         let cfg = default_config(file);
@@ -1276,7 +1281,7 @@ mod tests {
 
     #[test]
     fn clear_restores_the_built_in_default() {
-        let file = "[base]\nmodel = \"m\"\napi_key = \"sk-x\"\nbeep_tone = 5\nprompt_text = \"p\"\n\
+        let file = "[base]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\napi_key = \"sk-x\"\nbeep_tone = 5\nprompt_text = \"p\"\n\
                     [default]\ninclude = [\"base\"]\nclear = [\"api_key\", \"beep_tone\", \"prompt_text\"]\n";
         let cfg = default_config(file);
         assert_eq!(cfg.api_key, None);
@@ -1285,7 +1290,7 @@ mod tests {
         assert_eq!(cfg.model, "m");
         // Clearing model leaves the profile without one.
         let err = select(
-            "[base]\nmodel = \"m\"\n[default]\ninclude = [\"base\"]\nclear = [\"model\"]\n",
+            "[base]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n[default]\ninclude = [\"base\"]\nclear = [\"model\"]\n",
             None,
         )
         .unwrap_err();
@@ -1293,6 +1298,32 @@ mod tests {
             err.contains("[default] handles text and image but has no model"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn api_url_has_no_default() {
+        assert_eq!(default_value("api_url"), None);
+        let err = select("[default]\nmodel = \"m\"\n", None).unwrap_err();
+        assert!(
+            err.contains("[default] handles text and image but has no api_url"),
+            "{err}"
+        );
+        // Blank counts as missing; clearing an included one leaves none.
+        let err = select("[default]\nmodel = \"m\"\napi_url = \" \"\n", None).unwrap_err();
+        assert!(err.contains("has no api_url"), "{err}");
+        let file = "[base]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n\
+                    [default]\ninclude = [\"base\"]\nclear = [\"api_url\"]\n";
+        assert!(select(file, None).unwrap_err().contains("has no api_url"));
+        // A profile that handles nothing needs none.
+        let file = "[nourl]\ninput = [\"image\"]\nmodel = \"m\"\n\
+                    [default]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n";
+        assert!(select(file, Some("nourl,default")).is_ok());
+        // --show-profile shows it as not set.
+        let parsed = parse("[a]\ninput = [\"none\"]\n[default]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n").unwrap();
+        let sel = parsed.select(None).unwrap();
+        assert!(parsed
+            .show(&sel)
+            .contains("api_url          = \"https://llm.example/v1\"  # [default]"));
     }
 
     #[test]
@@ -1356,7 +1387,11 @@ mod tests {
 
     #[test]
     fn default_profile_is_used_without_p_and_required() {
-        let sel = select("[default]\nmodel = \"m\"\n[x]\nmodel = \"x\"\n", None).unwrap();
+        let sel = select(
+            "[default]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n[x]\nmodel = \"x\"\n",
+            None,
+        )
+        .unwrap();
         assert_eq!(sel.names(), "default");
         let err = select("[openai]\nmodel = \"m\"\n[x]\nmodel = \"x\"\n", None).unwrap_err();
         assert!(
@@ -1380,10 +1415,10 @@ mod tests {
 
     /// A file with profiles `both` (every kind), `text` and `image` (one
     /// kind each) and `beeps` (none).
-    const ROUTING: &str = "[beeps]\ninput = [\"none\"]\nbeep_tone = 880\n\
+    const ROUTING: &str = "[beeps]\ninput = [\"none\"]\nbeep_tone = 880\napi_url = \"https://llm.example/v1\"\n\
                            [both]\ninclude = [\"beeps\"]\nclear = [\"input\"]\nmodel = \"both\"\n\
-                           [text]\ninput = [\"text\"]\nmodel = \"text\"\n\
-                           [image]\ninput = [\"image\"]\nmodel = \"image\"\n";
+                           [text]\ninput = [\"text\"]\nmodel = \"text\"\napi_url = \"https://llm.example/v1\"\n\
+                           [image]\ninput = [\"image\"]\nmodel = \"image\"\napi_url = \"https://llm.example/v1\"\n";
 
     /// The model handling each kind (text, image) for `-p names`.
     fn routes(names: &str) -> (Option<String>, Option<String>) {
@@ -1457,11 +1492,11 @@ mod tests {
 
     #[test]
     fn show_lists_values_sources_and_routing_but_never_the_key() {
-        let file = "[base]\ninput = [\"none\"]\napi_key = \"sk-very-secret\"\nmodel = \"gpt\"\n\
+        let file = "[base]\ninput = [\"none\"]\napi_key = \"sk-very-secret\"\nmodel = \"gpt\"\napi_url = \"https://llm.example/v1\"\n\
                     prompt_text = \"line1\\nline2\"\n\
                     [default]\ninclude = [\"base\"]\nclear = [\"input\"]\nbeep_tone = 1\n\
                     [ocr]\ninclude = [\"base\"]\ninput = [\"image\"]\n\
-                    [nokey]\ninput = [\"text\"]\napi_key = \"\"\nmodel = \"m\"\n";
+                    [nokey]\ninput = [\"text\"]\napi_key = \"\"\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n";
         let parsed = parse(file).unwrap();
         let sel = parsed
             .select(Some(&["default".into(), "ocr".into()]))
@@ -1614,7 +1649,7 @@ mod tests {
     fn key_in_private_file_is_loaded() {
         let path = temp_config(
             "privkey",
-            "[default]\napi_key = \"sk-abc\"\nmodel = \"m\"\n",
+            "[default]\napi_key = \"sk-abc\"\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n",
             0o600,
         );
         let file = load_from_path(&path).unwrap();
@@ -1834,7 +1869,11 @@ mod tests {
                 "{key}: {entry}"
             );
         }
-        assert!(man.contains(DEFAULT_API_URL));
+        let api_url = man.split(".It Cm api_url\n").nth(1).unwrap();
+        assert!(
+            api_url.starts_with("Required") && api_url.contains("no default"),
+            "{api_url}"
+        );
         assert!(man.contains(&format!("~/.config/{APP_NAME}/config.toml")));
         assert!(man.contains(DEFAULT_PROFILE));
     }

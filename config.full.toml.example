@@ -51,7 +51,8 @@ clear = ["input"]
 # API too).
 api_type = "OpenAI"
 
-# OpenAI's real endpoint, or point this at a local Ollama server, e.g.:
+# Required in every profile that handles input (here or via include); there
+# is no default. OpenAI's endpoint, or point this at a local Ollama server, e.g.:
 # api_url = "http://127.0.0.1:11434/v1/chat/completions"
 # Only http and https are accepted. Plain http to anything other than this
 # computer (loopback or one of its own addresses) works, but prints a

@@ -6,7 +6,8 @@
 # https://github.com/TheHolm/clipGPT (e.g. on Windows).
 
 [default]
-# OpenAI, or e.g. "http://127.0.0.1:11434/v1/chat/completions" for Ollama.
+# Required (no default): OpenAI, or e.g.
+# "http://127.0.0.1:11434/v1/chat/completions" for Ollama.
 api_url = "https://api.openai.com/v1/chat/completions"
 # Leave empty for servers that need no key.
 api_key = "sk-your-key-here"
