@@ -128,16 +128,27 @@ pub fn check_url(
     }
 }
 
-/// Decide one redirect hop when redirects are allowed. `visited` is the
-/// number of URLs already requested (reqwest's `previous().len()`). Returns
-/// a warning to print for plain http to another host, or an error to stop.
+/// Decide one redirect hop when redirects are allowed. `previous` holds
+/// the URLs already requested, in order (reqwest's `previous()`); the last
+/// one is redirecting to `next`. Returns a warning to print for plain http
+/// to another host, or an error to stop. A redirect from https to anything
+/// but https is refused, wherever it points: the request (a 307/308 one
+/// re-sends the clipboard text) must never lose the encryption it started
+/// with.
 pub fn redirect_decision(
     next: &Url,
-    visited: usize,
+    previous: &[Url],
     is_local: &dyn Fn(&str, u16) -> bool,
 ) -> Result<Option<String>, String> {
-    if visited > MAX_REDIRECTS {
+    if previous.len() > MAX_REDIRECTS {
         return Err(format!("Too many redirects (more than {})", MAX_REDIRECTS));
+    }
+    if previous.last().is_some_and(|p| p.scheme() == "https") && next.scheme() != "https" {
+        return Err(format!(
+            "Redirect refused: {} would downgrade https to {}",
+            url_origin(next),
+            next.scheme()
+        ));
     }
     check_url(next, is_local).map_err(|e| format!("Redirect refused: {}", e))
 }
@@ -151,7 +162,7 @@ pub fn redirect_decision(
 pub fn build_client(allow_redirects: bool, timeout: Option<Duration>) -> Result<Client, String> {
     let policy = if allow_redirects {
         redirect::Policy::custom(|attempt| {
-            match redirect_decision(attempt.url(), attempt.previous().len(), &host_is_local) {
+            match redirect_decision(attempt.url(), attempt.previous(), &host_is_local) {
                 Ok(warning) => {
                     if let Some(warning) = warning {
                         eprintln!("{}", warning);
@@ -368,22 +379,52 @@ mod tests {
 
     #[test]
     fn redirect_hops_are_checked() {
+        let from_http = [url("http://127.0.0.1/")];
         assert_eq!(
-            redirect_decision(&url("https://a.example/"), 1, &fake_local),
+            redirect_decision(&url("https://a.example/"), &from_http, &fake_local),
             Ok(None)
         );
-        assert!(redirect_decision(&url("http://a.example/"), 1, &fake_local)
-            .unwrap()
-            .is_some());
-        let err = redirect_decision(&url("file:///etc/passwd"), 1, &fake_local).unwrap_err();
+        assert!(
+            redirect_decision(&url("http://a.example/"), &from_http, &fake_local)
+                .unwrap()
+                .is_some()
+        );
+        let err =
+            redirect_decision(&url("file:///etc/passwd"), &from_http, &fake_local).unwrap_err();
         assert!(err.contains("Redirect refused"));
+    }
+
+    #[test]
+    fn redirect_from_https_to_http_is_refused() {
+        let from_https = [url("https://api.example/v1")];
+        // Even to this computer, and even to the same host.
+        for next in [
+            "http://203.0.113.7/x?token=SECRET",
+            "http://127.0.0.1:11434/",
+            "http://api.example/v1",
+        ] {
+            let err = redirect_decision(&url(next), &from_https, &fake_local).unwrap_err();
+            assert!(err.contains("downgrade https to http"), "{err}");
+            assert!(!err.contains("SECRET"), "{err}");
+        }
+        assert_eq!(
+            redirect_decision(&url("https://b.example/"), &from_https, &fake_local),
+            Ok(None)
+        );
+        // Only the hop that is being redirected from counts.
+        let chain = [url("https://a.example/"), url("http://127.0.0.1/")];
+        assert_eq!(
+            redirect_decision(&url("http://localhost/"), &chain, &fake_local),
+            Ok(None)
+        );
     }
 
     #[test]
     fn redirect_limit_enforced() {
         let u = url("https://a.example/");
-        assert!(redirect_decision(&u, MAX_REDIRECTS, &fake_local).is_ok());
-        assert!(redirect_decision(&u, MAX_REDIRECTS + 1, &fake_local).is_err());
+        let hops = |n| vec![url("https://a.example/"); n];
+        assert!(redirect_decision(&u, &hops(MAX_REDIRECTS), &fake_local).is_ok());
+        assert!(redirect_decision(&u, &hops(MAX_REDIRECTS + 1), &fake_local).is_err());
     }
 
     #[test]

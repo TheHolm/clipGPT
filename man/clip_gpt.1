@@ -247,6 +247,7 @@ Follow HTTP redirects from
 each hop checked like
 .Cm api_url
 itself, at most 10; default false.
+A redirect from https to plain http is always refused.
 .It Cm secret_check
 Refuse clipboard text that looks like a secret; default true.
 .It Cm request_timeout

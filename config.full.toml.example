@@ -95,7 +95,8 @@ prompt_image = "You are an OCR engine. Transcribe all text visible in the image 
 #max_image_bytes = 10485760
 
 # Follow HTTP redirects from api_url? Default false: any redirect is an
-# error. When true, up to 10 hops are followed, each checked like api_url.
+# error. When true, up to 10 hops are followed, each checked like api_url;
+# a redirect from https to plain http is always refused.
 # true or false, without quotes.
 #allow_redirects = false
 

@@ -147,7 +147,7 @@ errors. Error messages never quote setting values.
 | beep_duration |  | 250 | int | duration in ms, for error and success beeps (set to 0 to disable) |
 | max_input_bytes |  | 65536 | int | largest clipboard text (UTF-8 bytes) sent to the LLM; bigger clipboards are refused |
 | max_image_bytes |  | 10485760 | int | largest clipboard image (bytes) sent to the LLM, checked as read and after conversion to PNG; bigger images are refused |
-| allow_redirects |  | false | bool | follow HTTP redirects from api_url |
+| allow_redirects |  | false | bool | follow HTTP redirects from api_url (never from https to http) |
 | secret_check | -s / --no-secret-check (turns it off) | true | bool | refuse clipboard text that looks like an API key, token, private key or URL with a password (see "Security") |
 | request_timeout | --timeout SECONDS | 30 | int | longest wait in seconds for the LLM's whole answer; 0 = no limit. Raise it for slow local models (e.g. a cold Ollama model load) |
 
@@ -292,7 +292,9 @@ output back where you will paste it, so it applies these protections:
   loopback or to one of this computer's own addresses (e.g. its LAN IP) is
   silent; to any other host it works but prints a warning on stderr, since
   the key and text travel unencrypted. Redirects are refused unless
-  `allow_redirects = true`; then each hop is checked the same way (at most 10).
+  `allow_redirects = true`; then each hop is checked the same way (at most
+  10), and a redirect from `https` to plain `http` is always refused, even
+  to this computer.
   When a redirect changes host the API key is dropped, but a 307/308
   redirect does re-send the clipboard text to the new host.
 * **Limits.** Clipboard text over `max_input_bytes` and images over
