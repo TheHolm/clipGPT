@@ -44,8 +44,9 @@ To build from source instead:
    The binary will be at `target/release/clip_gpt`.
 
 2. Copy `config.toml.example` to `config.toml` and fill in `api_url` and
-   `model` (both required, there is no default server) and `api_key` (if your server needs one - a local Ollama
-   doesn't) in its `[default]` profile. `config.expanded.toml.example`
+   `model` (both required, there is no default server) and `api_key` (if
+   your server needs one - a local Ollama doesn't) in its `[default]`
+   profile. `config.expanded.toml.example`
    shows several profiles with includes, `config.full.toml.example` every
    key with its default. Place it at one of the locations
    listed under "Config file location" below. If it contains an `api_key`,
