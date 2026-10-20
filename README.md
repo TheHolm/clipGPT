@@ -154,9 +154,11 @@ errors. Error messages never quote setting values.
 Strings are quoted (`"..."` takes escapes such as `\n`, `'...'` doesn't);
 numbers and `true`/`false` are not.
 
-Command line options: `-p`/`--profile NAME[,NAME...]` picks the profiles
+Command line options: `-c`/`--config FILE` reads that config file instead
+of searching the usual locations (no fallback if it's missing; use an
+absolute path in hotkey bindings); `-p`/`--profile NAME[,NAME...]` picks the profiles
 (see above); `--list-profiles` prints the profile names; `--show-profile`
-prints the selected profiles' resolved settings (API key hidden) and exits,
+prints the config file used and the selected profiles' resolved settings (API key hidden) and exits,
 which also checks the config; `-s`/`--no-secret-check` skips the secret
 check for one run; `--timeout SECONDS` (or `--timeout=SECONDS`) sets the
 request timeout for one run, overriding `request_timeout` (0 = no limit);
@@ -164,7 +166,7 @@ request timeout for one run, overriding `request_timeout` (0 = no limit);
 `-V`/`--version` prints the version; `-h`/`--help` prints usage. Any other
 argument is an error.
 
-The `-c`/`-k`/`-t`/`-i` command line options are planned but **not yet
+The `-k`/`-t`/`-i` command line options are planned but **not yet
 implemented**.
 
 ## Images
@@ -213,7 +215,8 @@ Default per-OS location of `config.toml`:
 * Windows *"%APPDATA%\clipgpt\config.toml"* - %APPDATA% typically resolves to `C:\Users\<username>\AppData\Roaming`.
 
 If `config.toml` isn't found at the path above, the current working
-directory is checked too (i.e. `./config.toml`).
+directory is checked too (i.e. `./config.toml`). `-c FILE` skips both and
+reads exactly `FILE`.
 
 ## Security
 

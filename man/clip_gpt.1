@@ -12,12 +12,15 @@
 .Sh SYNOPSIS
 .Nm
 .Op Fl s
+.Op Fl c Ar file
 .Op Fl p Ar profile Ns Op , Ns Ar profile ...
 .Op Fl \-timeout Ar seconds
 .Nm
+.Op Fl c Ar file
 .Op Fl p Ar profile Ns Op , Ns Ar profile ...
 .Fl \-show\-profile
 .Nm
+.Op Fl c Ar file
 .Fl \-list\-profiles
 .Nm
 .Fl h | V
@@ -44,6 +47,18 @@ when anything fails or the clipboard text was refused.
 Messages go to standard error.
 .Sh OPTIONS
 .Bl -tag -width Ds
+.It Fl c Ar file , Fl \-config Ar file , Fl \-config Ns = Ns Ar file
+Read exactly
+.Ar file
+instead of searching the locations under
+.Sx CONFIGURATION .
+If it does not exist or cannot be read,
+.Nm
+fails; there is no fallback to the usual locations.
+A relative name is taken from the current directory, which a hotkey
+daemon may set to anything: use an absolute path in hotkey bindings.
+All checks, including the file permission check, apply as usual.
+Giving the option twice is an error.
 .It Fl p Ar list , Fl \-profile Ar list , Fl \-profile Ns = Ns Ar list
 Use the profiles in the comma-separated
 .Ar list
@@ -62,8 +77,8 @@ every kind it accepts, only prints a warning.
 Print the names of all profiles in the configuration file, one per line,
 and exit.
 .It Fl \-show\-profile
-Print the settings of the selected profiles (the default one, or those
-given with
+Print the path of the configuration file read, then the settings of the
+selected profiles (the default one, or those given with
 .Fl p )
 after includes, each with the profile it came from or
 .Ql built-in default ,
@@ -101,7 +116,9 @@ is internal (see
 .Sx CLIPBOARD )
 and must not be used directly.
 .Sh CONFIGURATION
-Settings are read from a TOML file, looked up first at
+Settings are read from a TOML file: the one given with
+.Fl c ,
+or else the first found of
 .Pa ~/.config/clipgpt/config.toml
 .Po
 .Pa ~/Library/Application Support/clipgpt/config.toml
@@ -109,7 +126,7 @@ on macOS,
 .Pa %APPDATA%\eclipgpt\econfig.toml
 on Windows
 .Pc
-and then at
+and
 .Pa ./config.toml .
 The
 .Pa config.ini
@@ -352,6 +369,9 @@ The X11 display used when Wayland clipboard access is not available.
 Configuration file.
 .It Pa ./config.toml
 Used if the file above does not exist.
+Neither is used when
+.Fl c
+is given.
 .It Pa config.toml.example , config.expanded.toml.example , config.full.toml.example
 Example configurations in the source tree: a short one with a single
 profile, one with several profiles and includes, and one listing every key
@@ -403,6 +423,10 @@ Text to OpenAI, images to the local server:
 Check which profile would handle what, and with which settings:
 .Pp
 .Dl $ clip_gpt \-p default,ocr \-\-show\-profile
+.Pp
+A second hotkey using a separate configuration file:
+.Pp
+.Dl $ clip_gpt \-c ~/.config/clipgpt/work.toml \-p ocr
 .Pp
 Rewrite the clipboard once, waiting as long as the model needs:
 .Pp

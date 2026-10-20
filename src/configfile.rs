@@ -367,10 +367,14 @@ pub struct ConfigFile {
     profiles: Vec<Profile>,
 }
 
-/// Locate and load config.toml (see [`resolve_config_path`]).
-pub fn load() -> Result<ConfigFile, String> {
-    let path = resolve_config_path()?;
-    load_from_path(&path)
+/// Load the config file: exactly `path` if given (`-c`; a missing file is
+/// an error, there is no fallback), else the config.toml found by
+/// [`resolve_config_path`].
+pub fn load(path: Option<&Path>) -> Result<ConfigFile, String> {
+    match path {
+        Some(path) => load_from_path(path),
+        None => load_from_path(resolve_config_path()?),
+    }
 }
 
 /// Read, parse and check the config file at `path`.
@@ -378,9 +382,12 @@ pub fn load() -> Result<ConfigFile, String> {
 /// On Unix the permission check uses the metadata of the same open file
 /// handle that is read. It applies when any profile, used or not, has a
 /// non-empty `api_key`.
-fn load_from_path(path: &str) -> Result<ConfigFile, String> {
-    let mut handle =
-        File::open(path).map_err(|e| format!("Cannot open config file {}: {}", path, e))?;
+fn load_from_path(path: impl AsRef<Path>) -> Result<ConfigFile, String> {
+    // Opened by its real path; messages use a (possibly lossy) display form.
+    let mut handle = File::open(path.as_ref())
+        .map_err(|e| format!("Cannot open config file {}: {}", path.as_ref().display(), e))?;
+    let shown = path.as_ref().display().to_string();
+    let path = shown.as_str();
     #[cfg(unix)]
     let mode = {
         use std::os::unix::fs::PermissionsExt;
@@ -916,7 +923,7 @@ impl ConfigFile {
     /// handles which kind. The API key is never shown, only whether one is
     /// set.
     pub fn show(&self, selection: &Selection) -> String {
-        let mut out = String::new();
+        let mut out = format!("# config: {}\n\n", self.path);
         for selected in &selection.profiles {
             let profile = self.profile(&selected.name);
             out.push_str(&format!("[{}]\n", selected.name));
@@ -1420,6 +1427,7 @@ mod tests {
             .select(Some(&["default".into(), "ocr".into()]))
             .unwrap();
         let out = parsed.show(&sel);
+        assert!(out.starts_with("# config: t.toml\n\n[default]\n"), "{out}");
         assert!(!out.contains("sk-very"), "{out}");
         assert!(
             out.contains("api_key          = (set, hidden)  # [base]"),
@@ -1550,6 +1558,54 @@ mod tests {
     }
 
     #[test]
+    fn explicit_path_is_read_without_search_or_fallback() {
+        let path = temp_config("explicit", "[work]\nmodel = \"w\"\n", 0o600);
+        let file = load(Some(Path::new(&path))).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(file.profile_names(), ["work"]);
+        assert_eq!(file.path, path);
+        // A missing -c file is an error naming it, never the usual search.
+        let err = load(Some(Path::new("/nonexistent/clipgpt/work.toml"))).unwrap_err();
+        assert!(
+            err.starts_with("Cannot open config file /nonexistent/clipgpt/work.toml:"),
+            "{err}"
+        );
+        assert!(!err.contains("No config.toml found"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_path_gets_the_permission_check() {
+        let path = temp_config(
+            "explicitkey",
+            "[default]\napi_key = \"sk-x\"\nmodel = \"m\"\n",
+            0o640,
+        );
+        let err = load(Some(Path::new(&path))).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        assert!(err.contains("chmod 600"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_non_utf8_path_is_opened() {
+        use std::os::unix::ffi::OsStrExt;
+        let name = format!("clipgpt-test-{}-caf", std::process::id());
+        let mut bytes = name.into_bytes();
+        bytes.extend_from_slice(b"\xe9.toml");
+        let path = env::temp_dir().join(std::ffi::OsStr::from_bytes(&bytes));
+        // Some filesystems (e.g. ZFS with utf8only) refuse such names.
+        if std::fs::write(&path, "[default]\nmodel = \"m\"\n").is_err() {
+            eprintln!("skipped: filesystem refuses non-UTF-8 file names");
+            return;
+        }
+        let file = load(Some(&path));
+        std::fs::remove_file(&path).unwrap();
+        let file = file.unwrap();
+        assert!(file.path.contains('\u{FFFD}'), "{}", file.path);
+    }
+
+    #[test]
     fn missing_file_is_an_error_not_a_panic() {
         assert!(load_from_path("/nonexistent/clipgpt/config.toml").is_err());
     }
@@ -1558,7 +1614,7 @@ mod tests {
     fn non_utf8_file_is_an_error() {
         let path = env::temp_dir().join(format!("clipgpt-test-{}-latin1.toml", std::process::id()));
         std::fs::write(&path, b"[default]\nmodel = \"\xe9\"\n").unwrap();
-        let err = load_from_path(&path.to_string_lossy());
+        let err = load_from_path(&path);
         std::fs::remove_file(&path).unwrap();
         assert!(err.unwrap_err().contains("Cannot read config file"));
     }

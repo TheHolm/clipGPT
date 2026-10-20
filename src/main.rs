@@ -168,7 +168,7 @@ enum Outcome {
 /// hidden X11 clipboard owner mode runs before (and without) the config and
 /// never beeps; it reports to the clipGPT run that started it instead.
 fn main() {
-    let (options, show) = match cli::parse(std::env::args().skip(1)) {
+    let (options, show) = match cli::parse(std::env::args_os().skip(1)) {
         Ok(cli::Command::Help) => {
             println!("{}", cli::USAGE);
             return;
@@ -178,8 +178,8 @@ fn main() {
             return;
         }
         Ok(cli::Command::ClipboardOwner) => std::process::exit(clipboard_backend::serve_owner()),
-        Ok(cli::Command::ListProfiles) => {
-            for name in load_config().profile_names() {
+        Ok(cli::Command::ListProfiles(options)) => {
+            for name in load_config(&options).profile_names() {
                 println!("{name}");
             }
             return;
@@ -189,7 +189,7 @@ fn main() {
         Err(e) => fail_default(&e),
     };
 
-    let file = load_config();
+    let file = load_config(&options);
     let mut selection = file
         .select(options.profiles.as_deref())
         .unwrap_or_else(|e| fail_default(&e));
@@ -229,10 +229,12 @@ fn main() {
     }
 }
 
-/// Load config.toml, or fail with the built-in error tone.
-fn load_config() -> ConfigFile {
-    configfile::load()
-        .unwrap_or_else(|error| fail_default(&format!("Failed to load config.toml: {}", error)))
+/// Load the config file (`-c`, or the usual config.toml), or fail with the
+/// built-in error tone.
+fn load_config(options: &cli::Options) -> ConfigFile {
+    // Errors name the file themselves.
+    configfile::load(options.config.as_deref())
+        .unwrap_or_else(|error| fail_default(&format!("Failed to load config: {}", error)))
 }
 
 /// [`fail`] with the built-in error tone, for errors before any profile is
