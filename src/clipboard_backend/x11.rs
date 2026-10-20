@@ -22,9 +22,7 @@
 //! serves requests until another client takes the clipboard over.
 //! Re-executing avoids `fork()` in a multi-threaded process.
 
-use super::{
-    choose_image_type, image_too_large, marks_password, too_large, use_text, Clip, Limits,
-};
+use super::{choose, choose_image_type, image_too_large, marks_password, too_large, Clip, Limits};
 use crate::cli::OWNER_HELPER_ARG;
 use crate::imagefile::ClipImage;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -358,7 +356,7 @@ impl Reader {
 }
 
 /// Read the clipboard through X11, detecting the password-manager hint
-/// among the offered formats: the text, or an image if the text is blank.
+/// among the offered formats, then reading what [`choose`] picks.
 /// Data over its limit is an error, never returned in part. If the owner
 /// does not answer `TARGETS`, the hint cannot be checked and `UTF8_STRING`,
 /// then `STRING` are tried (no image).
@@ -376,22 +374,27 @@ pub fn get(limits: Limits) -> Result<Clip, Failure> {
         ReadPlan::Password => return Ok(Clip::Password),
         ReadPlan::Try { text, image } => (text, image),
     };
-    let mut text = String::new();
-    for target in candidates {
-        if let Some((bytes, type_)) = reader.read(target, limits.text, too_large)? {
-            text = decode_clip(bytes, type_, limits.text)?;
-            break;
-        }
-    }
-    match image {
-        Some(image) if !use_text(&text, true) => {
-            match reader.read(image, limits.image, image_too_large)? {
-                Some((bytes, _)) => Ok(Clip::Image(ClipImage::File(bytes))),
-                None => Ok(Clip::Text(text)),
+    let read_text = |max| {
+        for &target in &candidates {
+            if let Some((bytes, type_)) = reader.read(target, max, too_large)? {
+                return decode_clip(bytes, type_, max).map(Some);
             }
         }
-        _ => Ok(Clip::Text(text)),
-    }
+        Ok(None)
+    };
+    let read_image = |max| match image {
+        Some(image) => Ok(reader
+            .read(image, max, image_too_large)?
+            .map(|(bytes, _)| ClipImage::File(bytes))),
+        None => Ok(None),
+    };
+    choose(
+        !candidates.is_empty(),
+        image.is_some(),
+        limits,
+        read_text,
+        read_image,
+    )
 }
 
 /// What to do after looking at the owner's `TARGETS`.
@@ -1425,8 +1428,8 @@ mod tests {
         let owner = Owner::take(data)?;
         let server = std::thread::spawn(move || owner.serve());
         let result = get(Limits {
-            text: max_bytes,
-            image: max_bytes,
+            text: Some(max_bytes),
+            image: Some(max_bytes),
         });
         let other = Owner::take(Vec::new())?;
         server.join().unwrap()?;

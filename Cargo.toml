@@ -1,6 +1,6 @@
 [package]
 name = "clip_gpt"
-version = "0.5.0"
+version = "0.6.0"
 authors = [ "TheHolm" ]
 license = "AGPL-3.0-or-later"
 rust-version = "1.92"
@@ -11,7 +11,10 @@ edition = "2021"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-pretty_ini = "0.1"
+# Config file parser (config.toml with profiles). Only parsing into a
+# toml::Table is used (no serde derive; "serde" is needed for Table
+# itself); preserve_order keeps profiles in the order of the file.
+toml = { version = "1.1", default-features = false, features = ["std", "parse", "preserve_order", "serde"] }
 native-tls = "0.2.13"
 cpal = "0.18"
 regex = "1.12"

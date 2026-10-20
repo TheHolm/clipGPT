@@ -11,7 +11,10 @@
 //!
 //! Reading prefers text: an image is read only when no text, or only
 //! white space, is offered (apps such as office suites and browsers often
-//! offer both, the image being a rendering of the text).
+//! offer both, the image being a rendering of the text). Kinds no selected
+//! profile handles are not read at all (see [`Limits`] and
+//! [`Clip::Unwanted`]), so with only image profiles selected an image is
+//! read even when text is offered too.
 //!
 //! Reading also detects clipboard contents that a password manager has
 //! marked as sensitive, so they are never sent to the LLM:
@@ -22,6 +25,7 @@
 //!   set to 0
 //! * macOS: the `org.nspasteboard.ConcealedType` pasteboard type
 
+use crate::configfile::InputKind;
 use crate::imagefile::{too_large as image_too_large, ClipImage};
 
 /// What was found on the clipboard.
@@ -34,15 +38,19 @@ pub enum Clip {
     /// Contents a password manager marked as sensitive. The text itself is
     /// never read.
     Password,
+    /// Only content of this kind was offered, and no selected profile
+    /// handles it. Nothing was read.
+    Unwanted(InputKind),
 }
 
-/// Size limits for reading the clipboard, in bytes.
+/// What to read from the clipboard: the size limit of each kind in bytes,
+/// `None` for a kind no selected profile handles (it is then not read).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// Largest text, in UTF-8 (`max_input_bytes`).
-    pub text: usize,
+    pub text: Option<usize>,
     /// Largest image as read (`max_image_bytes`).
-    pub image: usize,
+    pub image: Option<usize>,
 }
 
 /// Image MIME types (Wayland) / targets (X11) we can read, most preferred
@@ -92,10 +100,41 @@ fn choose_image_type(offered: &[&str]) -> Option<&'static str> {
     pick(&IMAGE_MIME_PREFERENCE, offered)
 }
 
-/// Whether to use the `text` read rather than an available image: text
-/// wins unless it is blank or there is no image to fall back to.
-fn use_text(text: &str, image_available: bool) -> bool {
-    !image_available || !text.trim().is_empty()
+/// Decide what to read and read it, the same way on every OS:
+/// `text_offered`/`image_offered` say what the clipboard offers, the
+/// reader functions read one kind with the given size limit (`Ok(None)`
+/// if it turns out not to be available after all).
+///
+/// Non-blank text wins if it is wanted; otherwise a wanted image is read.
+/// Content that is offered but not wanted, with nothing wanted to read
+/// instead, is [`Clip::Unwanted`]. Nothing at all (or only blank text) is
+/// an empty [`Clip::Text`].
+fn choose<E>(
+    text_offered: bool,
+    image_offered: bool,
+    limits: Limits,
+    read_text: impl FnOnce(usize) -> Result<Option<String>, E>,
+    read_image: impl FnOnce(usize) -> Result<Option<ClipImage>, E>,
+) -> Result<Clip, E> {
+    let image_limit = limits.image.filter(|_| image_offered);
+    let mut text = String::new();
+    if text_offered {
+        match limits.text {
+            Some(max) => {
+                text = read_text(max)?.unwrap_or_default();
+                if !text.trim().is_empty() {
+                    return Ok(Clip::Text(text));
+                }
+            }
+            None if image_limit.is_none() => return Ok(Clip::Unwanted(InputKind::Text)),
+            None => {}
+        }
+    }
+    match image_limit {
+        Some(max) => Ok(read_image(max)?.map_or(Clip::Text(text), Clip::Image)),
+        None if image_offered => Ok(Clip::Unwanted(InputKind::Image)),
+        None => Ok(Clip::Text(text)),
+    }
 }
 
 /// MIME type (Wayland) / target (X11) password managers add to mark a
@@ -243,8 +282,8 @@ fn display_is_set(display: Option<std::ffi::OsString>) -> bool {
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod imp {
     use super::{
-        bytes_to_text, choose_image_type, display_is_set, image_too_large, marks_password,
-        too_large, use_text, with_x11_fallback, x11, Clip, ClipImage, Limits,
+        bytes_to_text, choose, choose_image_type, display_is_set, image_too_large, marks_password,
+        too_large, with_x11_fallback, x11, Clip, ClipImage, Limits,
     };
     use std::io::Read;
     use wl_clipboard_rs::copy::{Error as CopyError, MimeType as CopyMimeType, Options, Source};
@@ -311,10 +350,17 @@ mod imp {
         }
     }
 
-    /// Check the offered MIME types for a password hint, then read the text
-    /// and, if that is blank, an offered image (see [`read_capped`]).
-    /// Wayland errors are returned as-is (outer `Err`) for [`finish_get`]
-    /// to classify; read/size errors are final (inner `Err`).
+    /// A failed Wayland read: a Wayland error for [`finish_get`] to
+    /// classify, or a final read/size error.
+    enum ReadError {
+        Wayland(PasteError),
+        Final(String),
+    }
+
+    /// Check the offered MIME types for a password hint, then read what
+    /// [`choose`] picks (see [`read_capped`]). Wayland errors are returned
+    /// as-is (outer `Err`) for [`finish_get`] to classify; read/size errors
+    /// are final (inner `Err`).
     fn wayland_get(limits: Limits) -> Result<Result<Clip, String>, PasteError> {
         let types = get_mime_types(ClipboardType::Regular, Seat::Unspecified)?;
         let offered: Vec<&str> = types.iter().map(String::as_str).collect();
@@ -322,26 +368,40 @@ mod imp {
             return Ok(Ok(Clip::Password));
         }
         let image_type = choose_image_type(&offered);
-        let text = match get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Text) {
-            Ok((pipe, _)) => match read_capped(pipe, limits.text) {
-                Ok(text) => text,
-                Err(e) => return Ok(Err(e)),
-            },
-            // No text type offered at all: an image may still be.
-            Err(PasteError::NoMimeType) if image_type.is_some() => String::new(),
-            Err(err) => return Err(err),
+        let text_offered = offered.iter().any(|m| wl_clipboard_rs::utils::is_text(m));
+        let read_text = |max| {
+            match get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Text) {
+                Ok((pipe, _)) => read_capped(pipe, max).map(Some).map_err(ReadError::Final),
+                // No text type offered after all: an image may still be.
+                Err(PasteError::NoMimeType) => Ok(None),
+                Err(err) => Err(ReadError::Wayland(err)),
+            }
         };
-        let image_type = match image_type {
-            Some(image_type) if !use_text(&text, true) => image_type,
-            _ => return Ok(Ok(Clip::Text(text))),
+        let read_image = |max| {
+            let Some(image_type) = image_type else {
+                return Ok(None);
+            };
+            let (pipe, _) = get_contents(
+                ClipboardType::Regular,
+                Seat::Unspecified,
+                MimeType::Specific(image_type),
+            )
+            .map_err(ReadError::Wayland)?;
+            read_bytes_capped(pipe, max, image_too_large)
+                .map(|bytes| Some(ClipImage::File(bytes)))
+                .map_err(ReadError::Final)
         };
-        let (pipe, _) = get_contents(
-            ClipboardType::Regular,
-            Seat::Unspecified,
-            MimeType::Specific(image_type),
-        )?;
-        Ok(read_bytes_capped(pipe, limits.image, image_too_large)
-            .map(|bytes| Clip::Image(ClipImage::File(bytes))))
+        match choose(
+            text_offered,
+            image_type.is_some(),
+            limits,
+            read_text,
+            read_image,
+        ) {
+            Ok(clip) => Ok(Ok(clip)),
+            Err(ReadError::Wayland(err)) => Err(err),
+            Err(ReadError::Final(message)) => Ok(Err(message)),
+        }
     }
 
     /// Read from `source` with a hard cap of `max_bytes + 1` bytes, so a
@@ -406,17 +466,16 @@ const WINDOWS_PNG_FORMATS: [&str; 2] = ["PNG", "image/png"];
 #[cfg(target_os = "windows")]
 mod imp {
     use super::{
-        check_text_size, image_too_large, too_large, use_text, windows_marks_password, Clip,
+        check_text_size, choose, image_too_large, too_large, windows_marks_password, Clip,
         ClipImage, Limits, WINDOWS_EXCLUDE_FORMATS, WINDOWS_HISTORY_FORMAT, WINDOWS_PNG_FORMATS,
     };
     use clipboard_win::{formats, raw, Clipboard, Getter};
 
-    /// Open the clipboard, check the password-manager markers, and read the
-    /// text if there is any, else an image (see [`read_image`]). The text
-    /// size is checked before copying: UTF-16 takes at most twice the bytes
-    /// of the same text in UTF-8, so a UTF-16 buffer over
-    /// `2 * (max_bytes + 1)` bytes (incl. the terminator) is certainly too
-    /// large.
+    /// Open the clipboard, check the password-manager markers, and read
+    /// what [`choose`] picks (images via [`read_image`]). The text size is
+    /// checked before copying: UTF-16 takes at most twice the bytes of the
+    /// same text in UTF-8, so a UTF-16 buffer over `2 * (max_bytes + 1)`
+    /// bytes (incl. the terminator) is certainly too large.
     pub fn get(limits: Limits) -> Result<Clip, String> {
         let _clip =
             Clipboard::new_attempts(10).map_err(|e| format!("Failed to open clipboard: {e}"))?;
@@ -434,24 +493,29 @@ mod imp {
         }
 
         let image_format = image_format();
-        let mut text = String::new();
-        if raw::is_format_avail(formats::CF_UNICODETEXT) {
+        let read_text = |max: usize| {
             if let Some(size) = raw::size(formats::CF_UNICODETEXT) {
-                if size.get() / 2 > limits.text + 1 {
-                    return Err(too_large(limits.text));
+                if size.get() / 2 > max + 1 {
+                    return Err(too_large(max));
                 }
             }
+            let mut text = String::new();
             formats::Unicode
                 .read_clipboard(&mut text)
                 .map_err(|e| format!("Failed to get clipboard content: {e}"))?;
-            text = check_text_size(text, limits.text)?;
-        }
-        match image_format {
-            Some(image) if !use_text(&text, true) => {
-                read_image(image, limits.image).map(Clip::Image)
-            }
-            _ => Ok(Clip::Text(text)),
-        }
+            check_text_size(text, max).map(Some)
+        };
+        let read_image = |max| match image_format {
+            Some(image) => read_image(image, max).map(Some),
+            None => Ok(None),
+        };
+        choose(
+            raw::is_format_avail(formats::CF_UNICODETEXT),
+            image_format.is_some(),
+            limits,
+            read_text,
+            read_image,
+        )
     }
 
     /// An image format on the clipboard: registered PNG data, or a bitmap
@@ -534,15 +598,15 @@ fn plan_macos(types: &[&str]) -> MacPlan {
 #[cfg(target_os = "macos")]
 mod imp {
     use super::{
-        check_text_size, image_too_large, plan_macos, use_text, Clip, ClipImage, Limits, MacPlan,
+        check_text_size, choose, image_too_large, plan_macos, Clip, ClipImage, Limits, MacPlan,
         MACOS_TEXT_TYPE,
     };
     use objc2_app_kit::NSPasteboard;
     use objc2_foundation::NSString;
 
-    /// Read the general pasteboard: password marker first, then text, then
-    /// (if the text is blank) an image. The image size is checked before
-    /// copying its bytes.
+    /// Read the general pasteboard: password marker first, then what
+    /// [`choose`] picks. The image size is checked before copying its
+    /// bytes.
     pub fn get(limits: Limits) -> Result<Clip, String> {
         let pasteboard = NSPasteboard::generalPasteboard();
         let types: Vec<String> = pasteboard
@@ -554,23 +618,21 @@ mod imp {
             MacPlan::Password => return Ok(Clip::Password),
             MacPlan::Read { text, image } => (text, image),
         };
-        let mut text = String::new();
-        if want_text {
-            if let Some(string) = pasteboard.stringForType(&NSString::from_str(MACOS_TEXT_TYPE)) {
-                text = check_text_size(string.to_string(), limits.text)?;
+        let read_text = |max| match pasteboard.stringForType(&NSString::from_str(MACOS_TEXT_TYPE)) {
+            Some(string) => check_text_size(string.to_string(), max).map(Some),
+            None => Ok(None),
+        };
+        let read_image = |max| {
+            let Some(data) = image.and_then(|t| pasteboard.dataForType(&NSString::from_str(t)))
+            else {
+                return Ok(None);
+            };
+            if data.length() > max {
+                return Err(image_too_large(max));
             }
-        }
-        let image = match image {
-            Some(image) if !use_text(&text, true) => image,
-            _ => return Ok(Clip::Text(text)),
+            Ok(Some(ClipImage::File(data.to_vec())))
         };
-        let Some(data) = pasteboard.dataForType(&NSString::from_str(image)) else {
-            return Ok(Clip::Text(text));
-        };
-        if data.length() > limits.image {
-            return Err(image_too_large(limits.image));
-        }
-        Ok(Clip::Image(ClipImage::File(data.to_vec())))
+        choose(want_text, image.is_some(), limits, read_text, read_image)
     }
 
     /// Replace the pasteboard contents with `text`.
@@ -803,14 +865,114 @@ mod tests {
         assert!(image_too_large(4).contains("max_image_bytes"));
     }
 
+    /// Run [`choose`] on a fake clipboard offering `text` and/or an image
+    /// (`image`), with text/image wanted as given (limit 100). Returns the
+    /// result and which kinds were read.
+    fn fake_choose(
+        text: Option<&str>,
+        image: bool,
+        want_text: bool,
+        want_image: bool,
+    ) -> (Clip, Vec<&'static str>) {
+        let read = std::cell::RefCell::new(Vec::new());
+        let limits = Limits {
+            text: want_text.then_some(100),
+            image: want_image.then_some(100),
+        };
+        let clip = choose::<String>(
+            text.is_some(),
+            image,
+            limits,
+            |max| {
+                assert_eq!(max, 100);
+                read.borrow_mut().push("text");
+                Ok(text.map(str::to_string))
+            },
+            |max| {
+                assert_eq!(max, 100);
+                read.borrow_mut().push("image");
+                Ok(Some(ClipImage::File(b"img".to_vec())))
+            },
+        )
+        .unwrap();
+        (clip, read.into_inner())
+    }
+
     #[test]
-    fn text_wins_unless_blank_with_image() {
-        assert!(use_text("hello", true));
-        assert!(use_text("hello", false));
-        assert!(use_text("", false));
-        assert!(use_text(" \n\t", false));
-        assert!(!use_text("", true));
-        assert!(!use_text(" \r\n", true));
+    fn choose_prefers_text_when_both_are_wanted() {
+        let img = || Clip::Image(ClipImage::File(b"img".to_vec()));
+        let text = |t: &str| Clip::Text(t.into());
+        assert_eq!(
+            fake_choose(Some("hi"), true, true, true),
+            (text("hi"), vec!["text"])
+        );
+        assert_eq!(
+            fake_choose(Some(" \n"), true, true, true),
+            (img(), vec!["text", "image"])
+        );
+        assert_eq!(fake_choose(None, true, true, true), (img(), vec!["image"]));
+        assert_eq!(
+            fake_choose(Some("hi"), false, true, true),
+            (text("hi"), vec!["text"])
+        );
+        assert_eq!(
+            fake_choose(Some(" "), false, true, true),
+            (text(" "), vec!["text"])
+        );
+        assert_eq!(fake_choose(None, false, true, true), (text(""), vec![]));
+    }
+
+    #[test]
+    fn choose_reads_only_wanted_kinds() {
+        let img = || Clip::Image(ClipImage::File(b"img".to_vec()));
+        let unwanted = Clip::Unwanted;
+        // Image-only selection: the image is read even with text offered.
+        assert_eq!(
+            fake_choose(Some("hi"), true, false, true),
+            (img(), vec!["image"])
+        );
+        assert_eq!(
+            fake_choose(Some("hi"), false, false, true),
+            (unwanted(InputKind::Text), vec![])
+        );
+        // Text-only selection: an image is never read.
+        assert_eq!(
+            fake_choose(None, true, true, false),
+            (unwanted(InputKind::Image), vec![])
+        );
+        assert_eq!(
+            fake_choose(Some(""), true, true, false),
+            (unwanted(InputKind::Image), vec!["text"])
+        );
+        assert_eq!(
+            fake_choose(Some("hi"), true, true, false),
+            (Clip::Text("hi".into()), vec!["text"])
+        );
+        // Nothing offered is empty text whatever is wanted.
+        assert_eq!(
+            fake_choose(None, false, false, true),
+            (Clip::Text(String::new()), vec![])
+        );
+    }
+
+    #[test]
+    fn choose_falls_back_when_a_read_finds_nothing_and_passes_errors() {
+        let limits = Limits {
+            text: Some(5),
+            image: Some(7),
+        };
+        let gone = choose::<String>(true, true, limits, |_| Ok(None), |_| Ok(None));
+        assert_eq!(gone, Ok(Clip::Text(String::new())));
+        let err = choose(true, true, limits, |max| Err(too_large(max)), |_| Ok(None));
+        assert_eq!(err, Err(too_large(5)));
+        let err = choose(
+            false,
+            true,
+            limits,
+            |_| Ok(None),
+            |max| Err(image_too_large(max)),
+        );
+        assert_eq!(err, Err(image_too_large(7)));
     }
 
     #[test]

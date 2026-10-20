@@ -1,7 +1,7 @@
 .\" SPDX-License-Identifier: AGPL-3.0-or-later
 .\"
 .\" clip_gpt(1) - keep in sync with src/cli.rs (USAGE) and
-.\" config.ini.example; tests in src/cli.rs and src/configfile.rs check
+.\" config.full.toml.example; tests in src/cli.rs and src/configfile.rs check
 .\" the options, config keys and defaults.
 .Dd October 20, 2026
 .Dt CLIP_GPT 1
@@ -12,7 +12,16 @@
 .Sh SYNOPSIS
 .Nm
 .Op Fl s
+.Op Fl c Ar file
+.Op Fl p Ar profile Ns Op , Ns Ar profile ...
 .Op Fl \-timeout Ar seconds
+.Nm
+.Op Fl c Ar file
+.Op Fl p Ar profile Ns Op , Ns Ar profile ...
+.Fl \-show\-profile
+.Nm
+.Op Fl c Ar file
+.Fl \-list\-profiles
 .Nm
 .Fl h | V
 .Sh DESCRIPTION
@@ -21,6 +30,9 @@ reads the text on the clipboard, sends it to an OpenAI-compatible chat
 completions API (OpenAI itself, or a local server such as Ollama or
 llama.cpp) together with a configurable prompt, and replaces the clipboard
 contents with the response.
+Settings come from named profiles in a configuration file (see
+.Sx PROFILES ) ,
+so different hotkeys can use different servers, models or prompts.
 An image on the clipboard is sent to the model instead when there is no
 text (see
 .Sx IMAGES ) .
@@ -35,6 +47,45 @@ when anything fails or the clipboard text was refused.
 Messages go to standard error.
 .Sh OPTIONS
 .Bl -tag -width Ds
+.It Fl c Ar file , Fl \-config Ar file , Fl \-config Ns = Ns Ar file
+Read exactly
+.Ar file
+instead of searching the locations under
+.Sx CONFIGURATION .
+If it does not exist or cannot be read,
+.Nm
+fails; there is no fallback to the usual locations.
+A relative name is taken from the current directory, which a hotkey
+daemon may set to anything: use an absolute path in hotkey bindings.
+All checks, including the file permission check, apply as usual.
+Giving the option twice is an error.
+.It Fl p Ar list , Fl \-profile Ar list , Fl \-profile Ns = Ns Ar list
+Use the profiles in the comma-separated
+.Ar list
+instead of
+.Bq default .
+Each kind of clipboard content goes to the last profile in the list whose
+.Cm input
+accepts it; see
+.Sx PROFILES .
+An unknown profile, an empty or repeated name, a profile with
+.Ql input = [\(dqnone\(dq] ,
+or giving the option twice is an error.
+A listed profile that ends up handling nothing, because later ones take
+every kind it accepts, only prints a warning.
+.It Fl \-list\-profiles
+Print the names of all profiles in the configuration file, one per line,
+and exit.
+.It Fl \-show\-profile
+Print the path of the configuration file read, then the settings of the
+selected profiles (the default one, or those given with
+.Fl p )
+after includes, each with the profile it came from or
+.Ql built-in default ,
+and which profile handles which kind of content, then exit.
+The API key is only shown as set or not.
+The whole file is checked as for a normal run, so this also tests a
+configuration.
 .It Fl s , Fl \-no\-secret\-check
 Do not refuse clipboard text that looks like an API key, token, private
 key or URL with a password, for this run.
@@ -55,30 +106,97 @@ Print a usage summary and exit.
 .El
 .Pp
 Any other argument is an error.
+.Fl s
+and
+.Fl \-timeout
+apply to whichever profile handles the clipboard.
 The argument
 .Fl \-x11\-clipboard\-owner
 is internal (see
 .Sx CLIPBOARD )
 and must not be used directly.
 .Sh CONFIGURATION
-Settings are read from the
-.Bq openai
-section of an INI file, looked up first at
-.Pa ~/.config/clipgpt/config.ini
-and then at
-.Pa ./config.ini .
-If the file contains an
+Settings are read from a TOML file: the one given with
+.Fl c ,
+or else the first found of
+.Pa ~/.config/clipgpt/config.toml
+.Po
+.Pa ~/Library/Application Support/clipgpt/config.toml
+on macOS,
+.Pa %APPDATA%\eclipgpt\econfig.toml
+on Windows
+.Pc
+and
+.Pa ./config.toml .
+The
+.Pa config.ini
+of clipGPT 0.5 and older is not read.
+Every table
+.Bq Ar name
+in the file is a profile; settings outside a table are an error.
+If any profile contains a non-empty
 .Cm api_key ,
-it must not be accessible by other users (mode 0600), or
+the file must not be accessible by other users (mode 0600), or
 .Nm
 refuses to run:
 .Pp
-.Dl $ chmod 600 ~/.config/clipgpt/config.ini
+.Dl $ chmod 600 ~/.config/clipgpt/config.toml
 .Pp
-Keys:
+The whole file is checked on every run, including profiles that are not
+used: an unknown key (keys are case-sensitive), a value of the wrong type,
+an include of an unknown profile or an include cycle is an error.
+Error messages never quote setting values.
+Strings are written in double quotes, in which
+.Ql \en
+is a newline, or in single quotes, which take no escapes;
+.Ql \(dq\(dq
+is a real empty string.
+Numbers and the booleans
+.Ql true
+and
+.Ql false
+are written without quotes.
+.Pp
+Keys, all optional unless stated:
 .Bl -tag -width Ds
+.It Cm include
+A list of profiles to start from, e.g.\&
+.Ql include = [\(dqbase\(dq, \(dqbeeps\(dq] .
+They are applied in order, later ones overriding earlier ones, and the
+profile's own keys override them all.
+Included profiles may include others.
+.It Cm clear
+A list of keys whose values from
+.Cm include
+are dropped, so the built-in default applies again, e.g.\&
+.Ql clear = [\(dqapi_key\(dq, \(dqinput\(dq] .
+Listing an unknown key,
+.Cm include ,
+.Cm clear ,
+or a key the same profile sets, is an error.
+.It Cm input
+The kinds of clipboard content the profile handles: a list of
+.Ql text
+and
+.Ql image ,
+or
+.Ql [\(dqnone\(dq]
+for a profile that handles nothing and only exists to be included by
+others (such a profile cannot be selected, and needs no
+.Cm model ) .
+Without
+.Cm input
+a profile handles every kind, including kinds added in later versions.
+Like any other key it is passed on by
+.Cm include ;
+a profile that includes a
+.Ql none
+profile sets its own
+.Cm input
+or lists it in
+.Cm clear .
 .It Cm model
-Required.
+Required in every profile that handles input (set there or included).
 The model name, e.g.\&
 .Ql gpt-4o-mini
 for OpenAI or a local model name for Ollama.
@@ -93,7 +211,9 @@ are accepted; plain http to a host other than this computer prints a
 warning.
 .It Cm api_key
 Optional bearer token.
-Empty or missing means no key is sent (e.g.\& for a local Ollama).
+Empty or missing means no key is sent (e.g.\& for a local Ollama), so
+.Ql api_key = \(dq\(dq
+also drops an included key.
 .It Cm api_type
 Only
 .Ql OpenAI
@@ -101,9 +221,6 @@ Only
 .It Cm prompt_text
 Prompt sent as the system message; the clipboard text is sent separately
 as the user message.
-A literal
-.Ql \en
-becomes a newline.
 .It Cm prompt_image
 Prompt sent as the system message when the clipboard holds an image and
 no text; the image is sent separately as the user message.
@@ -137,8 +254,44 @@ Longest wait in whole seconds for the LLM's answer, from sending the
 request to the end of the response; default 30, 0 means no limit.
 Raise it for slow local models.
 .El
+.Sh PROFILES
+Without
+.Fl p ,
+.Nm
+uses the profile
+.Bq default ;
+if there is none, a profile must be given with
+.Fl p .
+With
+.Fl p Ar a,b ,
+each kind of clipboard content goes to the last listed profile whose
+.Cm input
+accepts it, and all settings of the run (server, model, prompt, size
+limit, secret check, timeout, beeps) come from that profile.
+For example, with
+.Ql \-p default,ocr ,
+where
+.Bq ocr
+has
+.Ql input = [\(dqimage\(dq] ,
+images go to
+.Bq ocr
+and text to
+.Bq default ;
+with
+.Ql \-p ocr,default
+everything goes to
+.Bq default ,
+and a warning says that
+.Bq ocr
+handles nothing.
 .Pp
-Boolean values accept true/false, yes/no, 1/0 and on/off.
+Only kinds some selected profile handles are read from the clipboard: if
+none takes text, an image is used even when text is offered too.
+Content that no selected profile accepts is refused with the error tone
+and the clipboard is left unchanged.
+Errors before the kind of content is known use the beeps of the last
+selected profile.
 .Sh CLIPBOARD
 On Linux and
 .Fx
@@ -191,7 +344,7 @@ Text containing invisible Unicode tag characters is refused the same way.
 Unless
 .Fl s
 or
-.Cm secret_check Ns =false
+.Ql secret_check = false
 is used, text that looks like an API key, token, private key, JSON Web
 Token or URL with a password is refused and the clipboard left as it was.
 Control, bidirectional-override and zero-width characters are removed
@@ -204,7 +357,7 @@ response body.
 .Bl -tag -width Ds
 .It Ev HOME
 Used to find
-.Pa ~/.config/clipgpt/config.ini .
+.Pa ~/.config/clipgpt/config.toml .
 .It Ev WAYLAND_DISPLAY
 The Wayland compositor to use.
 .It Ev DISPLAY
@@ -212,40 +365,68 @@ The X11 display used when Wayland clipboard access is not available.
 .El
 .Sh FILES
 .Bl -tag -width Ds
-.It Pa ~/.config/clipgpt/config.ini
+.It Pa ~/.config/clipgpt/config.toml
 Configuration file.
-.It Pa ./config.ini
+.It Pa ./config.toml
 Used if the file above does not exist.
+Neither is used when
+.Fl c
+is given.
+.It Pa config.toml.example , config.expanded.toml.example , config.full.toml.example
+Example configurations in the source tree: a short one with a single
+profile, one with several profiles and includes, and one listing every key
+with its default.
 .El
 .Sh EXIT STATUS
 .Nm
 exits 0 when the response is on the clipboard, or after
-.Fl h
+.Fl h ,
+.Fl V ,
+.Fl \-list\-profiles
 or
-.Fl V .
+.Fl \-show\-profile
+with a valid configuration.
 It exits 1 on any error, including an invalid option or configuration, a
 failed request, and refused clipboard contents (password, hidden
-characters, secret, too large, unsupported image, empty clipboard).
+characters, secret, too large, unsupported image, empty clipboard, content
+no selected profile accepts).
 .Sh EXAMPLES
-A configuration for a local Ollama server with a slow model:
-.Bd -literal -offset indent
-[openai]
-api_url=http://127.0.0.1:11434/v1/chat/completions
-model=llama3
-prompt_text=Fix spelling and grammar. Reply with the text only.
-request_timeout=120
-.Ed
-.Pp
-A local llama.cpp server with a vision model, for reading text off
-screenshots:
+A configuration with OpenAI for text, a local llama.cpp server with a
+vision model for reading text off screenshots, and shared beeps:
 .Bd -literal -offset indent
 $ llama\-server \-hf ggml\-org/gemma\-3\-4b\-it\-GGUF
 
-[openai]
-api_url=http://127.0.0.1:8080/v1/chat/completions
-model=gemma\-3\-4b\-it
-request_timeout=120
+[beeps]
+input = ["none"]
+beep_tone = 880
+beep_duration = 150
+
+[default]
+include = ["beeps"]
+clear = ["input"]
+api_key = "sk\-..."
+model = "gpt\-4o\-mini"
+prompt_text = "Fix spelling and grammar. Reply with the text only."
+
+[ocr]
+include = ["beeps"]
+input = ["image"]
+api_url = "http://127.0.0.1:8080/v1/chat/completions"
+model = "gemma\-3\-4b\-it"
+request_timeout = 120
 .Ed
+.Pp
+Text to OpenAI, images to the local server:
+.Pp
+.Dl $ clip_gpt \-p default,ocr
+.Pp
+Check which profile would handle what, and with which settings:
+.Pp
+.Dl $ clip_gpt \-p default,ocr \-\-show\-profile
+.Pp
+A second hotkey using a separate configuration file:
+.Pp
+.Dl $ clip_gpt \-c ~/.config/clipgpt/work.toml \-p ocr
 .Pp
 Rewrite the clipboard once, waiting as long as the model needs:
 .Pp

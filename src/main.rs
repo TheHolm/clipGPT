@@ -12,7 +12,7 @@ mod secrets;
 
 use beep::beep_with_hz_and_millis;
 use clipboard_backend::{Clip, Limits};
-use configfile::Config;
+use configfile::{Config, ConfigFile, InputKind, Selection};
 use imagefile::Prepared;
 
 /// Put onto the clipboard instead of a password-manager secret, which is
@@ -115,6 +115,10 @@ enum Block {
     /// The clipboard held no text (or only white space and invisible
     /// characters) and no image. The clipboard is left untouched.
     Empty,
+    /// The clipboard held only this kind of content, which none of the
+    /// selected profiles (named, comma-separated) accepts. The clipboard is
+    /// left untouched.
+    Unhandled(InputKind, String),
 }
 
 impl Block {
@@ -130,12 +134,21 @@ impl Block {
                 .to_string(),
             Block::Secret(kind) => format!(
                 "Clipboard looks like it contains a secret ({}); not sent to the LLM, clipboard \
-                 left unchanged. Use --no-secret-check (-s) or secret_check=false to override",
+                 left unchanged. Use --no-secret-check (-s) or secret_check = false to override",
                 kind
             ),
             Block::Empty => "Clipboard holds no text or image; nothing sent, clipboard left \
                  unchanged"
                 .to_string(),
+            Block::Unhandled(kind, selected) => format!(
+                "Clipboard holds {}, which no selected profile accepts (selected: {}); nothing \
+                 sent, clipboard left unchanged",
+                match kind {
+                    InputKind::Text => "text",
+                    InputKind::Image => "an image",
+                },
+                selected
+            ),
         }
     }
 }
@@ -155,7 +168,7 @@ enum Outcome {
 /// hidden X11 clipboard owner mode runs before (and without) the config and
 /// never beeps; it reports to the clipGPT run that started it instead.
 fn main() {
-    let options = match cli::parse(std::env::args().skip(1)) {
+    let (options, show) = match cli::parse(std::env::args_os().skip(1)) {
         Ok(cli::Command::Help) => {
             println!("{}", cli::USAGE);
             return;
@@ -165,28 +178,42 @@ fn main() {
             return;
         }
         Ok(cli::Command::ClipboardOwner) => std::process::exit(clipboard_backend::serve_owner()),
-        Ok(cli::Command::Run(options)) => options,
-        Err(e) => fail(
-            &e,
-            configfile::DEFAULT_ERROR_TONE,
-            configfile::DEFAULT_BEEP_DURATION,
-        ),
+        Ok(cli::Command::ListProfiles(options)) => {
+            for name in load_config(&options).profile_names() {
+                println!("{name}");
+            }
+            return;
+        }
+        Ok(cli::Command::ShowProfile(options)) => (options, true),
+        Ok(cli::Command::Run(options)) => (options, false),
+        Err(e) => fail_default(&e),
     };
 
-    let mut config = configfile::read_ini().unwrap_or_else(|error| {
-        fail(
-            &format!("Failed to load config.ini: {}", error),
-            configfile::DEFAULT_ERROR_TONE,
-            configfile::DEFAULT_BEEP_DURATION,
-        )
-    });
-    let check_secrets = config.secret_check && !options.no_secret_check;
-    if let Some(timeout) = options.timeout {
-        config.request_timeout = timeout;
+    let file = load_config(&options);
+    let mut selection = file
+        .select(options.profiles.as_deref())
+        .unwrap_or_else(|e| fail_default(&e));
+    if show {
+        print!("{}", file.show(&selection));
+        return;
     }
+    for warning in selection.warnings() {
+        eprintln!("{warning}");
+    }
+    if let Some(timeout) = options.timeout {
+        for config in selection.handlers_mut() {
+            config.request_timeout = timeout;
+        }
+    }
+    let Some(fallback) = selection.fallback() else {
+        fail_default("No selected profile handles any input")
+    };
 
-    let result = std::panic::catch_unwind(|| run(&config, check_secrets))
-        .unwrap_or_else(|_| Err("Internal error (panic)".to_string()));
+    let (used, result) = std::panic::catch_unwind(|| run(&selection, options.no_secret_check))
+        .unwrap_or_else(|_| (None, Err("Internal error (panic)".to_string())));
+    // Beep with the profile that handled the input, or before that was
+    // known, the last selected one.
+    let config = used.unwrap_or(fallback);
 
     match result {
         Ok(Outcome::Done) => {
@@ -200,6 +227,24 @@ fn main() {
         }
         Err(e) => fail(&e, config.error_tone, config.beep_duration),
     }
+}
+
+/// Load the config file (`-c`, or the usual config.toml), or fail with the
+/// built-in error tone.
+fn load_config(options: &cli::Options) -> ConfigFile {
+    // Errors name the file themselves.
+    configfile::load(options.config.as_deref())
+        .unwrap_or_else(|error| fail_default(&format!("Failed to load config: {}", error)))
+}
+
+/// [`fail`] with the built-in error tone, for errors before any profile is
+/// known.
+fn fail_default(message: &str) -> ! {
+    fail(
+        message,
+        configfile::DEFAULT_ERROR_TONE,
+        configfile::DEFAULT_BEEP_DURATION,
+    )
 }
 
 /// Print `message` to stderr, play the error tone and exit with status 1.
@@ -234,33 +279,84 @@ fn screen_input(text: &str, check_secrets: bool) -> Result<String, Block> {
     Ok(cleaned)
 }
 
-/// One clipboard -> LLM -> clipboard round trip.
-fn run(config: &Config, check_secrets: bool) -> Result<Outcome, String> {
+/// Parse and check a profile's `api_url`, printing the warning for plain
+/// http to another computer.
+fn check_api_url(config: &Config) -> Result<Url, String> {
     let url = Url::parse(&config.api_url).map_err(|e| format!("Invalid api_url: {}", e))?;
     if let Some(warning) = net::check_url(&url, &net::host_is_local)? {
         eprintln!("{}", warning);
     }
+    Ok(url)
+}
 
-    let limits = Limits {
-        text: config.max_input_bytes,
-        image: config.max_image_bytes,
-    };
-    let input = match clipboard_backend::get(limits)? {
+/// The clipboard size limits for `selection`: each kind's limit from the
+/// profile handling it, `None` (not read) for kinds no profile handles.
+fn limits_for(selection: &Selection) -> Limits {
+    Limits {
+        text: selection
+            .handler(InputKind::Text)
+            .map(|c| c.max_input_bytes),
+        image: selection
+            .handler(InputKind::Image)
+            .map(|c| c.max_image_bytes),
+    }
+}
+
+/// One clipboard -> LLM -> clipboard round trip with the profile that
+/// handles the clipboard's kind of content. Returns that profile's config
+/// (for the beeps; `None` if it was not known yet) and the outcome.
+fn run(selection: &Selection, no_secret_check: bool) -> (Option<&Config>, Result<Outcome, String>) {
+    let mut used = None;
+    let result = run_with(selection, no_secret_check, &mut used);
+    (used, result)
+}
+
+/// [`run`], storing the handling profile's config in `used` once known.
+fn run_with<'a>(
+    selection: &'a Selection,
+    no_secret_check: bool,
+    used: &mut Option<&'a Config>,
+) -> Result<Outcome, String> {
+    // Every profile that may be used must have a valid api_url, whatever
+    // the clipboard holds.
+    for config in selection.handlers() {
+        check_api_url(config)?;
+    }
+    let unhandled = |kind| Ok(Outcome::Blocked(Block::Unhandled(kind, selection.names())));
+
+    let (config, input) = match clipboard_backend::get(limits_for(selection))? {
         Clip::Password => {
             clipboard_backend::set_text(PASSWORD_PLACEHOLDER.to_string())?;
             return Ok(Outcome::Blocked(Block::Password));
         }
-        Clip::Image(image) => Input::Image(imagefile::prepare(image, config.max_image_bytes)?),
-        Clip::Text(raw_text) => match screen_input(&raw_text, check_secrets) {
-            Ok(text) => Input::Text(text),
-            Err(Block::HiddenTags) => {
-                clipboard_backend::set_text(HIDDEN_TAGS_PLACEHOLDER.to_string())?;
-                return Ok(Outcome::Blocked(Block::HiddenTags));
+        Clip::Unwanted(kind) => return unhandled(kind),
+        Clip::Image(image) => {
+            let Some(config) = selection.handler(InputKind::Image) else {
+                return unhandled(InputKind::Image);
+            };
+            *used = Some(config);
+            let image = imagefile::prepare(image, config.max_image_bytes)?;
+            (config, Input::Image(image))
+        }
+        Clip::Text(raw_text) => {
+            // An empty clipboard is reported as empty text even when no
+            // profile takes text.
+            let config = selection.handler(InputKind::Text);
+            *used = config.or(*used);
+            let check_secrets = config.is_none_or(|c| c.secret_check) && !no_secret_check;
+            match (screen_input(&raw_text, check_secrets), config) {
+                (Ok(text), Some(config)) => (config, Input::Text(text)),
+                (Ok(_), None) => return unhandled(InputKind::Text),
+                (Err(Block::HiddenTags), _) => {
+                    clipboard_backend::set_text(HIDDEN_TAGS_PLACEHOLDER.to_string())?;
+                    return Ok(Outcome::Blocked(Block::HiddenTags));
+                }
+                (Err(block), _) => return Ok(Outcome::Blocked(block)),
             }
-            Err(block) => return Ok(Outcome::Blocked(block)),
-        },
+        }
     };
 
+    let url = Url::parse(&config.api_url).map_err(|e| format!("Invalid api_url: {}", e))?;
     let hint = status_hint(&input);
     let payload = build_request(config, input);
     let client = net::build_client(config.allow_redirects, config.request_timeout)?;
@@ -474,10 +570,13 @@ mod tests {
     #[test]
     fn invalid_api_url_is_error() {
         let mut config = config_with_prompt("p");
+        assert!(check_api_url(&config).is_ok());
         config.api_url = "not a url".into();
-        assert!(run(&config, true).unwrap_err().contains("Invalid api_url"));
+        assert!(check_api_url(&config)
+            .unwrap_err()
+            .contains("Invalid api_url"));
         config.api_url = "file:///etc/passwd".into();
-        assert!(run(&config, true).unwrap_err().contains("scheme"));
+        assert!(check_api_url(&config).unwrap_err().contains("scheme"));
     }
 
     /// A GitHub-style token, assembled at runtime (see secrets.rs tests).
@@ -534,9 +633,19 @@ mod tests {
         let msg = Block::Secret("GitHub token").message();
         assert!(msg.contains("GitHub token"));
         assert!(msg.contains("--no-secret-check"));
-        assert!(msg.contains("secret_check=false"));
+        assert!(msg.contains("secret_check = false"));
         assert!(Block::HiddenTags.message().contains("tag characters"));
         assert!(Block::Password.message().contains("password"));
         assert!(Block::Empty.message().contains("no text or image"));
+        let msg = Block::Unhandled(InputKind::Image, "a,b".into()).message();
+        assert!(
+            msg.contains("holds an image") && msg.contains("(selected: a,b)"),
+            "{msg}"
+        );
+        let msg = Block::Unhandled(InputKind::Text, "ocr".into()).message();
+        assert!(
+            msg.contains("holds text, which no selected profile"),
+            "{msg}"
+        );
     }
 }

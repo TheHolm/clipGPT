@@ -1,0 +1,44 @@
+# clipGPT config with several profiles. Copy to ~/.config/clipgpt/config.toml
+# (macOS: ~/Library/Application Support/clipgpt/, Windows: %APPDATA%\clipgpt\)
+# and run `chmod 600` on it if any profile holds an api_key.
+# Full reference: `man clip_gpt`, or README.md at
+# https://github.com/TheHolm/clipGPT (e.g. on Windows). Every key with its
+# default: config.full.toml.example.
+#
+# Usage:
+#   clip_gpt                    everything to [default]
+#   clip_gpt -p local           everything to the local Ollama server
+#   clip_gpt -p default,ocr     text to [default], images to [ocr]
+#                               (the last listed profile accepting a kind wins)
+#   clip_gpt -p default,ocr --show-profile   print the resulting settings
+#   clip_gpt --list-profiles    list the profile names
+
+# Shared beeps. input = ["none"]: only for including, can't be picked with -p.
+[beeps]
+input = ["none"]
+beep_tone = 1046
+error_tone = 131
+beep_duration = 250
+
+# OpenAI for text and images.
+[default]
+include = ["beeps"]
+clear = ["input"]          # don't inherit "none" from [beeps]
+api_key = "sk-your-key-here"
+model = "gpt-4o-mini"
+prompt_text = "Fix spelling and grammar. Reply with the corrected text only."
+
+# Same prompts, but a local Ollama server.
+[local]
+include = ["default"]
+api_url = "http://127.0.0.1:11434/v1/chat/completions"
+api_key = ""               # no key (drops the one from [default])
+model = "llama3"
+request_timeout = 120      # cold model loads are slow
+
+# Images only, read by a local vision model (OCR prompt is the built-in one).
+[ocr]
+include = ["local"]
+input = ["image"]
+model = "qwen2.5vl"
+max_image_bytes = 20971520

@@ -1,0 +1,14 @@
+# clipGPT config, short version. Copy to ~/.config/clipgpt/config.toml
+# (macOS: ~/Library/Application Support/clipgpt/, Windows: %APPDATA%\clipgpt\)
+# and run `chmod 600` on it if it holds an api_key.
+# More: config.expanded.toml.example (profiles), config.full.toml.example
+# (every key). Full reference: `man clip_gpt`, or README.md at
+# https://github.com/TheHolm/clipGPT (e.g. on Windows).
+
+[default]
+# OpenAI, or e.g. "http://127.0.0.1:11434/v1/chat/completions" for Ollama.
+api_url = "https://api.openai.com/v1/chat/completions"
+# Leave empty for servers that need no key.
+api_key = "sk-your-key-here"
+model = "gpt-4o-mini"
+prompt_text = "Check spelling and gramma and rewrite following text on pirate speak. Be mean and pushy \n\n"

@@ -3,6 +3,106 @@
 This file lists user-facing changes for each tagged release. See `AGENTS.md`
 for the versioning and tagging convention.
 
+## v0.6.0 - Config profiles (config.toml), routing by clipboard content, -c
+
+**Breaking change: `config.ini` is no longer read.** The configuration is
+now `config.toml` (TOML) with named profiles. Without `-p`, the profile
+`[default]` is used; if there is none, running without `-p` is an error.
+To convert an old config, rename `[openai]` to `[default]` (or always run
+with `-p openai`) and quote the string values:
+
+```toml
+# old config.ini            # new config.toml
+# [openai]                  [default]
+# model=llama3              model = "llama3"
+# prompt_text=Fix it.\n     prompt_text = "Fix it.\n"
+# allow_redirects=yes       allow_redirects = true
+# request_timeout=120       request_timeout = 120
+```
+
+Other behaviour changes from the stricter format:
+
+- Booleans are only `true`/`false` (no yes/no, 1/0, on/off).
+- `\n` is a newline only inside "double-quoted" strings; 'single-quoted'
+  strings take no escapes.
+- Invalid `beep_tone`, `error_tone` or `beep_duration` values are now
+  errors instead of silently falling back to the default.
+- Unknown keys (keys are case-sensitive), wrong value types and settings
+  outside a profile are errors - in every profile of the file, used or not.
+
+User-facing changes:
+
+- **New: profiles.** Every `[name]` table is a profile. `include = ["a",
+  "b"]` starts from other profiles' settings (later includes win, the
+  profile's own keys win over all of them). `clear = ["key", ...]` drops
+  included values so the built-in default applies again; `key = ""` is a
+  real empty string (`api_key = ""` means no key).
+- **New: `input = [...]`** says which clipboard content a profile handles:
+  `"text"`, `"image"`, or `["none"]` for a profile that only exists to be
+  included (e.g. shared beep settings). Without `input` a profile handles
+  every kind. `input` is inherited through `include` like any other key.
+- **New: `-p NAME[,NAME...]` / `--profile`** picks profiles. Each kind of
+  clipboard content goes to the last listed profile that accepts it, e.g.
+  `-p default,ocr` sends text to `[default]` and images to an images-only
+  `[ocr]`. Only kinds some selected profile handles are read, so with only
+  image profiles selected an image is used even when text is on the
+  clipboard too. Content no selected profile accepts is refused with the
+  error tone and the clipboard is left unchanged. A selected profile left
+  with nothing to handle prints a warning; selecting a `none` profile is an
+  error.
+- **New: `-c FILE` / `--config FILE`** reads exactly that config file
+  instead of searching `~/.config/clipgpt/config.toml` and `./config.toml`
+  (no fallback if it is missing).
+- **New: `--list-profiles`** prints the profile names; **`--show-profile`**
+  prints the config file used, the selected profiles' settings after
+  includes with where each came from, and which profile handles which kind
+  of content. The API key is never shown.
+- If any profile holds an `api_key`, the file must be mode 0600 (as before,
+  now for the whole file).
+- Three example configs: `config.toml.example` (short),
+  `config.expanded.toml.example` (several profiles with includes) and
+  `config.full.toml.example` (every key with its default). The man page is
+  the full reference; Windows users see the README on GitHub.
+- A non-UTF-8 command line argument is now an "Unknown option" error instead
+  of a crash.
+
+### Details
+
+- `Cargo.toml`: `pretty_ini` replaced by `toml` 1.1 (`std`, `parse`,
+  `preserve_order`, `serde` features; parsed into a `toml::Table`, no serde
+  derive). New in `Cargo.lock`: `toml`, `toml_parser`, `toml_datetime`,
+  `toml_writer`, `serde_spanned`, `serde_core`, `winnow`, `hashbrown`.
+- `configfile.rs` rewritten: `parse_file` checks each profile's keys
+  against `KEYS` and value types (`KeyType`), profile names (letters,
+  digits, `_`, `-`), and resolves every profile's includes up front
+  (unknown profiles and cycles reported with the chain). TOML syntax errors
+  report only the line and toml's short message, never the line's content;
+  no message quotes a setting value. `ConfigFile::select` resolves the
+  selected profiles, rejects `none` ones, assigns each `InputKind` to the
+  last profile accepting it, and builds a `Config` only for profiles that
+  handle something (only those need `model`). `ConfigFile::show` renders
+  `--show-profile`. `load(Option<&Path>)` loads the `-c` file or searches;
+  without a `config.toml` but with an old `config.ini`, the error says it
+  is no longer read.
+- `clipboard_backend.rs`: `Limits` fields became `Option<usize>` (`None` =
+  kind not read); a shared `choose()` decides what to read on Wayland, X11,
+  Windows and macOS, and `Clip::Unwanted(kind)` reports content no profile
+  handles without reading it.
+- `main.rs`: runs with the profile handling the clipboard's kind; every
+  handler's `api_url` is checked up front; `-s` and `--timeout` apply to
+  whichever profile handles the input; errors before the kind is known
+  beep with the last selected profile's tones. `Block::Unhandled` names
+  the selected profiles.
+- `cli.rs`: arguments parsed as `OsStr` (`args_os`) so `-c` paths need not
+  be UTF-8; `-p` takes a comma list only (twice, empty or repeated names
+  are errors); `--list-profiles` and `--show-profile` cannot be combined.
+- Man page: new PROFILES section, the new options and keys, examples for
+  multi-profile configs and `-c`. README and AGENTS.md updated.
+- Tests: 211 unit tests (plus 3 X11 tests under `xvfb-run`), covering
+  parsing, includes, `clear`, `input`, routing, errors and their
+  no-value-leak guarantee, the three example configs, `-c`, and non-UTF-8
+  arguments and paths.
+
 ## v0.5.0 - Clipboard images (OCR) and an empty-clipboard fix
 
 User-facing changes:

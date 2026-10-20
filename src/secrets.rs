@@ -414,7 +414,18 @@ mod tests {
         for (name, text) in [
             ("LICENSE", include_str!("../LICENSE")),
             ("README.md", include_str!("../README.md")),
-            ("config.ini.example", include_str!("../config.ini.example")),
+            (
+                "config.toml.example",
+                include_str!("../config.toml.example"),
+            ),
+            (
+                "config.expanded.toml.example",
+                include_str!("../config.expanded.toml.example"),
+            ),
+            (
+                "config.full.toml.example",
+                include_str!("../config.full.toml.example"),
+            ),
         ] {
             assert_eq!(find_secret(text), None, "{name}");
         }
