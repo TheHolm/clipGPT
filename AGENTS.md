@@ -62,14 +62,19 @@ should pass before merging anything touching the macOS backend.
   clipboard image checks and conversion to PNG (`imagefile.rs`),
   input/output cleaning (`sanitize.rs`), secret-pattern detection
   (`secrets.rs`) and command-line parsing (`cli.rs`)
-- `config.toml.example` - the config template users copy and fill in
+- `config.toml.example` (short, one profile), `config.expanded.toml.example`
+  (several profiles with includes) and `config.full.toml.example` (every
+  key, with its default) - config templates users copy and fill in. The
+  man page is the full reference; the examples only point to it (and to
+  the README on GitHub for Windows, which gets no man page). Tests check
+  all three parse, and keep the short one a single plain `[default]`
 - `man/clip_gpt.1` - the man page (hand-written mdoc; lint with
   `mandoc -T lint -W warning`). Installed gzipped by both package types:
   `.deb` to `/usr/share/man/man1` (cargo-deb compresses it), FreeBSD `.pkg`
   to `/usr/local/share/man/man1` (`scripts/ci-freebsd.sh`). Tests in
   `cli.rs` and `configfile.rs` fail if it misses an option, a config key
   (`KEYS` in `configfile.rs`, which must also all appear in
-  `config.toml.example`), or a changed default - update it with them
+  `config.full.toml.example`), or a changed default - update it with them
 - `docker/` - a Dockerfile/compose setup for building in a clean container
   (build-only; clipboard/audio access isn't available from inside it)
 - `scripts/` - CI tooling: FreeBSD packaging (`fetch-freebsd-deps.py`,

@@ -418,6 +418,14 @@ mod tests {
                 "config.toml.example",
                 include_str!("../config.toml.example"),
             ),
+            (
+                "config.expanded.toml.example",
+                include_str!("../config.expanded.toml.example"),
+            ),
+            (
+                "config.full.toml.example",
+                include_str!("../config.full.toml.example"),
+            ),
         ] {
             assert_eq!(find_secret(text), None, "{name}");
         }

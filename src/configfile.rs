@@ -1563,12 +1563,16 @@ mod tests {
         assert!(err.unwrap_err().contains("Cannot read config file"));
     }
 
-    /// The example config shipped with clipGPT.
-    const EXAMPLE: &str = include_str!("../config.toml.example");
+    /// The short example config (one profile).
+    const EXAMPLE_SHORT: &str = include_str!("../config.toml.example");
+    /// The example config with several profiles and includes.
+    const EXAMPLE_EXPANDED: &str = include_str!("../config.expanded.toml.example");
+    /// The example config listing every key.
+    const EXAMPLE_FULL: &str = include_str!("../config.full.toml.example");
 
-    /// Key names set or commented out (`#key = ...`) in the example.
-    fn example_keys() -> Vec<&'static str> {
-        let mut keys: Vec<&str> = EXAMPLE
+    /// Key names set or commented out (`#key = ...`) in `example`.
+    fn example_keys(example: &str) -> Vec<&str> {
+        let mut keys: Vec<&str> = example
             .lines()
             .map(|l| l.trim_start_matches('#').trim())
             .filter_map(|l| l.split_once(" = ").map(|(k, _)| k))
@@ -1580,36 +1584,81 @@ mod tests {
     }
 
     #[test]
-    fn example_config_covers_every_key_and_is_valid() {
-        let mut all = KEYS.to_vec();
-        all.sort_unstable();
-        assert_eq!(example_keys(), all);
-        let file = parse(EXAMPLE).unwrap();
-        let sel = file.select(None).unwrap();
-        let cfg = sel.handler(InputKind::Text).unwrap();
-        assert_eq!(cfg.prompt_image, DEFAULT_PROMPT_IMAGE);
-        assert_eq!(cfg.max_image_bytes, DEFAULT_MAX_IMAGE_BYTES);
-        // Every profile in the example can be selected on its own except
-        // the include-only ones.
-        for name in file.profile_names() {
-            let one = [name.to_string()];
-            let result = file.select(Some(&one));
-            let resolved = file.resolve(name).unwrap();
-            assert_eq!(
-                result.is_ok(),
-                accepts(&resolved) != Accepts::Nothing,
-                "{name}"
-            );
+    fn every_example_is_valid_and_its_profiles_selectable() {
+        for (name, example) in [
+            ("short", EXAMPLE_SHORT),
+            ("expanded", EXAMPLE_EXPANDED),
+            ("full", EXAMPLE_FULL),
+        ] {
+            let file = parse(example).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(file.select(None).is_ok(), "{name}: [default]");
+            // Every profile can be selected on its own except the
+            // include-only ones.
+            for profile in file.profile_names() {
+                let one = [profile.to_string()];
+                let resolved = file.resolve(profile).unwrap();
+                assert_eq!(
+                    file.select(Some(&one)).is_ok(),
+                    accepts(&resolved) != Accepts::Nothing,
+                    "{name}: [{profile}]"
+                );
+            }
         }
     }
 
     #[test]
-    fn example_prompt_image_matches_default() {
-        let line = EXAMPLE
+    fn short_example_is_one_plain_profile_with_the_default_prompt() {
+        let file = parse(EXAMPLE_SHORT).unwrap();
+        assert_eq!(file.profile_names(), [DEFAULT_PROFILE]);
+        let profile = &file.profiles[0];
+        assert!(profile.include.is_empty() && profile.clear.is_empty());
+        let cfg = default_config(EXAMPLE_SHORT);
+        assert_eq!(cfg.prompt_text, DEFAULT_PROMPT_TEXT);
+        assert_eq!(cfg.prompt_image, DEFAULT_PROMPT_IMAGE);
+    }
+
+    #[test]
+    fn expanded_example_routes_text_and_images_apart() {
+        let file = parse(EXAMPLE_EXPANDED).unwrap();
+        assert!(file.profiles.iter().any(|p| !p.include.is_empty()));
+        let sel = file
+            .select(Some(&["default".into(), "ocr".into()]))
+            .unwrap();
+        assert!(sel.warnings().is_empty());
+        let text = sel.handler(InputKind::Text).unwrap();
+        let image = sel.handler(InputKind::Image).unwrap();
+        assert_eq!(text.model, "gpt-4o-mini");
+        assert!(text.api_key.is_some());
+        assert_eq!(image.model, "qwen2.5vl");
+        assert_eq!(image.api_key, None, "api_key = \"\" in [local]");
+        assert!(image.api_url.starts_with("http://127.0.0.1:"));
+    }
+
+    #[test]
+    fn full_example_covers_every_key() {
+        let mut all = KEYS.to_vec();
+        all.sort_unstable();
+        assert_eq!(example_keys(EXAMPLE_FULL), all);
+        let cfg = default_config(EXAMPLE_FULL);
+        assert_eq!(cfg.prompt_image, DEFAULT_PROMPT_IMAGE);
+        assert_eq!(cfg.max_image_bytes, DEFAULT_MAX_IMAGE_BYTES);
+    }
+
+    #[test]
+    fn full_example_prompt_image_matches_default() {
+        let line = EXAMPLE_FULL
             .lines()
             .find_map(|l| l.strip_prefix("prompt_image = "))
-            .expect("prompt_image in config.toml.example");
+            .expect("prompt_image in config.full.toml.example");
         assert_eq!(line, display_value(&Value::from(DEFAULT_PROMPT_IMAGE)));
+    }
+
+    #[test]
+    fn examples_point_to_the_full_documentation() {
+        for example in [EXAMPLE_SHORT, EXAMPLE_EXPANDED, EXAMPLE_FULL] {
+            assert!(example.contains("man clip_gpt"));
+            assert!(example.contains("README.md at\n# https://github.com/TheHolm/clipGPT"));
+        }
     }
 
     /// The man page with roff hyphen escapes (`\-`) undone.

@@ -1,5 +1,4 @@
 target
-config.ini
 config.toml
 execute.sh
 *.swp

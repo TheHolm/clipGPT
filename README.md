@@ -45,7 +45,9 @@ To build from source instead:
 
 2. Copy `config.toml.example` to `config.toml` and fill in `model`
    (required) and `api_key` (if your server needs one - a local Ollama
-   doesn't) in its `[default]` profile. Place it at one of the locations
+   doesn't) in its `[default]` profile. `config.expanded.toml.example`
+   shows several profiles with includes, `config.full.toml.example` every
+   key with its default. Place it at one of the locations
    listed under "Config file location" below. If it contains an `api_key`,
    make it private: `chmod 600 config.toml` (see "Security" below).
 
@@ -55,6 +57,10 @@ To build from source instead:
    OS's own tools so you don't have to run it manually every time.
 
 ## Configuration
+
+The full reference for the config file and how clipGPT uses it is the man
+page (`man clip_gpt`, or `man -l man/clip_gpt.1`; sections CONFIGURATION
+and PROFILES). This section is a summary.
 
 **Since v0.6.0 the config file is `config.toml`** (TOML) with named
 profiles; the old `config.ini` is no longer read. To convert one, rename
@@ -135,7 +141,7 @@ errors. Error messages never quote setting values.
 | api_key | -k *(not yet implemented)* |  | str | Optional. Empty or missing means no key is sent (e.g. local Ollama). If any profile sets one, the config file must be mode 600 on Unix |
 | model |  |  | str | Required in every profile that handles input. Model name sent to api_url, e.g. gpt-4o-mini for OpenAI, or a local model name for Ollama |
 | prompt_text | -t *(not yet implemented)* | "Check spelling and gramma and rewrite following text on pirate speak. Be mean and pushy \n\n" | str | prompt used if clipboard contains text (sent as the system message, the clipboard text as a separate user message) |
-| prompt_image | -i *(not yet implemented)* | an OCR prompt (see `config.toml.example`): transcribe all text in the image exactly, as Markdown, nothing else | str | prompt used if the clipboard contains an image and no text (sent as the system message, the image as a separate user message). The model must accept images, see "Images" |
+| prompt_image | -i *(not yet implemented)* | an OCR prompt (see `man clip_gpt`): transcribe all text in the image exactly, as Markdown, nothing else | str | prompt used if the clipboard contains an image and no text (sent as the system message, the image as a separate user message). The model must accept images, see "Images" |
 | beep_tone |  | 1046 | int | frequency in Hz, played when response is received and pasted to clipboard, approx. C6 |
 | error_tone |   | 131  | int  | frequency in Hz, played when an error occurs or a password was found on the clipboard, approx. C3 |
 | beep_duration |  | 250 | int | duration in ms, for error and success beeps (set to 0 to disable) |

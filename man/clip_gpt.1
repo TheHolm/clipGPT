@@ -1,7 +1,7 @@
 .\" SPDX-License-Identifier: AGPL-3.0-or-later
 .\"
 .\" clip_gpt(1) - keep in sync with src/cli.rs (USAGE) and
-.\" config.toml.example; tests in src/cli.rs and src/configfile.rs check
+.\" config.full.toml.example; tests in src/cli.rs and src/configfile.rs check
 .\" the options, config keys and defaults.
 .Dd October 20, 2026
 .Dt CLIP_GPT 1
@@ -352,6 +352,10 @@ The X11 display used when Wayland clipboard access is not available.
 Configuration file.
 .It Pa ./config.toml
 Used if the file above does not exist.
+.It Pa config.toml.example , config.expanded.toml.example , config.full.toml.example
+Example configurations in the source tree: a short one with a single
+profile, one with several profiles and includes, and one listing every key
+with its default.
 .El
 .Sh EXIT STATUS
 .Nm
