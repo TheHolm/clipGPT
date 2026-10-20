@@ -53,8 +53,11 @@ const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// Most `TARGETS` entries looked at, so a hostile owner cannot make us
-/// look up an unbounded number of atom names.
-const MAX_TARGETS: u32 = 256;
+/// look up an unbounded number of atom names. Read in one request (16 KiB).
+/// Real owners list a few dozen at most; the limit used to be 256, which a
+/// list padded with junk could push a password-manager hint past. Entries
+/// after this many are still not checked (see [`get`]).
+const MAX_TARGETS: u32 = 4096;
 
 /// Largest single property write, in bytes. Texts above this (or above
 /// what the server accepts in one request) are sent with `INCR`.
@@ -359,7 +362,9 @@ impl Reader {
 /// among the offered formats, then reading what [`choose`] picks.
 /// Data over its limit is an error, never returned in part. If the owner
 /// does not answer `TARGETS`, the hint cannot be checked and `UTF8_STRING`,
-/// then `STRING` are tried (no image).
+/// then `STRING` are tried (no image). Only the first [`MAX_TARGETS`]
+/// entries of a longer `TARGETS` list are checked for the hint. Both gaps
+/// are documented (README "Security", man page SECURITY).
 pub fn get(limits: Limits) -> Result<Clip, Failure> {
     let (conn, screen_num) = connect()?;
     let win = create_window(&conn, screen_num)?;
@@ -436,7 +441,8 @@ fn plan_read(targets: Option<&[(Atom, String)]>, guesses: [Atom; 2]) -> ReadPlan
 
 /// The atoms of a `TARGETS` reply, or `None` if it is not a plain list of
 /// 32-bit atoms (e.g. an `INCR` announcement, which no sane owner uses for
-/// `TARGETS`).
+/// `TARGETS`). A list longer than was asked for comes back cut off
+/// (`bytes_after` > 0); its first part is still used.
 fn target_atoms(reply: &GetPropertyReply, incr: Atom) -> Option<Vec<Atom>> {
     if reply.type_ == incr {
         return None;
@@ -1035,6 +1041,27 @@ mod tests {
     }
 
     #[test]
+    fn target_atoms_keeps_first_part_of_a_cut_off_list() {
+        let list = reply(4, 32, atom_bytes(&[7, 9]), 400);
+        assert_eq!(target_atoms(&list, 104), Some(vec![7, 9]));
+    }
+
+    #[test]
+    fn password_hint_found_deep_in_a_long_target_list() {
+        // An owner padding its list with junk before the hint: found as
+        // long as it is within the first MAX_TARGETS entries.
+        let mut t: Vec<(Atom, String)> = (0..MAX_TARGETS - 1)
+            .map(|i| (1000 + i, format!("junk-{i}")))
+            .collect();
+        t.insert(0, (2, "UTF8_STRING".into()));
+        t.truncate(MAX_TARGETS as usize - 1);
+        t.push((3, "x-kde-passwordManagerHint".into()));
+        assert_eq!(t.len(), MAX_TARGETS as usize);
+        assert_eq!(plan_read(Some(&t), [1, 2]), ReadPlan::Password);
+        const { assert!(MAX_TARGETS >= 4096) };
+    }
+
+    #[test]
     fn plan_read_choices() {
         let guesses = [1, 2];
         let plan = |text: Vec<Atom>, image: Option<Atom>| ReadPlan::Try { text, image };
@@ -1418,13 +1445,15 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(20));
     }
 
+    /// Serialises the tests using the one real X clipboard.
+    static X11_CLIPBOARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Own the clipboard in a thread with `data`, read it back through
     /// [`get`], then take it over again so the first owner exits.
     /// Needs a real X server: run with `xvfb-run cargo test -- --ignored`.
     /// Serialised, since all tests share the one X clipboard.
     fn round_trip(data: Vec<u8>, max_bytes: usize) -> Result<Clip, Failure> {
-        static CLIPBOARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = X11_CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner());
         let owner = Owner::take(data)?;
         let server = std::thread::spawn(move || owner.serve());
         let result = get(Limits {
@@ -1461,5 +1490,86 @@ mod tests {
         assert_eq!(small, Failure::Other(too_large(999)));
         let incr = round_trip(vec![b'x'; 300_000], 299_999).unwrap_err();
         assert_eq!(incr, Failure::Other(too_large(299_999)));
+    }
+
+    /// Own the clipboard with a fake owner whose `TARGETS` answer is
+    /// `UTF8_STRING`, `padding` junk entries, then the password-manager
+    /// hint (and which serves "text" as `UTF8_STRING`), and read it back
+    /// through [`get`].
+    fn read_with_padded_targets(padding: usize) -> Result<Clip, Failure> {
+        let _guard = X11_CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner());
+        let (conn, screen_num) = connect()?;
+        let win = create_window(&conn, screen_num)?;
+        let atoms = Atoms::new(&conn)?.reply()?;
+        let hint = conn
+            .intern_atom(false, b"x-kde-passwordManagerHint")?
+            .reply()?
+            .atom;
+        let mut targets = vec![atoms.TARGETS, atoms.UTF8_STRING];
+        targets.extend(std::iter::repeat_n(Atom::from(AtomEnum::PRIMARY), padding));
+        targets.push(hint);
+        conn.set_selection_owner(win, atoms.CLIPBOARD, CURRENT_TIME)?;
+        conn.flush()?;
+        let server = std::thread::spawn(move || -> Result<(), Failure> {
+            loop {
+                match conn.wait_for_event()? {
+                    Event::SelectionRequest(req) => {
+                        let property = reply_property(req.property, req.target);
+                        if req.target == atoms.TARGETS {
+                            conn.change_property32(
+                                PropMode::REPLACE,
+                                req.requestor,
+                                property,
+                                AtomEnum::ATOM,
+                                &targets,
+                            )?;
+                        } else {
+                            conn.change_property8(
+                                PropMode::REPLACE,
+                                req.requestor,
+                                property,
+                                atoms.UTF8_STRING,
+                                b"text",
+                            )?;
+                        }
+                        let notify = SelectionNotifyEvent {
+                            response_type: SELECTION_NOTIFY_EVENT,
+                            sequence: 0,
+                            time: req.time,
+                            requestor: req.requestor,
+                            selection: req.selection,
+                            target: req.target,
+                            property,
+                        };
+                        conn.send_event(false, req.requestor, EventMask::NO_EVENT, notify)?;
+                        conn.flush()?;
+                    }
+                    Event::SelectionClear(_) => return Ok(()),
+                    _ => {}
+                }
+            }
+        });
+        let result = get(Limits {
+            text: Some(100),
+            image: Some(100),
+        });
+        let other = Owner::take(Vec::new())?;
+        server.join().unwrap()?;
+        drop(other);
+        result
+    }
+
+    #[test]
+    #[ignore = "needs an X server (DISPLAY), e.g. xvfb-run"]
+    fn x11_password_hint_behind_many_targets_is_found() {
+        // 1000 junk entries pushed the hint past the old 256-entry limit.
+        assert_eq!(read_with_padded_targets(1000), Ok(Clip::Password));
+        assert_eq!(read_with_padded_targets(0), Ok(Clip::Password));
+        // Past MAX_TARGETS it is not seen (documented gap).
+        let beyond = MAX_TARGETS as usize;
+        assert_eq!(
+            read_with_padded_targets(beyond),
+            Ok(Clip::Text("text".into()))
+        );
     }
 }

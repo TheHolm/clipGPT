@@ -340,11 +340,20 @@ is then not based on it.
 Clipboard contents marked as secret by a password manager
 .Po
 .Ql x\-kde\-passwordManagerHint
-on Wayland and X11,
+on Wayland and X11;
+.Ql ExcludeClipboardContentFromMonitorProcessing ,
+.Ql Clipboard Viewer Ignore
+or
+.Ql CanIncludeInClipboardHistory
+= 0 on Windows;
 .Ql org.nspasteboard.ConcealedType
 on macOS
 .Pc
 are never read or sent; the clipboard is replaced by a notice.
+On X11 the marker is looked for in the owner's list of formats
+.Pq Dv TARGETS :
+an owner that does not answer that request is read anyway (as text
+only), and only the first 4096 entries of a longer list are checked.
 Text containing invisible Unicode tag characters, or hidden variation
 selectors (any of U+E0100 to U+E01EF, or two or more of U+FE00 to U+FE0F
 in a row), is refused the same way; a single variation selector after a

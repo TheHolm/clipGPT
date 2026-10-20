@@ -233,7 +233,10 @@ output back where you will paste it, so it applies these protections:
   or `CanIncludeInClipboardHistory` = 0; macOS
   `org.nspasteboard.ConcealedType` (1Password, KeePassXC, Bitwarden and
   others - untested, see "Releases"). A password manager that sets no marker
-  can't be detected.
+  can't be detected. On X11 the marker can only be seen in the list of
+  formats the copying program offers (`TARGETS`): a program that doesn't
+  answer that request is read anyway (as plain text, no image), and only
+  the first 4096 entries of a longer list are checked.
 * **Hidden prompt injection is refused.** Clipboard text containing
   Unicode tag characters (U+E0000-U+E007F - invisible, but read by LLMs)
   or hidden variation selectors is treated as an attack: the clipboard is
