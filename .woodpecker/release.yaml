@@ -48,6 +48,19 @@
 #     with no connection to anything in this crate's own code. Cargo.lock
 #     already pins mio >=1.2.4; do not downgrade it for a FreeBSD build.
 #
+# Downloads and how they are verified:
+#   - base.txz: against the release MANIFEST, confirmed by independent
+#     mirrors (scripts/verify-freebsd-dist.sh)
+#   - FreeBSD packages (alsa-lib, openssl closure): each .pkg against the
+#     size and checksum in packagesite.yaml, fetched over HTTPS from
+#     pkg.freebsd.org (scripts/fetch-freebsd-deps.py)
+#   - rustup-init: against the SHA-256 published next to it
+#     (scripts/fetch-verified.sh)
+#   - llvm-mingw (build-windows-arm64): NOT verified beyond HTTPS from
+#     GitHub; its releases publish no checksum file
+#   - apt packages, crates, the gh CLI: by apt/cargo's own signatures and
+#     checksums (Cargo.lock)
+#
 # Requirements for this to work (not set up by anything in this repo):
 #   - A `github_token` secret set on this repo in Woodpecker (Project
 #     Settings -> Secrets), holding a GitHub PAT scoped to Contents:
@@ -118,7 +131,8 @@ steps:
       # pure Rust by default, no libxcb or libwayland-client linking
       # required. Confirmed FreeBSD package
       # names - do not guess new ones without checking
-      # https://cgit.freebsd.org/ports first.
+      # https://cgit.freebsd.org/ports first. Each downloaded .pkg is checked
+      # against packagesite.yaml's size and checksum before it is unpacked.
       - >-
         python3 scripts/fetch-freebsd-deps.py --sysroot /opt/freebsd-sysroot
         --root alsa-lib --root openssl
@@ -262,7 +276,8 @@ steps:
       # Classic GNU mingw-w64 has no ARM64 Windows support at all - only the
       # LLVM-based mingw (llvm-mingw) does, targeting the gnullvm ABI
       # (aarch64-pc-windows-gnullvm, NOT aarch64-pc-windows-gnu, which is not
-      # a real rustc target).
+      # a real rustc target). The download is only protected by HTTPS: the
+      # llvm-mingw releases publish no checksum to verify it against.
       - apt-get update && apt-get install -y --no-install-recommends curl xz-utils ca-certificates
       - curl -fsSL -o /tmp/llvm-mingw.tar.xz https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64.tar.xz
       - mkdir -p /opt/llvm-mingw
