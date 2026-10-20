@@ -59,6 +59,17 @@ const POLL_INTERVAL: Duration = Duration::from_millis(2);
 /// after this many are still not checked (see [`get`]).
 const MAX_TARGETS: u32 = 4096;
 
+/// How long an `INCR` transfer may go without the requestor asking for
+/// the next chunk before the owner helper gives up on it. Only matters
+/// once the clipboard has been taken over: the helper then stays only to
+/// finish transfers already started, and a stalled one would otherwise
+/// keep it running forever.
+const TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Pause between event polls while the owner helper waits for unfinished
+/// transfers (coarser than [`POLL_INTERVAL`]: nobody waits on it).
+const TRANSFER_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 /// Largest single property write, in bytes. Texts above this (or above
 /// what the server accepts in one request) are sent with `INCR`.
 const MAX_CHUNK: usize = 256 * 1024;
@@ -634,6 +645,8 @@ struct Transfer {
     property: Atom,
     type_: Atom,
     sender: IncrSender,
+    /// When the transfer started or last handed out a chunk.
+    last_progress: Instant,
 }
 
 /// One step of an `INCR` transfer: write `chunk` with type `type_`; if
@@ -651,9 +664,9 @@ struct Step<'a> {
 struct Transfers(Vec<Transfer>);
 
 impl Transfers {
-    /// Begin a transfer to `property` on `requestor`, replacing an earlier
-    /// one to the same place.
-    fn start(&mut self, requestor: Window, property: Atom, type_: Atom) {
+    /// Begin a transfer to `property` on `requestor` at `now`, replacing
+    /// an earlier one to the same place.
+    fn start(&mut self, now: Instant, requestor: Window, property: Atom, type_: Atom) {
         self.0
             .retain(|t| !(t.requestor == requestor && t.property == property));
         self.0.push(Transfer {
@@ -661,15 +674,26 @@ impl Transfers {
             property,
             type_,
             sender: IncrSender::default(),
+            last_progress: now,
         });
     }
 
-    /// The requestor deleted `property` on `window`, asking for the next
-    /// chunk of `data` (at most `chunk` bytes). `None` if no transfer goes
-    /// there. A transfer is dropped once its final empty chunk is handed
-    /// out.
+    /// Drop every transfer that made no progress for `max_idle` up to
+    /// `now`, returning how many were dropped.
+    fn expire(&mut self, now: Instant, max_idle: Duration) -> usize {
+        let before = self.0.len();
+        self.0
+            .retain(|t| now.saturating_duration_since(t.last_progress) < max_idle);
+        before - self.0.len()
+    }
+
+    /// The requestor deleted `property` on `window` at `now`, asking for
+    /// the next chunk of `data` (at most `chunk` bytes). `None` if no
+    /// transfer goes there. A transfer is dropped once its final empty
+    /// chunk is handed out.
     fn advance<'a>(
         &mut self,
+        now: Instant,
         window: Window,
         property: Atom,
         data: &'a [u8],
@@ -680,6 +704,7 @@ impl Transfers {
             .iter()
             .position(|t| t.requestor == window && t.property == property)?;
         let t = &mut self.0[i];
+        t.last_progress = now;
         let type_ = t.type_;
         // Finished transfers are removed right away, so `next` always
         // yields here; an empty chunk would end the transfer anyway.
@@ -819,12 +844,32 @@ impl Owner {
     }
 
     /// Answer requests until the clipboard is taken over and no transfer
-    /// is still in progress, or the connection ends.
+    /// is still in progress, or the connection ends. After the takeover,
+    /// transfers idle for [`TRANSFER_IDLE_TIMEOUT`] are dropped, so a
+    /// requestor that stalls in the middle cannot keep the helper alive.
     fn serve(self) -> Result<(), Failure> {
+        self.serve_with_idle_timeout(TRANSFER_IDLE_TIMEOUT)
+    }
+
+    /// [`Owner::serve`] with transfers dropped after `max_idle` without
+    /// progress (once the clipboard is taken over).
+    fn serve_with_idle_timeout(self, max_idle: Duration) -> Result<(), Failure> {
         let mut transfers = Transfers::default();
         let mut cleared = false;
         while !(cleared && transfers.is_empty()) {
-            match self.conn.wait_for_event()? {
+            let event = if cleared {
+                match self.conn.poll_for_event()? {
+                    Some(event) => event,
+                    None => {
+                        transfers.expire(Instant::now(), max_idle);
+                        std::thread::sleep(TRANSFER_POLL_INTERVAL);
+                        continue;
+                    }
+                }
+            } else {
+                self.conn.wait_for_event()?
+            };
+            match event {
                 Event::SelectionRequest(req) => self.answer(&req, &mut transfers)?,
                 Event::SelectionClear(ev)
                     if ev.owner == self.win && ev.selection == self.atoms.CLIPBOARD =>
@@ -930,7 +975,7 @@ impl Owner {
             self.atoms.INCR,
             &[size],
         )?;
-        transfers.start(requestor, property, type_);
+        transfers.start(Instant::now(), requestor, property, type_);
         Ok(())
     }
 
@@ -943,7 +988,9 @@ impl Owner {
         property: Atom,
         transfers: &mut Transfers,
     ) -> Result<(), Failure> {
-        let Some(step) = transfers.advance(window, property, &self.data, self.chunk) else {
+        let Some(step) =
+            transfers.advance(Instant::now(), window, property, &self.data, self.chunk)
+        else {
             return Ok(());
         };
         self.conn
@@ -1149,46 +1196,80 @@ mod tests {
         assert_eq!(reply_property(42, 105), 42);
     }
 
+    /// A fixed point in time for transfer tests that don't care about it.
+    fn now() -> Instant {
+        static NOW: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *NOW.get_or_init(Instant::now)
+    }
+
+    #[test]
+    fn idle_transfers_expire_and_progress_resets_the_clock() {
+        let start = now();
+        let idle = Duration::from_secs(10);
+        let mut t = Transfers::default();
+        t.start(start, 1, 50, 105);
+        t.start(start, 2, 50, 105);
+        // Window 1 keeps asking for chunks; window 2 stalls.
+        let later = start + Duration::from_secs(8);
+        assert!(t.advance(later, 1, 50, b"abcdef", 2).is_some());
+        assert_eq!(t.expire(start + Duration::from_secs(9), idle), 0);
+        assert_eq!(t.expire(start + idle, idle), 1, "window 2 dropped");
+        assert_eq!(t.0.len(), 1);
+        assert_eq!(t.0[0].requestor, 1);
+        assert_eq!(t.expire(later + idle - Duration::from_millis(1), idle), 0);
+        assert_eq!(t.expire(later + idle, idle), 1);
+        assert!(t.is_empty());
+        // A clock that went backwards never expires anything.
+        t.start(later, 3, 50, 105);
+        assert_eq!(t.expire(start, idle), 0);
+    }
+
     #[test]
     fn transfers_send_chunks_then_unwatch() {
         let data = b"abcde";
         let mut t = Transfers::default();
-        t.start(1, 50, 105);
-        assert_eq!(t.advance(2, 50, data, 3), None, "other window");
-        assert_eq!(t.advance(1, 51, data, 3), None, "other property");
+        t.start(now(), 1, 50, 105);
+        assert_eq!(t.advance(now(), 2, 50, data, 3), None, "other window");
+        assert_eq!(t.advance(now(), 1, 51, data, 3), None, "other property");
         let step = |chunk: &'static [u8], unwatch| Step {
             type_: 105,
             chunk,
             unwatch,
         };
-        assert_eq!(t.advance(1, 50, data, 3), Some(step(b"abc", false)));
-        assert_eq!(t.advance(1, 50, data, 3), Some(step(b"de", false)));
-        assert_eq!(t.advance(1, 50, data, 3), Some(step(b"", true)));
+        assert_eq!(t.advance(now(), 1, 50, data, 3), Some(step(b"abc", false)));
+        assert_eq!(t.advance(now(), 1, 50, data, 3), Some(step(b"de", false)));
+        assert_eq!(t.advance(now(), 1, 50, data, 3), Some(step(b"", true)));
         assert!(t.is_empty());
-        assert_eq!(t.advance(1, 50, data, 3), None);
+        assert_eq!(t.advance(now(), 1, 50, data, 3), None);
     }
 
     #[test]
     fn transfers_keep_watching_window_with_other_transfer() {
         let mut t = Transfers::default();
-        t.start(1, 50, 105);
-        t.start(1, 60, 107);
-        assert_eq!(t.advance(1, 50, b"", 3).map(|s| s.unwatch), Some(false));
-        assert_eq!(t.advance(1, 60, b"", 3).map(|s| s.unwatch), Some(true));
+        t.start(now(), 1, 50, 105);
+        t.start(now(), 1, 60, 107);
+        assert_eq!(
+            t.advance(now(), 1, 50, b"", 3).map(|s| s.unwatch),
+            Some(false)
+        );
+        assert_eq!(
+            t.advance(now(), 1, 60, b"", 3).map(|s| s.unwatch),
+            Some(true)
+        );
         assert!(t.is_empty());
     }
 
     #[test]
     fn transfers_restart_and_forget() {
         let mut t = Transfers::default();
-        t.start(1, 50, 105);
-        assert!(t.advance(1, 50, b"abcdef", 2).is_some());
+        t.start(now(), 1, 50, 105);
+        assert!(t.advance(now(), 1, 50, b"abcdef", 2).is_some());
         // A new request to the same place starts over from the beginning.
-        t.start(1, 50, 107);
+        t.start(now(), 1, 50, 107);
         assert_eq!(t.0.len(), 1);
-        let step = t.advance(1, 50, b"abcdef", 2).unwrap();
+        let step = t.advance(now(), 1, 50, b"abcdef", 2).unwrap();
         assert_eq!((step.type_, step.chunk), (107, &b"ab"[..]));
-        t.start(2, 50, 105);
+        t.start(now(), 2, 50, 105);
         t.forget_window(1);
         assert_eq!(t.0.len(), 1);
         t.forget_window(2);
@@ -1571,5 +1652,48 @@ mod tests {
             read_with_padded_targets(beyond),
             Ok(Clip::Text("text".into()))
         );
+    }
+
+    #[test]
+    #[ignore = "needs an X server (DISPLAY), e.g. xvfb-run"]
+    fn x11_owner_exits_despite_a_stalled_incr_transfer() {
+        let _guard = X11_CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner());
+        let owner = Owner::take(vec![b'x'; 300_000]).unwrap();
+        let idle = Duration::from_millis(500);
+        let server = std::thread::spawn(move || owner.serve_with_idle_timeout(idle));
+
+        // A requestor that starts an INCR transfer and then never deletes
+        // the property, i.e. never asks for the first chunk.
+        let (conn, screen_num) = connect().unwrap();
+        let win = create_window(&conn, screen_num).unwrap();
+        let atoms = Atoms::new(&conn).unwrap().reply().unwrap();
+        let prop = atoms.CLIPGPT_PROPERTY;
+        conn.convert_selection(win, atoms.CLIPBOARD, atoms.UTF8_STRING, prop, CURRENT_TIME)
+            .unwrap();
+        let property = wait_for(&conn, |event| match event {
+            Event::SelectionNotify(n) if n.requestor == win => Some(n.property),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(property, prop);
+        let reply = conn
+            .get_property(false, win, prop, AtomEnum::ANY, 0, 1)
+            .unwrap()
+            .reply()
+            .unwrap();
+        assert_eq!(reply.type_, atoms.INCR, "large text goes through INCR");
+
+        // Someone else copies; the helper must give up on the stalled
+        // transfer and finish, while the requestor's window still exists.
+        let taken = Instant::now();
+        let other = Owner::take(Vec::new()).unwrap();
+        server.join().unwrap().unwrap();
+        let waited = taken.elapsed();
+        assert!(
+            waited >= idle / 2,
+            "exited before the idle timeout: {waited:?}"
+        );
+        assert!(waited < Duration::from_secs(5), "took {waited:?}");
+        drop((other, conn));
     }
 }

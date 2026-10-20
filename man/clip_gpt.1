@@ -338,7 +338,8 @@ the response
 .Nm
 leaves a copy of itself running in the background as
 .Ql clip_gpt \-\-x11\-clipboard\-owner .
-It exits as soon as anything else is copied.
+It exits as soon as anything else is copied, after finishing pastes
+already in progress; one that stalls for 10 seconds is given up.
 .Sh IMAGES
 If the clipboard holds no text (or only white space) but an image,
 the image is sent instead, with

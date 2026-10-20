@@ -340,7 +340,9 @@ Clipboard access is OS-specific:
     something must keep running to hand it out. So after writing the
     response, clipGPT leaves a small background copy of itself (`clip_gpt
     --x11-clipboard-owner`) running. It exits as soon as anything else is
-    copied. Don't run that option yourself; it's internal.
+    copied (after finishing pastes already in progress; one that stalls
+    for 10 seconds is given up). Don't run that option yourself; it's
+    internal.
   * `x11rb` is maintained and pure Rust: no libxcb, and in the default
     configuration used here it is compiled with `forbid(unsafe_code)`. It
     is unrelated to the `clipboard`/`x11-clipboard`
