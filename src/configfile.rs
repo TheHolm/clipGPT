@@ -735,9 +735,11 @@ impl Selection {
             .and_then(|p| p.config.as_ref())
     }
 
-    /// Every config that handles something.
-    pub fn handlers(&self) -> impl Iterator<Item = &Config> {
-        self.profiles.iter().filter_map(|p| p.config.as_ref())
+    /// Every profile that handles something, as (name, config).
+    pub fn handlers(&self) -> impl Iterator<Item = (&str, &Config)> {
+        self.profiles
+            .iter()
+            .filter_map(|p| p.config.as_ref().map(|c| (p.name.as_str(), c)))
     }
 
     /// Mutable access to every config that handles something (to apply
@@ -1561,7 +1563,7 @@ mod tests {
             .contains("[nomodel] is selected but handles nothing (overridden by [both])"));
         assert!(sel.profiles[0].config.is_none());
         assert_eq!(sel.fallback().unwrap().model, "both");
-        assert_eq!(sel.handlers().count(), 1);
+        assert_eq!(sel.handlers().map(|(n, _)| n).collect::<Vec<_>>(), ["both"]);
         // But a profile that handles something needs one.
         let err = select(&file, Some("text,nomodel")).unwrap_err();
         assert!(

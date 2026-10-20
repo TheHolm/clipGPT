@@ -163,7 +163,8 @@ absolute path in hotkey bindings); `-p`/`--profile NAME[,NAME...]` picks the pro
 (see above); `--list-profiles` prints the profile names; `--show-profile`
 prints the config file used and the selected profiles' resolved settings (API key hidden, and
 `api_url` without user info, query or fragment) and exits,
-which also checks the config; `-s`/`--no-secret-check` skips the secret
+which also checks the config, including every selected profile's
+`api_url` (a normal run only checks the one it uses); `-s`/`--no-secret-check` skips the secret
 check for one run; `--timeout SECONDS` (or `--timeout=SECONDS`) sets the
 request timeout for one run, overriding `request_timeout` (0 = no limit);
 `-s` and `--timeout` apply to whichever profile handles the clipboard;
@@ -301,7 +302,9 @@ output back where you will paste it, so it applies these protections:
   the key and text travel unencrypted. Redirects are refused unless
   `allow_redirects = true`; then each hop is checked the same way (at most
   10), and a redirect from `https` to plain `http` is always refused, even
-  to this computer.
+  to this computer. A run checks (and warns about) only the `api_url` of
+  the profile that handles the clipboard, once its kind is known;
+  `--show-profile` checks those of all selected profiles.
   When a redirect changes host the API key is dropped, but a 307/308
   redirect does re-send the clipboard text to the new host.
 * **Limits.** Clipboard text over `max_input_bytes` and images over

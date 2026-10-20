@@ -86,8 +86,10 @@ and which profile handles which kind of content, then exit.
 The API key is only shown as set or not, and
 .Cm api_url
 without user name, password, query or fragment, which may hold a key.
-The whole file is checked as for a normal run, so this also tests a
-configuration.
+The whole file is checked as for a normal run, and so is the
+.Cm api_url
+of every selected profile that handles input (a normal run only checks
+the one it uses), so this also tests a configuration.
 .It Fl s , Fl \-no\-secret\-check
 Do not refuse clipboard text that looks like an API key, token, private
 key or URL with a password, for this run.

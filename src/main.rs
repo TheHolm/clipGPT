@@ -202,6 +202,10 @@ fn main() {
         .unwrap_or_else(|e| fail_default(&e));
     if show {
         print!("{}", file.show(&selection));
+        match verify_api_urls(selection.handlers()) {
+            Ok(warnings) => warnings.iter().for_each(|w| eprintln!("{w}")),
+            Err(e) => fail_default(&e),
+        }
         return;
     }
     for warning in selection.warnings() {
@@ -326,14 +330,27 @@ fn decide_text<'a>(
     }
 }
 
-/// Parse and check a profile's `api_url`, printing the warning for plain
-/// http to another computer.
-fn check_api_url(config: &Config) -> Result<Url, String> {
+/// Parse and check a profile's `api_url` (see [`net::check_url`]).
+/// Returns the URL and the warning to print for plain http to another
+/// computer, if any.
+fn check_api_url(config: &Config) -> Result<(Url, Option<String>), String> {
     let url = Url::parse(&config.api_url).map_err(|e| format!("Invalid api_url: {}", e))?;
-    if let Some(warning) = net::check_url(&url, &net::host_is_local)? {
-        eprintln!("{}", warning);
+    let warning = net::check_url(&url, &net::host_is_local)?;
+    Ok((url, warning))
+}
+
+/// `--show-profile`'s check of every handling profile's `api_url`, as a
+/// normal run only checks the one it uses. Returns the warnings, each
+/// naming its profile, or the first error, naming its profile.
+fn verify_api_urls<'a>(
+    profiles: impl IntoIterator<Item = (&'a str, &'a Config)>,
+) -> Result<Vec<String>, String> {
+    let mut warnings = Vec::new();
+    for (name, config) in profiles {
+        let (_, warning) = check_api_url(config).map_err(|e| format!("Profile [{name}]: {e}"))?;
+        warnings.extend(warning.map(|w| format!("Profile [{name}]: {w}")));
     }
-    Ok(url)
+    Ok(warnings)
 }
 
 /// The clipboard size limits for `selection`: each kind's limit from the
@@ -364,11 +381,6 @@ fn run_with<'a>(
     no_secret_check: bool,
     used: &mut Option<&'a Config>,
 ) -> Result<Outcome, String> {
-    // Every profile that may be used must have a valid api_url, whatever
-    // the clipboard holds.
-    for config in selection.handlers() {
-        check_api_url(config)?;
-    }
     let unhandled = |kind| Ok(Outcome::Blocked(Block::Unhandled(kind, selection.names())));
 
     let (config, input) = match clipboard_backend::get(limits_for(selection))? {
@@ -400,7 +412,12 @@ fn run_with<'a>(
         }
     };
 
-    let url = Url::parse(&config.api_url).map_err(|e| format!("Invalid api_url: {}", e))?;
+    // Only the profile actually used is checked (no DNS lookups or
+    // warnings for the others); --show-profile checks them all.
+    let (url, warning) = check_api_url(config)?;
+    if let Some(warning) = warning {
+        eprintln!("{}", warning);
+    }
     let hint = status_hint(&input);
     let payload = build_request(config, input);
     let client = net::build_client(config.allow_redirects, config.request_timeout)?;
@@ -698,6 +715,32 @@ mod tests {
             Err(Block::Secret("GitHub token"))
         );
         assert_eq!(screen_input(&text, false), Ok(text));
+    }
+
+    #[test]
+    fn verify_api_urls_checks_every_profile_and_names_it() {
+        let with_url = |url: &str| {
+            let mut c = config_with_prompt("p");
+            c.api_url = url.into();
+            c
+        };
+        let good = with_url("https://llm.example/v1");
+        let local = with_url("http://127.0.0.1:11434/v1");
+        let plain = with_url("http://203.0.113.7/v1");
+        let bad_scheme = with_url("ftp://llm.example/");
+        let garbage = with_url("not a url");
+        assert_eq!(verify_api_urls([("a", &good), ("b", &local)]), Ok(vec![]));
+        let warnings = verify_api_urls([("a", &good), ("remote", &plain)]).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].starts_with("Profile [remote]: "),
+            "{warnings:?}"
+        );
+        // The bad one is found even when it is not the first or last.
+        let err = verify_api_urls([("a", &good), ("ocr", &bad_scheme), ("b", &local)]).unwrap_err();
+        assert!(err.starts_with("Profile [ocr]: "), "{err}");
+        let err = verify_api_urls([("x", &garbage)]).unwrap_err();
+        assert!(err.starts_with("Profile [x]: Invalid api_url"), "{err}");
     }
 
     #[test]
