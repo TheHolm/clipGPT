@@ -228,6 +228,13 @@ Only
 .It Cm prompt_text
 Prompt sent as the system message; the clipboard text is sent separately
 as the user message.
+The default is a plain proofread in the text's own language:
+.Bd -filled -offset indent
+Correct the spelling, grammar and punctuation of the following text.
+Keep its original language, meaning, tone and formatting - do not
+translate, summarise or add anything.
+Reply with the corrected text only.
+.Ed
 .It Cm prompt_image
 Prompt sent as the system message when the clipboard holds an image and
 no text; the image is sent separately as the user message.

@@ -75,7 +75,7 @@ model = "gpt-4o-mini"
 # the clipboard text is sent separately as the user message. "\n" is a
 # newline in "double-quoted" strings; 'single-quoted' strings take no
 # escapes.
-prompt_text = "Check spelling and gramma and rewrite following text on pirate speak. Be mean and pushy \n\n"
+prompt_text = "Correct the spelling, grammar and punctuation of the following text. Keep its original language, meaning, tone and formatting - do not translate, summarise or add anything. Reply with the corrected text only."
 
 # Prompt used when the clipboard contains an image (and no text). Sent as
 # the system message; the image is sent separately as the user message.

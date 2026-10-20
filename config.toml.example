@@ -12,4 +12,6 @@ api_url = "https://api.openai.com/v1/chat/completions"
 # Leave empty for servers that need no key.
 api_key = "sk-your-key-here"
 model = "gpt-4o-mini"
+# Anything goes here; the built-in default (used without this line) is a
+# plain spelling and grammar fix that keeps the text's language.
 prompt_text = "Check spelling and gramma and rewrite following text on pirate speak. Be mean and pushy \n\n"

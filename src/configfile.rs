@@ -27,8 +27,11 @@ const CONFIG_FILE: &str = "config.toml";
 pub const DEFAULT_PROFILE: &str = "default";
 
 const DEFAULT_API_TYPE: &str = "OpenAI";
-const DEFAULT_PROMPT_TEXT: &str =
-    "Check spelling and gramma and rewrite following text on pirate speak. Be mean and pushy \n\n";
+/// Default prompt for clipboard text: a plain proofread in the text's own
+/// language.
+const DEFAULT_PROMPT_TEXT: &str = "Correct the spelling, grammar and punctuation of the following \
+     text. Keep its original language, meaning, tone and formatting - do not translate, summarise \
+     or add anything. Reply with the corrected text only.";
 /// Default prompt for clipboard images: make a vision model act as OCR.
 const DEFAULT_PROMPT_IMAGE: &str = "You are an OCR engine. Transcribe all text visible in the \
      image exactly as written, in its original language. Do not translate, summarise, correct, or \
@@ -1960,14 +1963,36 @@ mod tests {
     }
 
     #[test]
-    fn short_example_is_one_plain_profile_with_the_default_prompt() {
+    fn short_example_is_one_plain_profile_with_its_own_text_prompt() {
         let file = parse(EXAMPLE_SHORT).unwrap();
         assert_eq!(file.profile_names(), [DEFAULT_PROFILE]);
         let profile = &file.profiles[0];
         assert!(profile.include.is_empty() && profile.clear.is_empty());
         let cfg = default_config(EXAMPLE_SHORT);
-        assert_eq!(cfg.prompt_text, DEFAULT_PROMPT_TEXT);
+        // A deliberately playful prompt, to show prompt_text is free-form;
+        // the built-in default is a plain proofread.
+        assert!(!cfg.prompt_text.trim().is_empty());
+        assert_ne!(cfg.prompt_text, DEFAULT_PROMPT_TEXT);
         assert_eq!(cfg.prompt_image, DEFAULT_PROMPT_IMAGE);
+    }
+
+    #[test]
+    fn full_example_prompt_text_matches_default() {
+        let line = EXAMPLE_FULL
+            .lines()
+            .find_map(|l| l.strip_prefix("prompt_text = "))
+            .expect("prompt_text in config.full.toml.example");
+        assert_eq!(line, display_value(&Value::from(DEFAULT_PROMPT_TEXT)));
+    }
+
+    #[test]
+    fn readme_and_man_page_show_the_default_text_prompt() {
+        assert!(include_str!("../README.md").contains(DEFAULT_PROMPT_TEXT));
+        let man = man_page().replace('\n', " ");
+        assert!(
+            man.contains(DEFAULT_PROMPT_TEXT),
+            "man page prompt_text default"
+        );
     }
 
     #[test]
