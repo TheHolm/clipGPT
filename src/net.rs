@@ -400,7 +400,7 @@ mod tests {
         // Even to this computer, and even to the same host.
         for next in [
             "http://203.0.113.7/x?token=SECRET",
-            "http://127.0.0.1:11434/",
+            "http://localhost/",
             "http://api.example/v1",
         ] {
             let err = redirect_decision(&url(next), &from_https, &fake_local).unwrap_err();
