@@ -921,7 +921,8 @@ impl ConfigFile {
     /// The `--show-profile` report: each selected profile's settings after
     /// includes, with the profile each value came from, then which profile
     /// handles which kind. The API key is never shown, only whether one is
-    /// set.
+    /// set, and neither are the parts of `api_url` that may hold one (see
+    /// [`display_api_url`]).
     pub fn show(&self, selection: &Selection) -> String {
         let mut out = format!("# config: {}\n\n", self.path);
         for selected in &selection.profiles {
@@ -948,6 +949,7 @@ impl ConfigFile {
                         "(set, hidden)".to_string()
                     }
                     ("api_key", Some(_)) => "\"\" (no key sent)".to_string(),
+                    ("api_url", Some(s)) => display_api_url(&s.value),
                     (_, Some(s)) => display_value(&s.value),
                     ("input", None) => format!("(every kind: {})", kind_names(&InputKind::ALL)),
                     (_, None) => default_value(key)
@@ -973,6 +975,44 @@ impl ConfigFile {
             out.push_str(&format!("#   {:<6} -> {handler}\n", kind.name()));
         }
         out
+    }
+}
+
+/// `api_url`'s value for `--show-profile`, with the parts that can carry
+/// a secret removed: user name and password (`https://user:pass@host`),
+/// query (`?api-key=...`) and fragment, followed by a note naming what was
+/// hidden. A URL without them is shown exactly as written. A value that is
+/// not a valid URL is not shown at all (a normal run reports it as invalid).
+fn display_api_url(value: &Value) -> String {
+    let Some(raw) = value.as_str() else {
+        return display_value(value);
+    };
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return "(not a valid URL, hidden)".to_string();
+    };
+    let mut hidden = Vec::new();
+    if !url.username().is_empty() || url.password().is_some() {
+        // Only fails for URLs that cannot have user info at all.
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        hidden.push("user info");
+    }
+    if url.query().is_some() {
+        url.set_query(None);
+        hidden.push("query");
+    }
+    if url.fragment().is_some() {
+        url.set_fragment(None);
+        hidden.push("fragment");
+    }
+    if hidden.is_empty() {
+        display_value(value)
+    } else {
+        format!(
+            "{} ({} hidden)",
+            display_value(&Value::from(url.as_str())),
+            hidden.join(", ")
+        )
     }
 }
 
@@ -1472,6 +1512,47 @@ mod tests {
         assert!(
             out.contains("# handles:  nothing (overridden by [default])"),
             "{out}"
+        );
+    }
+
+    #[test]
+    fn show_hides_secrets_in_api_url() {
+        let file = "[default]\nmodel = \"m\"\n\
+                    api_url = \"https://user:SECRET1@llm.example/v1/chat?api-key=SECRET2#SECRET3\"\n\
+                    [plain]\nmodel = \"m\"\napi_url = \"https://llm.example/v1/chat/completions\"\n\
+                    [bad]\nmodel = \"m\"\napi_url = \"SECRET4 not a url\"\n";
+        let parsed = parse(file).unwrap();
+        let show = |name: &str| parsed.show(&parsed.select(Some(&[name.into()])).unwrap());
+        let out = show("default");
+        assert!(!out.contains("SECRET") && !out.contains("user:"), "{out}");
+        assert!(
+            out.contains(
+                "api_url          = \"https://llm.example/v1/chat\" \
+                 (user info, query, fragment hidden)  # [default]"
+            ),
+            "{out}"
+        );
+        let out = show("plain");
+        assert!(
+            out.contains(
+                "api_url          = \"https://llm.example/v1/chat/completions\"  # [plain]"
+            ),
+            "{out}"
+        );
+        let out = show("bad");
+        assert!(!out.contains("SECRET"), "{out}");
+        assert!(
+            out.contains("api_url          = (not a valid URL, hidden)"),
+            "{out}"
+        );
+        // A user name alone (some services take a token there) is hidden too.
+        assert_eq!(
+            display_api_url(&Value::from("https://tok@h.example/")),
+            "\"https://h.example/\" (user info hidden)"
+        );
+        assert_eq!(
+            display_api_url(&Value::from("https://h.example/?")),
+            "\"https://h.example/\" (query hidden)"
         );
     }
 

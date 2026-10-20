@@ -158,7 +158,8 @@ Command line options: `-c`/`--config FILE` reads that config file instead
 of searching the usual locations (no fallback if it's missing; use an
 absolute path in hotkey bindings); `-p`/`--profile NAME[,NAME...]` picks the profiles
 (see above); `--list-profiles` prints the profile names; `--show-profile`
-prints the config file used and the selected profiles' resolved settings (API key hidden) and exits,
+prints the config file used and the selected profiles' resolved settings (API key hidden, and
+`api_url` without user info, query or fragment) and exits,
 which also checks the config; `-s`/`--no-secret-check` skips the secret
 check for one run; `--timeout SECONDS` (or `--timeout=SECONDS`) sets the
 request timeout for one run, overriding `request_timeout` (0 = no limit);
