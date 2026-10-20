@@ -287,6 +287,45 @@ fn screen_input(text: &str, check_secrets: bool) -> Result<String, Block> {
     Ok(cleaned)
 }
 
+/// What to do with clipboard text, see [`decide_text`].
+#[derive(Debug)]
+enum TextDecision<'a> {
+    /// Send the cleaned text with this profile.
+    Send(&'a Config, String),
+    /// Refuse it (the caller replaces the clipboard for
+    /// [`Block::HiddenChars`] only).
+    Refuse(Block),
+    /// No selected profile handles text: report it, leave the clipboard
+    /// alone.
+    Unhandled,
+}
+
+/// Decide about clipboard text `raw` for the profile `config` handling
+/// text (`None` if none does). Blank text is [`Block::Empty`] either way,
+/// so an empty clipboard is reported as such. Otherwise text that no
+/// profile handles is [`TextDecision::Unhandled`] *before* any screening:
+/// text that will not be sent is not checked, so it can never trigger the
+/// hidden-character placeholder or a secret warning. Text that will be
+/// sent goes through [`screen_input`], with the secret check unless the
+/// profile or `-s` turns it off.
+fn decide_text<'a>(
+    raw: &str,
+    config: Option<&'a Config>,
+    no_secret_check: bool,
+) -> TextDecision<'a> {
+    let Some(config) = config else {
+        return if raw.trim().is_empty() {
+            TextDecision::Refuse(Block::Empty)
+        } else {
+            TextDecision::Unhandled
+        };
+    };
+    match screen_input(raw, config.secret_check && !no_secret_check) {
+        Ok(text) => TextDecision::Send(config, text),
+        Err(block) => TextDecision::Refuse(block),
+    }
+}
+
 /// Parse and check a profile's `api_url`, printing the warning for plain
 /// http to another computer.
 fn check_api_url(config: &Config) -> Result<Url, String> {
@@ -347,19 +386,16 @@ fn run_with<'a>(
             (config, Input::Image(image))
         }
         Clip::Text(raw_text) => {
-            // An empty clipboard is reported as empty text even when no
-            // profile takes text.
             let config = selection.handler(InputKind::Text);
             *used = config.or(*used);
-            let check_secrets = config.is_none_or(|c| c.secret_check) && !no_secret_check;
-            match (screen_input(&raw_text, check_secrets), config) {
-                (Ok(text), Some(config)) => (config, Input::Text(text)),
-                (Ok(_), None) => return unhandled(InputKind::Text),
-                (Err(Block::HiddenChars), _) => {
+            match decide_text(&raw_text, config, no_secret_check) {
+                TextDecision::Send(config, text) => (config, Input::Text(text)),
+                TextDecision::Unhandled => return unhandled(InputKind::Text),
+                TextDecision::Refuse(Block::HiddenChars) => {
                     clipboard_backend::set_text(HIDDEN_CHARS_PLACEHOLDER.to_string())?;
                     return Ok(Outcome::Blocked(Block::HiddenChars));
                 }
-                (Err(block), _) => return Ok(Outcome::Blocked(block)),
+                TextDecision::Refuse(block) => return Ok(Outcome::Blocked(block)),
             }
         }
     };
@@ -662,6 +698,55 @@ mod tests {
             Err(Block::Secret("GitHub token"))
         );
         assert_eq!(screen_input(&text, false), Ok(text));
+    }
+
+    #[test]
+    fn unhandled_text_is_never_screened() {
+        // Hidden characters or a secret, but no profile takes text: report
+        // it as unhandled (clipboard untouched), not as an attack.
+        for raw in [
+            "hello\u{E0001}\u{E0069}",
+            "x\u{FE01}\u{FE02}",
+            "key sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCD",
+            "plain text",
+        ] {
+            assert!(
+                matches!(decide_text(raw, None, false), TextDecision::Unhandled),
+                "{raw:?}"
+            );
+        }
+        assert!(matches!(
+            decide_text(" \n", None, false),
+            TextDecision::Refuse(Block::Empty)
+        ));
+    }
+
+    #[test]
+    fn handled_text_is_screened_with_profile_and_option() {
+        let config = config_with_prompt("p");
+        assert!(matches!(
+            decide_text("a\u{200B}b", Some(&config), false),
+            TextDecision::Send(c, t) if std::ptr::eq(c, &config) && t == "ab"
+        ));
+        assert!(matches!(
+            decide_text("hello\u{E0001}", Some(&config), true),
+            TextDecision::Refuse(Block::HiddenChars)
+        ));
+        let secret = "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n";
+        assert!(matches!(
+            decide_text(secret, Some(&config), false),
+            TextDecision::Refuse(Block::Secret(_))
+        ));
+        assert!(matches!(
+            decide_text(secret, Some(&config), true),
+            TextDecision::Send(..)
+        ));
+        let mut off = config.clone();
+        off.secret_check = false;
+        assert!(matches!(
+            decide_text(secret, Some(&off), false),
+            TextDecision::Send(..)
+        ));
     }
 
     #[test]
