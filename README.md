@@ -110,6 +110,7 @@ beep_tone = 880
 [default]
 include = ["beeps"]
 clear = ["input"]  # don't inherit "none" from [beeps]
+api_url = "https://api.openai.com/v1/chat/completions"
 api_key = "sk-..."
 model = "gpt-4o-mini"
 

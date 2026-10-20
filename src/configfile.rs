@@ -2023,6 +2023,53 @@ mod tests {
         include_str!("../man/clip_gpt.1").replace("\\-", "-")
     }
 
+    /// Every profile of `contents` that handles input can be selected on
+    /// its own (include-only `input = ["none"]` profiles cannot be).
+    fn assert_all_profiles_selectable(what: &str, contents: &str) {
+        let file = parse(contents).unwrap_or_else(|e| panic!("{what}: {e}"));
+        let include_only = |name: &str| {
+            contents.contains(&format!("[{name}]")) && {
+                let section = contents.split(&format!("[{name}]")).nth(1).unwrap();
+                let section = section.split("\n[").next().unwrap();
+                section.contains("input = [\"none\"]")
+            }
+        };
+        for name in file.profile_names() {
+            if include_only(name) {
+                continue;
+            }
+            if let Err(e) = file.select(Some(&[name.to_string()])) {
+                panic!("{what}: [{name}]: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn readme_and_man_page_config_examples_are_valid() {
+        let readme = include_str!("../README.md");
+        let blocks: Vec<&str> = readme
+            .split("```toml\n")
+            .skip(1)
+            .map(|b| b.split("```").next().unwrap())
+            .collect();
+        assert!(blocks.len() >= 2);
+        for (i, block) in blocks.iter().enumerate() {
+            assert_all_profiles_selectable(&format!("README block {i}"), block);
+        }
+        let man = man_page();
+        let example = man
+            .split(".Bd -literal -offset indent\n")
+            .filter(|b| b.contains("[default]"))
+            .map(|b| b.split(".Ed").next().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!example.is_empty());
+        for block in example {
+            // The block starts with the llama-server command line.
+            let toml = &block[block.find("[beeps]").unwrap()..];
+            assert_all_profiles_selectable("man page", toml);
+        }
+    }
+
     #[test]
     fn man_page_documents_every_config_key() {
         let man = man_page();
