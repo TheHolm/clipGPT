@@ -214,7 +214,7 @@ fn io_is_timeout(err: &std::io::Error) -> bool {
 pub fn timeout_error(timeout: Option<Duration>, err: &dyn std::error::Error) -> String {
     match timeout {
         Some(limit) => format!(
-            "The LLM did not answer within {} s; raise request_timeout in config.ini or use \
+            "The LLM did not answer within {} s; raise request_timeout in config.toml or use \
              --timeout SECONDS (0 = no limit)",
             limit.as_secs()
         ),

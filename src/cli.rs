@@ -9,15 +9,23 @@ pub const USAGE: &str = "\
 Usage: clip_gpt [OPTIONS]
 
 Sends the clipboard text (or, if there is none, the clipboard image) to the
-LLM configured in config.ini and replaces the clipboard with the response.
+LLM configured in config.toml and replaces the clipboard with the response.
 
 Options:
+  -p, --profile NAME[,NAME...]
+                         Use these profiles of config.toml instead of
+                         [default]. Each kind of clipboard content (text,
+                         image) goes to the last listed profile whose input
+                         accepts it
+      --list-profiles    Print the names of all profiles and exit
+      --show-profile     Print the settings of the selected profiles after
+                         includes (and where each came from), then exit
   -s, --no-secret-check  Do not refuse clipboard text that looks like an API
                          key, token, private key or URL with a password
                          (password-manager and hidden-character checks
                          still apply)
       --timeout SECONDS  Wait at most SECONDS for the LLM's answer (0 = no
-                         limit); overrides request_timeout in config.ini
+                         limit); overrides request_timeout in config.toml
   -V, --version          Print the version and exit
   -h, --help             Print this help and exit";
 
@@ -40,6 +48,9 @@ pub struct Options {
     /// `--timeout`: `None` if not given (use the config value),
     /// otherwise the timeout for this run (`Some(None)` = no limit).
     pub timeout: Option<Option<Duration>>,
+    /// `-p`/`--profile`: the profiles to use, in order; `None` means the
+    /// default profile.
+    pub profiles: Option<Vec<String>>,
 }
 
 /// What the command line asks for.
@@ -47,6 +58,10 @@ pub struct Options {
 pub enum Command {
     /// Normal run with these options.
     Run(Options),
+    /// `--show-profile`: print the selected profiles' settings and exit.
+    ShowProfile(Options),
+    /// `--list-profiles`: print the profile names and exit.
+    ListProfiles,
     /// Print [`USAGE`] and exit successfully.
     Help,
     /// Print [`version_text`] and exit successfully.
@@ -71,25 +86,74 @@ where
         }
     }
     let mut options = Options::default();
+    let (mut list, mut show) = (false, false);
     let mut args = args.iter().map(AsRef::as_ref);
     while let Some(arg) = args.next() {
         match arg {
             "-h" | "--help" => return Ok(Command::Help),
             "-V" | "--version" => return Ok(Command::Version),
             "-s" | "--no-secret-check" => options.no_secret_check = true,
+            "--list-profiles" => list = true,
+            "--show-profile" => show = true,
             "--timeout" => {
                 let value = args.next().ok_or_else(|| {
                     format!("Option '{}' needs a number of seconds\n\n{}", arg, USAGE)
                 })?;
                 options.timeout = Some(timeout_value(arg, value)?);
             }
+            "-p" | "--profile" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("Option '{}' needs a profile name\n\n{}", arg, USAGE))?;
+                set_profiles(&mut options, arg, value)?;
+            }
             other => match other.strip_prefix("--timeout=") {
                 Some(value) => options.timeout = Some(timeout_value("--timeout", value)?),
-                None => return Err(format!("Unknown option '{}'\n\n{}", other, USAGE)),
+                None => match other.strip_prefix("--profile=") {
+                    Some(value) => set_profiles(&mut options, "--profile", value)?,
+                    None => return Err(format!("Unknown option '{}'\n\n{}", other, USAGE)),
+                },
             },
         }
     }
-    Ok(Command::Run(options))
+    Ok(match (list, show) {
+        (true, true) => {
+            return Err(format!(
+                "--list-profiles and --show-profile cannot be combined\n\n{USAGE}"
+            ))
+        }
+        (true, false) => Command::ListProfiles,
+        (false, true) => Command::ShowProfile(options),
+        (false, false) => Command::Run(options),
+    })
+}
+
+/// Store the comma-separated profile list `value` of option `option`.
+/// Giving the option twice, an empty name or the same name twice is an
+/// error; whether the names exist is checked against the config file.
+fn set_profiles(options: &mut Options, option: &str, value: &str) -> Result<(), String> {
+    if options.profiles.is_some() {
+        return Err(format!(
+            "Option '{option}' given more than once; list several profiles separated by commas \
+             instead (-p a,b)\n\n{USAGE}"
+        ));
+    }
+    let mut names: Vec<String> = Vec::new();
+    for name in value.split(',') {
+        if name.is_empty() {
+            return Err(format!(
+                "Option '{option}' has an empty profile name in '{value}'\n\n{USAGE}"
+            ));
+        }
+        if names.iter().any(|n| n == name) {
+            return Err(format!(
+                "Option '{option}' lists profile '{name}' twice\n\n{USAGE}"
+            ));
+        }
+        names.push(name.to_string());
+    }
+    options.profiles = Some(names);
+    Ok(())
 }
 
 /// Parse the value of the timeout option `option` (see
@@ -114,7 +178,7 @@ mod tests {
     fn secret_check_flags() {
         let expected = Ok(Command::Run(Options {
             no_secret_check: true,
-            timeout: None,
+            ..Options::default()
         }));
         assert_eq!(parse(["-s"]), expected);
         assert_eq!(parse(["--no-secret-check"]), expected);
@@ -198,6 +262,63 @@ mod tests {
         assert!(parse(["--timeout", "-s"]).is_err());
     }
 
+    /// The profile names parsed from `args`.
+    fn profiles(args: &[&str]) -> Option<Vec<String>> {
+        run_options(args).profiles
+    }
+
+    #[test]
+    fn profile_option_forms() {
+        let ab = Some(vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(profiles(&["-p", "a,b"]), ab);
+        assert_eq!(profiles(&["--profile", "a,b"]), ab);
+        assert_eq!(profiles(&["--profile=a,b"]), ab);
+        assert_eq!(profiles(&["-p", "ocr"]), Some(vec!["ocr".to_string()]));
+        assert_eq!(profiles(&[]), None);
+        let opts = run_options(&["-s", "-p", "x", "--timeout", "5"]);
+        assert_eq!(opts.profiles, Some(vec!["x".to_string()]));
+        assert!(opts.no_secret_check);
+    }
+
+    #[test]
+    fn profile_option_errors() {
+        let err = parse(["-p"]).unwrap_err();
+        assert!(err.contains("'-p' needs a profile name") && err.contains("Usage:"));
+        for bad in ["a,,b", ",a", "a,", ""] {
+            let err = parse(["-p", bad]).unwrap_err();
+            assert!(err.contains("empty profile name"), "{bad}: {err}");
+        }
+        assert!(parse(["--profile=a,b,a"])
+            .unwrap_err()
+            .contains("'a' twice"));
+        let err = parse(["-p", "a", "-p", "b"]).unwrap_err();
+        assert!(
+            err.contains("more than once") && err.contains("-p a,b"),
+            "{err}"
+        );
+        assert!(parse(["-p", "a", "--profile=b"]).is_err());
+    }
+
+    #[test]
+    fn list_and_show_profiles() {
+        assert_eq!(parse(["--list-profiles"]), Ok(Command::ListProfiles));
+        assert_eq!(
+            parse(["--show-profile"]),
+            Ok(Command::ShowProfile(Options::default()))
+        );
+        assert_eq!(
+            parse(["--show-profile", "-p", "a,b"]),
+            Ok(Command::ShowProfile(Options {
+                profiles: Some(vec!["a".into(), "b".into()]),
+                ..Options::default()
+            }))
+        );
+        assert!(parse(["--list-profiles", "--show-profile"])
+            .unwrap_err()
+            .contains("cannot be combined"));
+        assert_eq!(parse(["--list-profiles", "--help"]), Ok(Command::Help));
+    }
+
     #[test]
     fn owner_helper_only_alone_and_hidden() {
         assert_eq!(parse([OWNER_HELPER_ARG]), Ok(Command::ClipboardOwner));
@@ -209,15 +330,7 @@ mod tests {
     #[test]
     fn man_page_documents_every_option() {
         let man = include_str!("../man/clip_gpt.1").replace("\\-", "-");
-        for flag in [
-            "-s",
-            "--no-secret-check",
-            "--timeout",
-            "-V",
-            "--version",
-            "-h",
-            "--help",
-        ] {
+        for flag in ALL_FLAGS {
             let macro_form = format!("Fl {}", &flag[1..]);
             assert!(man.contains(&macro_form), "{flag} missing from man page");
         }
@@ -228,17 +341,24 @@ mod tests {
         assert!(!man.contains("Fl T"), "-T was removed");
     }
 
+    /// Every documented option.
+    const ALL_FLAGS: [&str; 11] = [
+        "-p",
+        "--profile",
+        "--list-profiles",
+        "--show-profile",
+        "-s",
+        "--no-secret-check",
+        "--timeout",
+        "-V",
+        "--version",
+        "-h",
+        "--help",
+    ];
+
     #[test]
     fn usage_mentions_all_flags() {
-        for flag in [
-            "-s",
-            "--no-secret-check",
-            "--timeout",
-            "-V",
-            "--version",
-            "-h",
-            "--help",
-        ] {
+        for flag in ALL_FLAGS {
             assert!(USAGE.contains(flag), "{flag}");
         }
     }

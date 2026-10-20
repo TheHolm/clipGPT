@@ -43,51 +43,131 @@ To build from source instead:
    ```
    The binary will be at `target/release/clip_gpt`.
 
-2. Copy `config.ini.example` to `config.ini` and fill in `model`
+2. Copy `config.toml.example` to `config.toml` and fill in `model`
    (required) and `api_key` (if your server needs one - a local Ollama
-   doesn't). Place it at one of the locations listed under "Config file
-   location" below. If it contains an `api_key`, make it private:
-   `chmod 600 config.ini` (see "Security" below).
+   doesn't) in its `[default]` profile. Place it at one of the locations
+   listed under "Config file location" below. If it contains an `api_key`,
+   make it private: `chmod 600 config.toml` (see "Security" below).
 
 3. Run `target/release/clip_gpt`. It copies whatever text (or, failing
    that, image) is currently on the clipboard, sends it to the configured
    LLM, and replaces the clipboard contents with the response. Bind this to a hotkey/macro key using your
    OS's own tools so you don't have to run it manually every time.
 
-## Configuration parameters
+## Configuration
+
+**Since v0.6.0 the config file is `config.toml`** (TOML) with named
+profiles; the old `config.ini` is no longer read. To convert one, rename
+`[openai]` to `[default]` and quote the string values:
+
+```toml
+[default]
+api_url = "http://127.0.0.1:11434/v1/chat/completions"
+model = "llama3"
+prompt_text = "Fix spelling and grammar.\n"
+allow_redirects = false   # true/false only, no yes/no/1/0
+request_timeout = 120
+```
+
+### Profiles
+
+Every `[name]` table is a profile. Without `-p` clipGPT uses `[default]`
+(an error if there is none); `-p NAME` or a comma-separated list
+`-p a,b` picks others. Per profile:
+
+* `include = ["a", "b"]` - start from these profiles' settings. Later
+  includes override earlier ones; the profile's own keys override them all.
+  Nested includes work; unknown profiles and cycles are errors.
+* `clear = ["key", ...]` - drop these keys' included values, so the built-in
+  default applies again. `key = ""` instead sets a real empty string
+  (`api_key = ""` means no key, which also drops an included one).
+* `input = [...]` - what the profile handles: `"text"`, `"image"`, or
+  `["none"]` for a profile that only exists to be included (it can't be
+  selected with `-p` and needs no `model`). Without `input` a profile handles
+  every kind, including kinds added in later versions. `input` is passed on
+  by `include` like any other key.
+
+With several profiles, each kind of clipboard content goes to the **last**
+listed profile whose `input` accepts it, and every setting of that run
+comes from that profile. Only kinds some selected profile handles are read
+from the clipboard, so with only image profiles selected an image is used
+even if text is on the clipboard too. Content nobody accepts is refused with
+the error tone. A listed profile left with nothing to handle only prints a
+warning.
+
+```toml
+[beeps]            # shared beep settings, include-only
+input = ["none"]
+beep_tone = 880
+
+[default]
+include = ["beeps"]
+clear = ["input"]  # don't inherit "none" from [beeps]
+api_key = "sk-..."
+model = "gpt-4o-mini"
+
+[ocr]
+include = ["beeps"]
+input = ["image"]
+api_url = "http://127.0.0.1:8080/v1/chat/completions"
+model = "gemma-3-4b-it"
+```
+
+`clip_gpt -p default,ocr` sends text to OpenAI and images to the local
+server; `-p ocr,default` sends everything to `[default]` (and warns that
+`[ocr]` is unused). `clip_gpt -p default,ocr --show-profile` prints the
+resulting settings, where each came from, and which profile handles what;
+`--list-profiles` lists the profile names.
+
+The whole file is checked on every run, including unused profiles: unknown
+keys (case-sensitive), wrong value types, unknown or cyclic includes are
+errors. Error messages never quote setting values.
+
+### Keys
 
 | config file | command line | default value | type | comment |
 | --- |  --- |  --- |  --- | --- |
+| include |  |  | list of str | profiles to start from, see "Profiles" |
+| clear |  |  | list of str | included keys to reset to their built-in default |
+| input |  | every kind | list of str | `"text"`, `"image"`, or `["none"]` |
 | api_type |  | OpenAI | str | Only OpenAI is currently supported (works with Ollama too, since it exposes an OpenAI-compatible API) |
 | api_url |  | https://api.openai.com/v1/chat/completions | str | http or https only; plain http to another computer prints a warning (see "Security") |
-| api_key | -k *(not yet implemented)* |  | str | Optional. Empty or missing means no key is sent (e.g. local Ollama). If set, the config file must be mode 600 on Unix |
-| model |  |  | str | Required. Model name sent to api_url, e.g. gpt-4o-mini for OpenAI, or a local model name for Ollama |
+| api_key | -k *(not yet implemented)* |  | str | Optional. Empty or missing means no key is sent (e.g. local Ollama). If any profile sets one, the config file must be mode 600 on Unix |
+| model |  |  | str | Required in every profile that handles input. Model name sent to api_url, e.g. gpt-4o-mini for OpenAI, or a local model name for Ollama |
 | prompt_text | -t *(not yet implemented)* | "Check spelling and gramma and rewrite following text on pirate speak. Be mean and pushy \n\n" | str | prompt used if clipboard contains text (sent as the system message, the clipboard text as a separate user message) |
-| prompt_image | -i *(not yet implemented)* | an OCR prompt (see `config.ini.example`): transcribe all text in the image exactly, as Markdown, nothing else | str | prompt used if the clipboard contains an image and no text (sent as the system message, the image as a separate user message). The model must accept images, see "Images" |
+| prompt_image | -i *(not yet implemented)* | an OCR prompt (see `config.toml.example`): transcribe all text in the image exactly, as Markdown, nothing else | str | prompt used if the clipboard contains an image and no text (sent as the system message, the image as a separate user message). The model must accept images, see "Images" |
 | beep_tone |  | 1046 | int | frequency in Hz, played when response is received and pasted to clipboard, approx. C6 |
 | error_tone |   | 131  | int  | frequency in Hz, played when an error occurs or a password was found on the clipboard, approx. C3 |
 | beep_duration |  | 250 | int | duration in ms, for error and success beeps (set to 0 to disable) |
 | max_input_bytes |  | 65536 | int | largest clipboard text (UTF-8 bytes) sent to the LLM; bigger clipboards are refused |
 | max_image_bytes |  | 10485760 | int | largest clipboard image (bytes) sent to the LLM, checked as read and after conversion to PNG; bigger images are refused |
-| allow_redirects |  | false | bool | follow HTTP redirects from api_url (true/false, yes/no, 1/0, on/off) |
+| allow_redirects |  | false | bool | follow HTTP redirects from api_url |
 | secret_check | -s / --no-secret-check (turns it off) | true | bool | refuse clipboard text that looks like an API key, token, private key or URL with a password (see "Security") |
 | request_timeout | --timeout SECONDS | 30 | int | longest wait in seconds for the LLM's whole answer; 0 = no limit. Raise it for slow local models (e.g. a cold Ollama model load) |
 
-Command line options: `-s`/`--no-secret-check` skips the secret check for
-one run; `--timeout SECONDS` (or `--timeout=SECONDS`) sets the
-request timeout for one run, overriding `request_timeout` (0 = no limit);
-`-V`/`--version` prints the version; `-h`/`--help` prints usage. Any other argument is an error.
+Strings are quoted (`"..."` takes escapes such as `\n`, `'...'` doesn't);
+numbers and `true`/`false` are not.
 
-The following are planned but **not yet implemented**: the `-c`/`-k`/`-t`/`-i`
-command line options, and a `name`/`include` system for multiple named
-profiles within one config file.
+Command line options: `-p`/`--profile NAME[,NAME...]` picks the profiles
+(see above); `--list-profiles` prints the profile names; `--show-profile`
+prints the selected profiles' resolved settings (API key hidden) and exits,
+which also checks the config; `-s`/`--no-secret-check` skips the secret
+check for one run; `--timeout SECONDS` (or `--timeout=SECONDS`) sets the
+request timeout for one run, overriding `request_timeout` (0 = no limit);
+`-s` and `--timeout` apply to whichever profile handles the clipboard;
+`-V`/`--version` prints the version; `-h`/`--help` prints usage. Any other
+argument is an error.
+
+The `-c`/`-k`/`-t`/`-i` command line options are planned but **not yet
+implemented**.
 
 ## Images
 
 When the clipboard holds no text (or only white space) but an image,
 clipGPT sends the image with `prompt_image` instead. When both are offered -
 office suites and browsers often put text *and* a rendered picture of it on
-the clipboard - the text wins. A clipboard with neither plays the error
+the clipboard - the text wins, unless no selected profile takes text (see
+"Profiles"). A clipboard with neither plays the error
 tone and is left unchanged.
 
 * **Formats.** PNG and JPEG are sent as they are. WebP, GIF (first frame),
@@ -121,13 +201,13 @@ tone and is left unchanged.
 
 ### Config file location
 
-Default per-OS location of `config.ini`:
-* Linux *"~/.config/clipgpt/config.ini"*
-* MacOS *"~/Library/Application Support/clipgpt/config.ini"*
-* Windows *"%APPDATA%\clipgpt\config.ini"* - %APPDATA% typically resolves to `C:\Users\<username>\AppData\Roaming`.
+Default per-OS location of `config.toml`:
+* Linux/FreeBSD *"~/.config/clipgpt/config.toml"*
+* MacOS *"~/Library/Application Support/clipgpt/config.toml"*
+* Windows *"%APPDATA%\clipgpt\config.toml"* - %APPDATA% typically resolves to `C:\Users\<username>\AppData\Roaming`.
 
-If `config.ini` isn't found at the path above, the current working
-directory is checked too (i.e. `./config.ini`).
+If `config.toml` isn't found at the path above, the current working
+directory is checked too (i.e. `./config.toml`).
 
 ## Security
 
@@ -162,7 +242,7 @@ output back where you will paste it, so it applies these protections:
   URLs with a password (a `user:password@` part after the scheme). On a
   match the error tone plays, nothing is sent and **the clipboard is left
   untouched**; stderr names only the kind of secret. Turn it off for one run with
-  `-s`/`--no-secret-check`, or permanently with `secret_check=false`.
+  `-s`/`--no-secret-check`, or permanently with `secret_check = false`.
   Placeholder connection strings in documentation (a URL with any
   username and password, even made-up ones) match too.
 * **Prompt and clipboard are kept apart.** `prompt_text` goes in the system
@@ -185,15 +265,15 @@ output back where you will paste it, so it applies these protections:
   loopback or to one of this computer's own addresses (e.g. its LAN IP) is
   silent; to any other host it works but prints a warning on stderr, since
   the key and text travel unencrypted. Redirects are refused unless
-  `allow_redirects=true`; then each hop is checked the same way (at most 10).
+  `allow_redirects = true`; then each hop is checked the same way (at most 10).
   When a redirect changes host the API key is dropped, but a 307/308
   redirect does re-send the clipboard text to the new host.
 * **Limits.** Clipboard text over `max_input_bytes` and images over
   `max_image_bytes` are refused; responses over 1 MiB are discarded.
 * **No content in logs.** Error messages contain only HTTP status codes and
   error kinds - never the response body, which can echo your text back.
-* **Key file permissions.** On Linux/FreeBSD/macOS, if `config.ini` holds an
-  `api_key` and other users can access it (mode wider than `0600`),
+* **Key file permissions.** On Linux/FreeBSD/macOS, if `config.toml` holds
+  an `api_key` in any profile and other users can access it (mode wider than `0600`),
   clipGPT refuses to run and prints the `chmod 600` command to fix it.
   Windows is not checked (`%APPDATA%` is per-user).
 
