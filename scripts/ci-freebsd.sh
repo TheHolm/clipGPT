@@ -31,7 +31,7 @@ export CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER=clang
 export CARGO_TARGET_DIR="$REPO_ROOT/target/freebsd"
 export RUSTFLAGS="-C link-arg=--target=x86_64-unknown-freebsd15 -C link-arg=--sysroot=$SYSROOT -C link-arg=-fuse-ld=lld -C link-arg=-B$SYSROOT/usr/lib"
 
-cargo build --release --target x86_64-unknown-freebsd --manifest-path "$REPO_ROOT/Cargo.toml"
+cargo build --locked --release --target x86_64-unknown-freebsd --manifest-path "$REPO_ROOT/Cargo.toml"
 
 cp "$CARGO_TARGET_DIR/x86_64-unknown-freebsd/release/clip_gpt" "$STAGE_DIR/usr/local/bin/clip_gpt"
 chmod 755 "$STAGE_DIR/usr/local/bin/clip_gpt"
