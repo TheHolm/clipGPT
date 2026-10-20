@@ -1529,12 +1529,25 @@ mod tests {
     /// Serialises the tests using the one real X clipboard.
     static X11_CLIPBOARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Take [`X11_CLIPBOARD`], first opening one idle X connection that
+    /// stays open for the rest of the test run. Xvfb resets the server
+    /// whenever its last client disconnects, and a test connecting during
+    /// that reset fails with "connection reset by peer"; with this
+    /// connection held, the gaps between tests never leave it without
+    /// clients.
+    fn x11_lock() -> std::sync::MutexGuard<'static, ()> {
+        static KEEP_SERVER_UP: std::sync::OnceLock<Option<RustConnection>> =
+            std::sync::OnceLock::new();
+        KEEP_SERVER_UP.get_or_init(|| connect().ok().map(|(conn, _)| conn));
+        X11_CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Own the clipboard in a thread with `data`, read it back through
     /// [`get`], then take it over again so the first owner exits.
     /// Needs a real X server: run with `xvfb-run cargo test -- --ignored`.
     /// Serialised, since all tests share the one X clipboard.
     fn round_trip(data: Vec<u8>, max_bytes: usize) -> Result<Clip, Failure> {
-        let _guard = X11_CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = x11_lock();
         let owner = Owner::take(data)?;
         let server = std::thread::spawn(move || owner.serve());
         let result = get(Limits {
@@ -1578,7 +1591,7 @@ mod tests {
     /// hint (and which serves "text" as `UTF8_STRING`), and read it back
     /// through [`get`].
     fn read_with_padded_targets(padding: usize) -> Result<Clip, Failure> {
-        let _guard = X11_CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = x11_lock();
         let (conn, screen_num) = connect()?;
         let win = create_window(&conn, screen_num)?;
         let atoms = Atoms::new(&conn)?.reply()?;
@@ -1657,7 +1670,7 @@ mod tests {
     #[test]
     #[ignore = "needs an X server (DISPLAY), e.g. xvfb-run"]
     fn x11_owner_exits_despite_a_stalled_incr_transfer() {
-        let _guard = X11_CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = x11_lock();
         let owner = Owner::take(vec![b'x'; 300_000]).unwrap();
         let idle = Duration::from_millis(500);
         let server = std::thread::spawn(move || owner.serve_with_idle_timeout(idle));
