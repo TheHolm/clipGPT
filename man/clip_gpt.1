@@ -313,8 +313,12 @@ It exits as soon as anything else is copied.
 If the clipboard holds no text (or only white space) but an image,
 the image is sent instead, with
 .Cm prompt_image .
-PNG and JPEG images are sent as they are; WebP, GIF (first frame), BMP,
-Windows bitmaps and TIFF are converted to PNG first.
+PNG and JPEG images are sent without re-encoding, but with their metadata
+removed (EXIF, including GPS position, XMP, text chunks, comments and
+anything after the end of the image; colour profiles are kept); one whose
+structure cannot be read is refused.
+WebP, GIF (first frame), BMP, Windows bitmaps and TIFF are converted to
+PNG first, which drops their metadata too.
 Images to convert that are over 8192 pixels wide or high are refused.
 If the clipboard holds neither text nor an image,
 .Nm
@@ -391,7 +395,7 @@ or
 with a valid configuration.
 It exits 1 on any error, including an invalid option or configuration, a
 failed request, and refused clipboard contents (password, hidden
-characters, secret, too large, unsupported image, empty clipboard, content
+characters, secret, too large, unsupported or malformed image, empty clipboard, content
 no selected profile accepts).
 .Sh EXAMPLES
 A configuration with OpenAI for text, a local llama.cpp server with a

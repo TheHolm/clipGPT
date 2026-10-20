@@ -178,7 +178,8 @@ the clipboard - the text wins, unless no selected profile takes text (see
 "Profiles"). A clipboard with neither plays the error
 tone and is left unchanged.
 
-* **Formats.** PNG and JPEG are sent as they are. WebP, GIF (first frame),
+* **Formats.** PNG and JPEG are sent without re-encoding, but with their
+  metadata removed (see "Security"). WebP, GIF (first frame),
   BMP, Windows bitmaps (`CF_DIB`, e.g. from Print Screen) and TIFF (macOS
   screenshots) are converted to PNG first, because not every server can
   decode them (llama.cpp can't read WebP, OpenAI doesn't take BMP/TIFF).
@@ -267,6 +268,15 @@ output back where you will paste it, so it applies these protections:
   model is told to treat text in the image as data, not instructions -
   again harder, not impossible, to abuse. Password-manager markers are
   still honoured.
+* **Image metadata is removed.** PNG and JPEG keep only what is needed to
+  show the picture (colour profile, gamma, transparency, JFIF/Adobe
+  headers); EXIF (camera, time, GPS position), XMP, IPTC, text chunks,
+  comments, embedded extra images and anything after the end of the image
+  are dropped. A JPEG whose structure can't be read is refused. Other
+  formats are converted to PNG, which carries no metadata. A side effect:
+  the EXIF orientation is dropped too, so a photo whose camera only marked
+  it as rotated reaches the model unrotated; an animated PNG is sent as its
+  first frame.
 * **The response is cleaned before it is pasted.** Control characters
   (except newline and tab - this removes terminal escape sequences),
   bidirectional-override characters, zero-width characters, the BOM,

@@ -90,8 +90,8 @@ prompt_image = "You are an OCR engine. Transcribe all text visible in the image 
 
 # Largest clipboard image (in bytes) that will be sent, both as read from
 # the clipboard and after conversion to PNG (WebP, GIF, BMP and TIFF are
-# converted; PNG and JPEG are sent as they are). Bigger images are refused
-# with the error tone. Default 10485760 (10 MiB).
+# converted; PNG and JPEG only lose their metadata). Bigger images are
+# refused with the error tone. Default 10485760 (10 MiB).
 #max_image_bytes = 10485760
 
 # Follow HTTP redirects from api_url? Default false: any redirect is an
