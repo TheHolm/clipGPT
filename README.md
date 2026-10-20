@@ -235,13 +235,17 @@ output back where you will paste it, so it applies these protections:
   can't be detected.
 * **Hidden prompt injection is refused.** Clipboard text containing
   Unicode tag characters (U+E0000-U+E007F - invisible, but read by LLMs)
-  is treated as an attack: the clipboard is replaced with a notice, the
-  error tone plays, nothing is sent. This check can't be turned off. The
-  England/Scotland/Wales flag emoji use these characters and are refused
-  too.
+  or hidden variation selectors is treated as an attack: the clipboard is
+  replaced with a notice, the error tone plays, nothing is sent. This
+  check can't be turned off. Hidden variation selectors are any of
+  U+E0100-U+E01EF, and two or more of U+FE00-U+FE0F in a row ("emoji
+  smuggling" hides data that way behind one visible character); a single
+  one after a character (e.g. U+2764 U+FE0F, the red heart emoji) is
+  normal and allowed. The England/Scotland/Wales flag emoji use tag
+  characters and are refused too.
 * **Clipboard text is cleaned before it is sent**, the same way as the
-  response below (control, bidirectional-override, zero-width and BOM
-  characters removed). Always on.
+  response below (control, bidirectional-override, zero-width, BOM and
+  other invisible characters removed). Always on.
 * **Secrets are not sent.** The cleaned text is scanned for API keys and
   tokens: private keys (PEM, age), OpenAI, Anthropic, OpenRouter, Groq, xAI,
   Hugging Face, Replicate, Perplexity, AWS, Google, Azure, DigitalOcean,
@@ -265,8 +269,12 @@ output back where you will paste it, so it applies these protections:
   still honoured.
 * **The response is cleaned before it is pasted.** Control characters
   (except newline and tab - this removes terminal escape sequences),
-  bidirectional-override characters, zero-width characters, the BOM and
-  Unicode tag characters are removed; line endings become `\n`. Emoji built
+  bidirectional-override characters, zero-width characters, the BOM,
+  Unicode tag characters, hidden variation selectors and other invisible
+  format characters (soft hyphen, Hangul fillers, combining grapheme
+  joiner, Mongolian vowel separator, interlinear annotation marks and
+  similar) are removed; line endings, including U+2028/U+2029, become
+  `\n`. Emoji built
   with zero-width joiners fall apart into their parts as a side effect. The
   model can still write plausible but harmful plain text - read what you
   paste into a terminal.

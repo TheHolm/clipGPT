@@ -19,9 +19,10 @@ use imagefile::Prepared;
 /// never sent to the LLM.
 const PASSWORD_PLACEHOLDER: &str = "[clipGPT] Clipboard held a password - not sent to the LLM.";
 
-/// Put onto the clipboard instead of text carrying hidden Unicode tag
-/// characters, so the hidden payload can't be pasted on elsewhere either.
-const HIDDEN_TAGS_PLACEHOLDER: &str = "[clipGPT] Clipboard contained hidden tag characters \
+/// Put onto the clipboard instead of text carrying hidden characters
+/// (Unicode tag characters or hidden variation selectors), so the hidden
+/// payload can't be pasted on elsewhere either.
+const HIDDEN_CHARS_PLACEHOLDER: &str = "[clipGPT] Clipboard contained hidden characters \
      (likely prompt injection) - not sent to the LLM.";
 
 /// Appended to the configured prompt in the system message, so the model
@@ -106,9 +107,10 @@ enum Block {
     /// A password manager marked the contents as secret. The clipboard is
     /// replaced by [`PASSWORD_PLACEHOLDER`].
     Password,
-    /// The text contained Unicode tag characters (hidden prompt injection).
-    /// The clipboard is replaced by [`HIDDEN_TAGS_PLACEHOLDER`].
-    HiddenTags,
+    /// The text contained Unicode tag characters or hidden variation
+    /// selectors (hidden prompt injection or data). The clipboard is
+    /// replaced by [`HIDDEN_CHARS_PLACEHOLDER`].
+    HiddenChars,
     /// The text looked like it contained a secret of this kind. The
     /// clipboard is left untouched, so a deliberately copied key isn't lost.
     Secret(&'static str),
@@ -129,8 +131,9 @@ impl Block {
                 "Clipboard held a password (marked by a password manager); not sent to the LLM"
                     .to_string()
             }
-            Block::HiddenTags => "Clipboard contained hidden Unicode tag characters (likely \
-                 prompt injection); not sent to the LLM"
+            Block::HiddenChars => "Clipboard contained hidden characters (Unicode tag \
+                 characters or variation selector runs; likely prompt injection); not sent to \
+                 the LLM"
                 .to_string(),
             Block::Secret(kind) => format!(
                 "Clipboard looks like it contains a secret ({}); not sent to the LLM, clipboard \
@@ -257,15 +260,16 @@ fn fail(message: &str, tone: u32, duration: u32) -> ! {
 }
 
 /// Check and clean clipboard text before it may be sent, in this order:
-/// 1. tag characters anywhere -> [`Block::HiddenTags`] (always checked)
+/// 1. tag characters or hidden variation selectors anywhere ->
+///    [`Block::HiddenChars`] (always checked)
 /// 2. invisible/control characters are removed (always)
 /// 3. nothing but white space left -> [`Block::Empty`]
 /// 4. if `check_secrets`, the cleaned text is scanned for secrets ->
 ///    [`Block::Secret`]. Scanning the cleaned text means a key with
 ///    zero-width characters slipped into it is still caught.
 fn screen_input(text: &str, check_secrets: bool) -> Result<String, Block> {
-    if sanitize::contains_tag_chars(text) {
-        return Err(Block::HiddenTags);
+    if sanitize::contains_hidden_chars(text) {
+        return Err(Block::HiddenChars);
     }
     let cleaned = sanitize::sanitize_input(text);
     if cleaned.trim().is_empty() {
@@ -347,9 +351,9 @@ fn run_with<'a>(
             match (screen_input(&raw_text, check_secrets), config) {
                 (Ok(text), Some(config)) => (config, Input::Text(text)),
                 (Ok(_), None) => return unhandled(InputKind::Text),
-                (Err(Block::HiddenTags), _) => {
-                    clipboard_backend::set_text(HIDDEN_TAGS_PLACEHOLDER.to_string())?;
-                    return Ok(Outcome::Blocked(Block::HiddenTags));
+                (Err(Block::HiddenChars), _) => {
+                    clipboard_backend::set_text(HIDDEN_CHARS_PLACEHOLDER.to_string())?;
+                    return Ok(Outcome::Blocked(Block::HiddenChars));
                 }
                 (Err(block), _) => return Ok(Outcome::Blocked(block)),
             }
@@ -603,8 +607,21 @@ mod tests {
     #[test]
     fn screen_refuses_tag_chars_even_without_secret_check() {
         let text = "hello\u{E0001}\u{E0069}";
-        assert_eq!(screen_input(text, true), Err(Block::HiddenTags));
-        assert_eq!(screen_input(text, false), Err(Block::HiddenTags));
+        assert_eq!(screen_input(text, true), Err(Block::HiddenChars));
+        assert_eq!(screen_input(text, false), Err(Block::HiddenChars));
+    }
+
+    #[test]
+    fn screen_refuses_variation_selector_runs_but_keeps_emoji() {
+        for text in ["x\u{FE01}\u{FE02}", "x\u{E0100}"] {
+            assert_eq!(
+                screen_input(text, false),
+                Err(Block::HiddenChars),
+                "{text:?}"
+            );
+        }
+        let emoji = "I \u{2764}\u{FE0F} it";
+        assert_eq!(screen_input(emoji, true), Ok(emoji.to_string()));
     }
 
     #[test]
@@ -634,7 +651,7 @@ mod tests {
         assert!(msg.contains("GitHub token"));
         assert!(msg.contains("--no-secret-check"));
         assert!(msg.contains("secret_check = false"));
-        assert!(Block::HiddenTags.message().contains("tag characters"));
+        assert!(Block::HiddenChars.message().contains("hidden characters"));
         assert!(Block::Password.message().contains("password"));
         assert!(Block::Empty.message().contains("no text or image"));
         let msg = Block::Unhandled(InputKind::Image, "a,b".into()).message();

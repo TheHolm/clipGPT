@@ -340,15 +340,18 @@ on Wayland and X11,
 on macOS
 .Pc
 are never read or sent; the clipboard is replaced by a notice.
-Text containing invisible Unicode tag characters is refused the same way.
+Text containing invisible Unicode tag characters, or hidden variation
+selectors (any of U+E0100 to U+E01EF, or two or more of U+FE00 to U+FE0F
+in a row), is refused the same way; a single variation selector after a
+character, as in emoji, is allowed.
 Unless
 .Fl s
 or
 .Ql secret_check = false
 is used, text that looks like an API key, token, private key, JSON Web
 Token or URL with a password is refused and the clipboard left as it was.
-Control, bidirectional-override and zero-width characters are removed
-from both the text sent and the response pasted.
+Control, bidirectional-override, zero-width and other invisible format
+characters are removed from both the text sent and the response pasted.
 Text inside an image cannot be checked this way; the model is told not to
 follow instructions found in it.
 Responses over 1 MiB are discarded, and error messages never include the
