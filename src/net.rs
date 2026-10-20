@@ -11,7 +11,8 @@
 //! * responses are capped at [`MAX_RESPONSE_BYTES`]
 //! * the whole request is bounded by the configured timeout (if any); a
 //!   timeout is reported as such, with the limit and how to raise it
-//! * error messages never contain the response body
+//! * error messages never contain the response body, nor the request URL's
+//!   path or query (which may hold a key)
 
 use reqwest::blocking::Client;
 use reqwest::{redirect, Url};
@@ -185,7 +186,7 @@ pub fn read_capped(
             if io_is_timeout(&e) {
                 timeout_error(timeout, &e)
             } else {
-                format!("Failed to read response: {}", e)
+                format!("Failed to read response: {}", describe(&e))
             }
         })?;
     if body.len() > limit {
@@ -211,7 +212,7 @@ fn io_is_timeout(err: &std::io::Error) -> bool {
 /// Message for a request that timed out. With a configured limit it names
 /// the limit and how to change it; without one (`None`, so the timeout
 /// came from the network or OS) it gives the underlying error.
-pub fn timeout_error(timeout: Option<Duration>, err: &dyn std::error::Error) -> String {
+pub fn timeout_error(timeout: Option<Duration>, err: &(dyn std::error::Error + 'static)) -> String {
     match timeout {
         Some(limit) => format!(
             "The LLM did not answer within {} s; raise request_timeout in config.toml or use \
@@ -223,16 +224,36 @@ pub fn timeout_error(timeout: Option<Duration>, err: &dyn std::error::Error) -> 
 }
 
 /// Format an error with its whole `source()` chain, so the reason behind a
-/// reqwest error (e.g. a refused redirect) is visible.
-fn error_chain(err: &dyn std::error::Error) -> String {
-    let mut message = err.to_string();
+/// reqwest error (e.g. a refused redirect) is visible. Every link is
+/// formatted by [`describe`], so no request URL (whose path or query may
+/// hold a key) ends up in the message.
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = describe(err);
     let mut source = err.source();
     while let Some(inner) = source {
         message.push_str(": ");
-        message.push_str(&inner.to_string());
+        message.push_str(&describe(inner));
         source = inner.source();
     }
     message
+}
+
+/// One error's own message, without the " for url (...)" suffix reqwest
+/// adds when it knows the request URL. The URL's path and query can carry
+/// secrets (e.g. `?api-key=...`), and all other messages show only scheme,
+/// host and port. An `io::Error` wrapping a reqwest error (as body reads
+/// return) displays that error's text, so it is unwrapped first.
+fn describe(err: &(dyn std::error::Error + 'static)) -> String {
+    let message = err.to_string();
+    let reqwest_err = err.downcast_ref::<reqwest::Error>().or_else(|| {
+        err.downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref())
+            .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+    });
+    match reqwest_err.and_then(reqwest::Error::url) {
+        Some(url) => message.replace(&format!(" for url ({url})"), ""),
+        None => message,
+    }
 }
 
 /// POST `body` as JSON to `url` and return the response body as text.
@@ -252,6 +273,7 @@ pub fn post_json<T: serde::Serialize>(
         request = request.bearer_auth(key);
     }
     let response = request.send().map_err(|e| {
+        let e = e.without_url();
         if e.is_timeout() {
             timeout_error(timeout, &e)
         } else {
@@ -664,6 +686,58 @@ mod tests {
     fn build_client_both_modes() {
         assert!(build_client(false, None).is_ok());
         assert!(build_client(true, Some(Duration::from_secs(5))).is_ok());
+    }
+
+    /// A loopback URL nothing listens on, with a secret in path and query.
+    fn closed_port_url() -> Url {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        url(&format!(
+            "http://127.0.0.1:{port}/v1/SECRETPATH?api-key=SECRETKEY"
+        ))
+    }
+
+    #[test]
+    fn failed_request_error_has_no_url_path_or_query() {
+        let u = closed_port_url();
+        let client = build_client(false, None).unwrap();
+        let err = post_json(&client, &u, None, &serde_json::json!({}), None, None).unwrap_err();
+        assert!(err.starts_with("Request failed: "), "{err}");
+        assert!(!err.contains("SECRET") && !err.contains("for url"), "{err}");
+        // Without a limit the timeout message shows the cause, also
+        // without the URL.
+        let client = build_client(false, None).unwrap();
+        let e = client.post(u).send().unwrap_err();
+        assert!(e.to_string().contains("SECRETKEY"), "reqwest adds the URL");
+        let msg = timeout_error(None, &e);
+        assert!(!msg.contains("SECRET"), "{msg}");
+    }
+
+    #[test]
+    fn refused_redirect_error_has_no_target_path_or_query() {
+        let (base, handle) = serve(vec![http_response(
+            "307 Temporary Redirect",
+            "Location: ftp://203.0.113.7/SECRETPATH?token=SECRETKEY\r\n",
+            "",
+        )]);
+        let client = build_client(true, None).unwrap();
+        let err = post_json(&client, &base, None, &serde_json::json!({}), None, None).unwrap_err();
+        handle.join().unwrap();
+        assert!(err.contains("Redirect refused"), "{err}");
+        assert!(!err.contains("SECRET"), "{err}");
+    }
+
+    #[test]
+    fn body_read_error_has_no_url_path_or_query() {
+        // Headers promise 100 bytes, then the connection closes early.
+        let partial = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"choices\"".to_string();
+        let base = serve_slow(Duration::ZERO, partial, Duration::ZERO);
+        let u = base.join("v1/SECRETPATH?api-key=SECRETKEY").unwrap();
+        let client = build_client(false, None).unwrap();
+        let err = post_json(&client, &u, None, &serde_json::json!({}), None, None).unwrap_err();
+        assert!(err.starts_with("Failed to read response"), "{err}");
+        assert!(!err.contains("SECRET"), "{err}");
     }
 
     #[test]

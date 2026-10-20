@@ -352,7 +352,7 @@ from both the text sent and the response pasted.
 Text inside an image cannot be checked this way; the model is told not to
 follow instructions found in it.
 Responses over 1 MiB are discarded, and error messages never include the
-response body.
+response body, nor more of a URL than its scheme, host and port.
 .Sh ENVIRONMENT
 .Bl -tag -width Ds
 .It Ev HOME

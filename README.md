@@ -281,6 +281,8 @@ output back where you will paste it, so it applies these protections:
   `max_image_bytes` are refused; responses over 1 MiB are discarded.
 * **No content in logs.** Error messages contain only HTTP status codes and
   error kinds - never the response body, which can echo your text back.
+  URLs in messages are cut to scheme, host and port, so a key in the
+  `api_url` path or query isn't printed either.
 * **Key file permissions.** On Linux/FreeBSD/macOS, if `config.toml` holds
   an `api_key` in any profile and other users can access it (mode wider than `0600`),
   clipGPT refuses to run and prints the `chmod 600` command to fix it.
