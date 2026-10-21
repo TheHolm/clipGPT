@@ -55,6 +55,18 @@ User-facing changes:
   clipboard helper gives up on a paste that stalls for 10 seconds after
   something else was copied, instead of staying forever. The man page now
   also lists the Windows password markers and the X11 limits.
+- **Fixed: on Wayland, the response (or the password/hidden-character
+  placeholder) could vanish from the clipboard the moment clipGPT exited**
+  - right after the success beep - unless something else (a clipboard
+  manager, or another application) grabbed it first. Reproduced on a
+  pure-Wayland session (sway, no Xwayland, no clipboard manager): the
+  clipboard read back empty immediately after "Response copied to
+  clipboard!". Wayland now gets the same kind of background clipboard
+  owner X11 already had; the internal argument that starts it changed
+  from `--x11-clipboard-owner` to `--clipboard-owner=x11` /
+  `--clipboard-owner=wayland` (nothing to change in normal use - it is
+  not meant to be run directly, and now refuses to if typed into a
+  terminal by mistake).
 - Release builds: FreeBSD dependency packages are verified against the
   repository's checksums, and every build uses `--locked`, so packages
   contain exactly the audited `Cargo.lock`.
@@ -92,6 +104,27 @@ User-facing changes:
 - `clipboard_backend/x11.rs`: `MAX_TARGETS` 4096. INCR transfers record
   their last progress; after `SelectionClear` the owner polls and drops
   transfers idle for `TRANSFER_IDLE_TIMEOUT` (10 s).
+- The background-owner protocol (spawn a copy of clipGPT with a hidden
+  argument, hand it the text on stdin, read back a one-line status, leave
+  it running once it says `ok`) moved out of `x11.rs` into
+  `clipboard_backend/owner.rs`, shared with a new Wayland implementation:
+  `set_text` now starts `--clipboard-owner=wayland` instead of calling
+  wl-clipboard-rs's background `copy()` directly; the helper takes the
+  clipboard with `Options::foreground(true).prepare_copy(..)` and then
+  calls `PreparedCopy::serve()` itself, falling back to the X11 helper on
+  the same errors (`MissingProtocol`/`WaylandConnection`/
+  `SocketOpenError`) the old background-copy path did. The status line
+  gained a third case, `unavailable: <message>`, for that fallback
+  decision, distinct from a backend that was reached but failed
+  (`TakeFailure`/`HandOverResult`). `run_owner_on_stdio` refuses to start
+  if stdin is a terminal and caps how much text it reads (twice
+  `net::MAX_RESPONSE_BYTES`), used by both backends' real entry points.
+  Windows and macOS are unaffected: their clipboards hold data
+  themselves, so nothing needs to keep running. Checked on a throwaway
+  Proxmox VM (Debian 13, sway headless, pure Wayland): the response
+  survives after clipGPT exits, and the helper exits once something else
+  is copied; also checked that the X11 round trip still works end to end
+  (`xclip` under `Xvfb`) under the renamed argument.
 - `scripts/fetch-freebsd-deps.py`: each `.pkg` checked against
   `pkgsize` and `sum` (pkg's "2$" base32 BLAKE2b-512, or hex SHA-256)
   before unpacking; unknown or missing sums are errors. Docstring cleaned
