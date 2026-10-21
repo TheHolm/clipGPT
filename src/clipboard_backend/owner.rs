@@ -100,6 +100,8 @@ pub fn hand_over(mut command: Command, data: &[u8]) -> HandOverResult {
 
     let status = match rx.recv_timeout(HELPER_READY_TIMEOUT) {
         Ok(Ok(line)) => line,
+        // A real io::Error from a pipe read (as opposed to Ok(0)/EOF when
+        // the writer closes) is exceptional; not reproduced in tests.
         Ok(Err(e)) => format!("error: cannot read helper status: {e}"),
         Err(_) => {
             let _ = child.kill();
@@ -190,7 +192,17 @@ pub fn run_owner_on_stdio<O>(
     take: impl FnOnce(Vec<u8>) -> Result<O, TakeFailure>,
     serve: impl FnOnce(O) -> Result<(), String>,
 ) -> i32 {
-    if std::io::stdin().is_terminal() {
+    run_owner_on_stdio_if(std::io::stdin().is_terminal(), take, serve)
+}
+
+/// [`run_owner_on_stdio`] with the terminal check's result passed in, so
+/// both outcomes can be tested without a real terminal.
+fn run_owner_on_stdio_if<O>(
+    is_terminal: bool,
+    take: impl FnOnce(Vec<u8>) -> Result<O, TakeFailure>,
+    serve: impl FnOnce(O) -> Result<(), String>,
+) -> i32 {
+    if is_terminal {
         eprintln!(
             "This is an internal option that clipGPT runs on itself; it is not meant to be run \
              directly."
@@ -372,13 +384,45 @@ mod tests {
 
     #[test]
     fn run_owner_on_stdio_refuses_a_terminal() {
-        // Covered indirectly: stdin is not a terminal under `cargo test`
-        // (it's piped/redirected), so the normal path runs. The check
-        // itself (IsTerminal on std::io::Stdin) is a one-line call to a
-        // standard library trait; there is no fake terminal to point it
-        // at here. What run_owner does with the input is already covered
-        // by the tests above, through the lower-level run_owner directly.
+        // The terminal check itself is a one-line call to a standard
+        // library trait with no fake terminal to point it at here, so
+        // run_owner_on_stdio_if takes the result in, which lets both
+        // outcomes be tested without one.
+        let status = run_owner_on_stdio_if(
+            true,
+            |_| -> Result<(), TakeFailure> { panic!("must not be called") },
+            |()| panic!("must not be called"),
+        );
+        assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn run_owner_on_stdio_runs_the_protocol_when_not_a_terminal() {
+        // Exercises the real entry point end to end: whatever this
+        // process's stdin is (not a terminal, since the test above would
+        // otherwise fail), reading it must not hang, and take/serve must
+        // run on the real std::io::stdin()/stdout().
         assert!(!std::io::stdin().is_terminal());
+        let mut taken = false;
+        let mut served = false;
+        let status = run_owner_on_stdio_if(
+            false,
+            |data| {
+                taken = true;
+                assert!(data.is_empty(), "nothing is piped into the test binary");
+                Ok(())
+            },
+            |()| {
+                served = true;
+                Ok(())
+            },
+        );
+        assert_eq!((status, taken, served), (0, true, true));
+        // The real public entry point, which does its own IsTerminal
+        // check instead of taking one in: same outcome, since this
+        // process's stdin genuinely is not a terminal here.
+        let status = run_owner_on_stdio(Ok, |_| Ok(()));
+        assert_eq!(status, 0);
     }
 
     #[test]
@@ -426,6 +470,33 @@ mod tests {
             hand_over(fake_helper(script), b"other"),
             HandOverResult::Failed(m) if m.contains("wrong data")
         ));
+    }
+
+    #[test]
+    fn hand_over_reports_a_program_that_cannot_be_spawned() {
+        let result = hand_over(Command::new("/no/such/program-xyz"), b"x");
+        assert!(matches!(result, HandOverResult::Failed(_)));
+    }
+
+    #[test]
+    fn hand_over_reports_missing_stdio() {
+        // No .stdin(Stdio::piped())/.stdout(Stdio::piped()): hand_over
+        // cannot take() them back from the child.
+        let result = hand_over(Command::new("true"), b"x");
+        assert!(matches!(result, HandOverResult::Failed(m) if m.contains("stdin/stdout")));
+    }
+
+    #[test]
+    fn hand_over_reports_a_write_that_fails() {
+        // Closes its own stdin right away, then waits: large enough data
+        // that hand_over cannot write it all in one go before that
+        // happens, so the write itself fails (broken pipe) rather than
+        // just never being read.
+        let result = hand_over(fake_helper("exec 0<&-; echo ok"), &vec![b'x'; 4 << 20]);
+        assert!(
+            matches!(&result, HandOverResult::Failed(m) if m.contains("cannot pass text")),
+            "{result:?}"
+        );
     }
 
     #[test]
