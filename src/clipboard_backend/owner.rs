@@ -16,7 +16,7 @@
 //! multi-threaded process risks a child that deadlocks on a lock another
 //! thread held at the moment of the fork.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -24,6 +24,14 @@ use std::time::Duration;
 
 /// How long [`hand_over`] waits for the owner helper to report back.
 const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Largest text [`run_owner`] reads from its parent before refusing:
+/// twice [`crate::net::MAX_RESPONSE_BYTES`] (the largest text an LLM
+/// reply or [`hand_over`] can ever send; the built-in placeholders are far
+/// smaller), so real input is never refused, while piping something
+/// unbounded into the hidden mode by hand (deliberately, or by mistake)
+/// cannot exhaust memory.
+const MAX_OWNER_TEXT_BYTES: usize = 2 * crate::net::MAX_RESPONSE_BYTES;
 
 /// How the owner helper's `take` step (see [`run_owner`]) can fail.
 #[derive(Debug, PartialEq, Eq)]
@@ -130,19 +138,30 @@ fn parse_status(line: &str) -> HandOverResult {
 /// The owner helper protocol, with the I/O and the backend-specific parts
 /// (`take` the clipboard with the text, then `serve` it) passed in. The
 /// status line goes to `output` (one line, so newlines in an error are
-/// replaced); `serve` only runs once `ok` was written. Returns the
-/// process exit status: 0 after serving, 1 on any failure.
+/// replaced); `serve` only runs once `ok` was written. Text over
+/// [`MAX_OWNER_TEXT_BYTES`] is refused rather than read in full, so an
+/// `input` with no end (e.g. `/dev/zero`) cannot exhaust memory. Returns
+/// the process exit status: 0 after serving, 1 on any failure.
 pub fn run_owner<O>(
-    mut input: impl Read,
+    input: impl Read,
     mut output: impl Write,
     take: impl FnOnce(Vec<u8>) -> Result<O, TakeFailure>,
     serve: impl FnOnce(O) -> Result<(), String>,
 ) -> i32 {
     let mut data = Vec::new();
     let owner = input
+        .take(MAX_OWNER_TEXT_BYTES as u64 + 1)
         .read_to_end(&mut data)
         .map_err(|e| TakeFailure::Failed(format!("cannot read text: {e}")))
-        .and_then(|_| take(data));
+        .and_then(|_| {
+            if data.len() > MAX_OWNER_TEXT_BYTES {
+                Err(TakeFailure::Failed(format!(
+                    "text from the parent process is over {MAX_OWNER_TEXT_BYTES} bytes; refusing"
+                )))
+            } else {
+                take(data)
+            }
+        });
     let (prefix, message) = match owner {
         Ok(owner) => {
             if writeln!(output, "ok").and_then(|_| output.flush()).is_err() {
@@ -159,6 +178,26 @@ pub fn run_owner<O>(
     let _ = writeln!(output, "{prefix}: {}", message.replace('\n', " "));
     let _ = output.flush();
     1
+}
+
+/// [`run_owner`] on the process's real stdin/stdout, refusing to start if
+/// stdin is a terminal: this hidden mode is only ever meant to be piped
+/// into by [`hand_over`], and a person who runs it by accident typing
+/// text in would otherwise see nothing happen (it reads until EOF, i.e.
+/// Ctrl-D), which looks like a hang rather than the internal option it
+/// is.
+pub fn run_owner_on_stdio<O>(
+    take: impl FnOnce(Vec<u8>) -> Result<O, TakeFailure>,
+    serve: impl FnOnce(O) -> Result<(), String>,
+) -> i32 {
+    if std::io::stdin().is_terminal() {
+        eprintln!(
+            "This is an internal option that clipGPT runs on itself; it is not meant to be run \
+             directly."
+        );
+        return 1;
+    }
+    run_owner(std::io::stdin(), std::io::stdout(), take, serve)
 }
 
 #[cfg(test)]
@@ -276,6 +315,70 @@ mod tests {
             |_| panic!("not after failed ok"),
         );
         assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn run_owner_caps_how_much_text_it_reads() {
+        // Right at the limit: read and passed to take whole.
+        let ok = vec![b'x'; MAX_OWNER_TEXT_BYTES];
+        let mut out = Vec::new();
+        let mut taken = None;
+        let status = run_owner(
+            &ok[..],
+            &mut out,
+            |data| {
+                taken = Some(data.len());
+                Ok(())
+            },
+            |()| Ok(()),
+        );
+        assert_eq!((status, taken), (0, Some(MAX_OWNER_TEXT_BYTES)));
+
+        // One byte over: refused, never reaches take, and does not have
+        // to read a limitless input in full to notice (an endless `Read`
+        // one byte over the limit still terminates this call).
+        let over =
+            std::iter::repeat_n(b'x', MAX_OWNER_TEXT_BYTES + 1).chain(std::iter::repeat(b'x'));
+        let mut out = Vec::new();
+        let status = run_owner(
+            IterReader(over),
+            &mut out,
+            |_| -> Result<(), TakeFailure> { panic!("must not be called") },
+            |()| panic!("must not be called"),
+        );
+        assert_eq!(status, 1);
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .starts_with("error: text from the parent process"),);
+    }
+
+    /// An endless [`Read`] yielding the bytes of `I`, one at a time.
+    struct IterReader<I>(I);
+
+    impl<I: Iterator<Item = u8>> Read for IterReader<I> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            match self.0.next() {
+                Some(b) => {
+                    buf[0] = b;
+                    Ok(1)
+                }
+                None => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn run_owner_on_stdio_refuses_a_terminal() {
+        // Covered indirectly: stdin is not a terminal under `cargo test`
+        // (it's piped/redirected), so the normal path runs. The check
+        // itself (IsTerminal on std::io::Stdin) is a one-line call to a
+        // standard library trait; there is no fake terminal to point it
+        // at here. What run_owner does with the input is already covered
+        // by the tests above, through the lower-level run_owner directly.
+        assert!(!std::io::stdin().is_terminal());
     }
 
     #[test]

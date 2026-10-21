@@ -496,12 +496,10 @@ pub fn set_text(text: String) -> Result<(), Failure> {
 /// Entry point of the owner helper (clipGPT run with
 /// [`OWNER_HELPER_X11_ARG`]): read the text from stdin, take the
 /// clipboard, report `ok` or `error: <message>` on stdout (see
-/// [`owner::run_owner`]), then serve paste requests until another client
-/// takes the clipboard. Returns the process exit status.
+/// [`owner::run_owner_on_stdio`]), then serve paste requests until
+/// another client takes the clipboard. Returns the process exit status.
 pub fn serve_owner() -> i32 {
-    owner::run_owner(
-        std::io::stdin(),
-        std::io::stdout(),
+    owner::run_owner_on_stdio(
         |data| Owner::take(data).map_err(x11_take_failure),
         |owner| owner.serve().map_err(x11_failure_message),
     )

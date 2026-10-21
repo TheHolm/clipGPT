@@ -495,12 +495,9 @@ mod imp {
     pub fn serve_owner(backend: OwnerBackend) -> i32 {
         match backend {
             OwnerBackend::X11 => x11::serve_owner(),
-            OwnerBackend::Wayland => owner::run_owner(
-                std::io::stdin(),
-                std::io::stdout(),
-                wayland_owner_take,
-                |prepared| prepared.serve().map_err(|e| e.to_string()),
-            ),
+            OwnerBackend::Wayland => owner::run_owner_on_stdio(wayland_owner_take, |prepared| {
+                prepared.serve().map_err(|e| e.to_string())
+            }),
         }
     }
 }
