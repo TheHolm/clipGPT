@@ -377,13 +377,18 @@ cargo install cargo-deb
 cargo deb
 ```
 
-The X11 clipboard tests need a real X server, so `cargo test` skips them
-by default. To run them headless:
+The X11 clipboard tests, and the end-to-end ones under `tests/` that run
+the real binary against it (`xclip` round trips through a local stub LLM
+server), need a real X server, so `cargo test` skips them by default. To
+run them headless:
 
 ```
-apt install xvfb xauth
+apt install xvfb xauth xclip
 xvfb-run -a cargo test -- --ignored
 ```
+
+The `tests/cli_dispatch.rs` integration tests (`--help`, `--list-profiles`,
+`--show-profile`, ...) need no display and run with plain `cargo test`.
 
 ### Docker (build environment only)
 
