@@ -1,3 +1,11 @@
+clip-gpt (0.7.2-1) unstable; urgency=medium
+
+  * No change to this package or the program itself: this release only
+    reworks the release pipeline's own cargo audit and crate-download
+    steps. See RELEASE_NOTES.md in the source tarball.
+
+ -- TheHolm <16282750+TheHolm@users.noreply.github.com>  Wed, 21 Oct 2026 23:35:09 +0000
+
 clip-gpt (0.7.1-1) unstable; urgency=medium
 
   * Debian packaging fixes only, no functional change. See RELEASE_NOTES.md

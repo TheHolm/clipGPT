@@ -97,7 +97,13 @@ should pass before merging anything touching the macOS backend.
   `Cargo.toml` - add a new entry with every version bump
 - `.woodpecker/release.yaml` - tag-triggered CI: builds Linux `.deb`,
   Windows binaries, and FreeBSD `.pkg` artifacts and publishes a GitHub
-  release
+  release. The `audit` step's `cargo fetch --locked` also fills a crate
+  cache (`$CI_WORKSPACE/.cargo-home`) every later build step reads
+  (`CARGO_NET_OFFLINE=true` there) instead of downloading the same
+  crates again; the two Ubuntu `.deb` steps additionally share one Rust
+  toolchain install (`$CI_WORKSPACE/.rustup-ubuntu`). Both are wiped at
+  the start of the step that fills them, so every release starts from
+  nothing cached
 - `.cargo/audit.toml` - tells `cargo audit` to check for yanked crates
   from cargo's own local index cache instead of downloading each locked
   crate's entry itself (slow, prone to timing out); run `cargo fetch
