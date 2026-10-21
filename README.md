@@ -43,9 +43,10 @@ To build from source instead:
    ```
    The binary will be at `target/release/clip_gpt`.
 
-2. Copy `config.toml.example` to `config.toml` and fill in `model`
-   (required) and `api_key` (if your server needs one - a local Ollama
-   doesn't) in its `[default]` profile. `config.expanded.toml.example`
+2. Copy `config.toml.example` to `config.toml` and fill in `api_url` and
+   `model` (both required, there is no default server) and `api_key` (if
+   your server needs one - a local Ollama doesn't) in its `[default]`
+   profile. `config.expanded.toml.example`
    shows several profiles with includes, `config.full.toml.example` every
    key with its default. Place it at one of the locations
    listed under "Config file location" below. If it contains an `api_key`,
@@ -89,9 +90,9 @@ Every `[name]` table is a profile. Without `-p` clipGPT uses `[default]`
   (`api_key = ""` means no key, which also drops an included one).
 * `input = [...]` - what the profile handles: `"text"`, `"image"`, or
   `["none"]` for a profile that only exists to be included (it can't be
-  selected with `-p` and needs no `model`). Without `input` a profile handles
-  every kind, including kinds added in later versions. `input` is passed on
-  by `include` like any other key.
+  selected with `-p` and needs no `model` or `api_url`). Without `input` a
+  profile handles every kind, including kinds added in later versions.
+  `input` is passed on by `include` like any other key.
 
 With several profiles, each kind of clipboard content goes to the **last**
 listed profile whose `input` accepts it, and every setting of that run
@@ -109,6 +110,7 @@ beep_tone = 880
 [default]
 include = ["beeps"]
 clear = ["input"]  # don't inherit "none" from [beeps]
+api_url = "https://api.openai.com/v1/chat/completions"
 api_key = "sk-..."
 model = "gpt-4o-mini"
 
@@ -137,19 +139,20 @@ errors. Error messages never quote setting values.
 | clear |  |  | list of str | included keys to reset to their built-in default |
 | input |  | every kind | list of str | `"text"`, `"image"`, or `["none"]` |
 | api_type |  | OpenAI | str | Only OpenAI is currently supported (works with Ollama too, since it exposes an OpenAI-compatible API) |
-| api_url |  | https://api.openai.com/v1/chat/completions | str | http or https only; plain http to another computer prints a warning (see "Security") |
+| api_url |  |  | str | Required in every profile that handles input; no default. Chat completions endpoint, e.g. https://api.openai.com/v1/chat/completions for OpenAI. http or https only; plain http to another computer prints a warning (see "Security") |
 | api_key | -k *(not yet implemented)* |  | str | Optional. Empty or missing means no key is sent (e.g. local Ollama). If any profile sets one, the config file must be mode 600 on Unix |
 | model |  |  | str | Required in every profile that handles input. Model name sent to api_url, e.g. gpt-4o-mini for OpenAI, or a local model name for Ollama |
-| prompt_text | -t *(not yet implemented)* | "Check spelling and gramma and rewrite following text on pirate speak. Be mean and pushy \n\n" | str | prompt used if clipboard contains text (sent as the system message, the clipboard text as a separate user message) |
+| prompt_text | -t *(not yet implemented)* | "Correct the spelling, grammar and punctuation of the following text. Keep its original language, meaning, tone and formatting - do not translate, summarise or add anything. Reply with the corrected text only." | str | prompt used if clipboard contains text (sent as the system message, the clipboard text as a separate user message) |
 | prompt_image | -i *(not yet implemented)* | an OCR prompt (see `man clip_gpt`): transcribe all text in the image exactly, as Markdown, nothing else | str | prompt used if the clipboard contains an image and no text (sent as the system message, the image as a separate user message). The model must accept images, see "Images" |
 | beep_tone |  | 1046 | int | frequency in Hz, played when response is received and pasted to clipboard, approx. C6 |
 | error_tone |   | 131  | int  | frequency in Hz, played when an error occurs or a password was found on the clipboard, approx. C3 |
 | beep_duration |  | 250 | int | duration in ms, for error and success beeps (set to 0 to disable) |
 | max_input_bytes |  | 65536 | int | largest clipboard text (UTF-8 bytes) sent to the LLM; bigger clipboards are refused |
 | max_image_bytes |  | 10485760 | int | largest clipboard image (bytes) sent to the LLM, checked as read and after conversion to PNG; bigger images are refused |
-| allow_redirects |  | false | bool | follow HTTP redirects from api_url |
+| allow_redirects |  | false | bool | follow HTTP redirects from api_url (never from https to http) |
 | secret_check | -s / --no-secret-check (turns it off) | true | bool | refuse clipboard text that looks like an API key, token, private key or URL with a password (see "Security") |
-| request_timeout | --timeout SECONDS | 30 | int | longest wait in seconds for the LLM's whole answer; 0 = no limit. Raise it for slow local models (e.g. a cold Ollama model load) |
+| request_timeout | --timeout SECONDS | 30 | int | longest wait in seconds for the LLM's whole answer, at most 3600 (1 hour); 0 = no limit. Raise it for slow local models (e.g. a cold Ollama model load) |
+| request_extra_body |  |  | table | extra top-level fields for the JSON request body, e.g. `{ keep_alive = "8h" }` to keep an Ollama model loaded for 8 hours. Values keep their TOML type; dates, `model`, `messages` and `stream` are refused. Not set: nothing extra is sent. A profile's own table replaces an included one |
 
 Strings are quoted (`"..."` takes escapes such as `\n`, `'...'` doesn't);
 numbers and `true`/`false` are not.
@@ -158,8 +161,10 @@ Command line options: `-c`/`--config FILE` reads that config file instead
 of searching the usual locations (no fallback if it's missing; use an
 absolute path in hotkey bindings); `-p`/`--profile NAME[,NAME...]` picks the profiles
 (see above); `--list-profiles` prints the profile names; `--show-profile`
-prints the config file used and the selected profiles' resolved settings (API key hidden) and exits,
-which also checks the config; `-s`/`--no-secret-check` skips the secret
+prints the config file used and the selected profiles' resolved settings (API key hidden, and
+`api_url` without user info, query or fragment) and exits,
+which also checks the config, including every selected profile's
+`api_url` (a normal run only checks the one it uses); `-s`/`--no-secret-check` skips the secret
 check for one run; `--timeout SECONDS` (or `--timeout=SECONDS`) sets the
 request timeout for one run, overriding `request_timeout` (0 = no limit);
 `-s` and `--timeout` apply to whichever profile handles the clipboard;
@@ -178,7 +183,8 @@ the clipboard - the text wins, unless no selected profile takes text (see
 "Profiles"). A clipboard with neither plays the error
 tone and is left unchanged.
 
-* **Formats.** PNG and JPEG are sent as they are. WebP, GIF (first frame),
+* **Formats.** PNG and JPEG are sent without re-encoding, but with their
+  metadata removed (see "Security"). WebP, GIF (first frame),
   BMP, Windows bitmaps (`CF_DIB`, e.g. from Print Screen) and TIFF (macOS
   screenshots) are converted to PNG first, because not every server can
   decode them (llama.cpp can't read WebP, OpenAI doesn't take BMP/TIFF).
@@ -232,16 +238,23 @@ output back where you will paste it, so it applies these protections:
   or `CanIncludeInClipboardHistory` = 0; macOS
   `org.nspasteboard.ConcealedType` (1Password, KeePassXC, Bitwarden and
   others - untested, see "Releases"). A password manager that sets no marker
-  can't be detected.
+  can't be detected. On X11 the marker can only be seen in the list of
+  formats the copying program offers (`TARGETS`): a program that doesn't
+  answer that request is read anyway (as plain text, no image), and only
+  the first 4096 entries of a longer list are checked.
 * **Hidden prompt injection is refused.** Clipboard text containing
   Unicode tag characters (U+E0000-U+E007F - invisible, but read by LLMs)
-  is treated as an attack: the clipboard is replaced with a notice, the
-  error tone plays, nothing is sent. This check can't be turned off. The
-  England/Scotland/Wales flag emoji use these characters and are refused
-  too.
+  or hidden variation selectors is treated as an attack: the clipboard is
+  replaced with a notice, the error tone plays, nothing is sent. This
+  check can't be turned off. Hidden variation selectors are any of
+  U+E0100-U+E01EF, and two or more of U+FE00-U+FE0F in a row ("emoji
+  smuggling" hides data that way behind one visible character); a single
+  one after a character (e.g. U+2764 U+FE0F, the red heart emoji) is
+  normal and allowed. The England/Scotland/Wales flag emoji use tag
+  characters and are refused too.
 * **Clipboard text is cleaned before it is sent**, the same way as the
-  response below (control, bidirectional-override, zero-width and BOM
-  characters removed). Always on.
+  response below (control, bidirectional-override, zero-width, BOM and
+  other invisible characters removed). Always on.
 * **Secrets are not sent.** The cleaned text is scanned for API keys and
   tokens: private keys (PEM, age), OpenAI, Anthropic, OpenRouter, Groq, xAI,
   Hugging Face, Replicate, Perplexity, AWS, Google, Azure, DigitalOcean,
@@ -263,10 +276,23 @@ output back where you will paste it, so it applies these protections:
   model is told to treat text in the image as data, not instructions -
   again harder, not impossible, to abuse. Password-manager markers are
   still honoured.
+* **Image metadata is removed.** PNG and JPEG keep only what is needed to
+  show the picture (colour profile, gamma, transparency, JFIF/Adobe
+  headers); EXIF (camera, time, GPS position), XMP, IPTC, text chunks,
+  comments, embedded extra images and anything after the end of the image
+  are dropped. A JPEG whose structure can't be read is refused. Other
+  formats are converted to PNG, which carries no metadata. A side effect:
+  the EXIF orientation is dropped too, so a photo whose camera only marked
+  it as rotated reaches the model unrotated; an animated PNG is sent as its
+  first frame.
 * **The response is cleaned before it is pasted.** Control characters
   (except newline and tab - this removes terminal escape sequences),
-  bidirectional-override characters, zero-width characters, the BOM and
-  Unicode tag characters are removed; line endings become `\n`. Emoji built
+  bidirectional-override characters, zero-width characters, the BOM,
+  Unicode tag characters, hidden variation selectors and other invisible
+  format characters (soft hyphen, Hangul fillers, combining grapheme
+  joiner, Mongolian vowel separator, interlinear annotation marks and
+  similar) are removed; line endings, including U+2028/U+2029, become
+  `\n`. Emoji built
   with zero-width joiners fall apart into their parts as a side effect. The
   model can still write plausible but harmful plain text - read what you
   paste into a terminal.
@@ -274,13 +300,19 @@ output back where you will paste it, so it applies these protections:
   loopback or to one of this computer's own addresses (e.g. its LAN IP) is
   silent; to any other host it works but prints a warning on stderr, since
   the key and text travel unencrypted. Redirects are refused unless
-  `allow_redirects = true`; then each hop is checked the same way (at most 10).
+  `allow_redirects = true`; then each hop is checked the same way (at most
+  10), and a redirect from `https` to plain `http` is always refused, even
+  to this computer. A run checks (and warns about) only the `api_url` of
+  the profile that handles the clipboard, once its kind is known;
+  `--show-profile` checks those of all selected profiles.
   When a redirect changes host the API key is dropped, but a 307/308
   redirect does re-send the clipboard text to the new host.
 * **Limits.** Clipboard text over `max_input_bytes` and images over
   `max_image_bytes` are refused; responses over 1 MiB are discarded.
 * **No content in logs.** Error messages contain only HTTP status codes and
   error kinds - never the response body, which can echo your text back.
+  URLs in messages are cut to scheme, host and port, so a key in the
+  `api_url` path or query isn't printed either.
 * **Key file permissions.** On Linux/FreeBSD/macOS, if `config.toml` holds
   an `api_key` in any profile and other users can access it (mode wider than `0600`),
   clipGPT refuses to run and prints the `chmod 600` command to fix it.
@@ -304,11 +336,15 @@ Clipboard access is OS-specific:
       clipGPT goes through Xwayland there. GNOME keeps the Xwayland and
       Wayland clipboards in sync, so this is the same clipboard.
     * **Pure X11 sessions** work the same way.
-  * On X11 the clipboard holds no data itself: the program that copied
+  * **Neither clipboard holds data itself**: the program that copied
     something must keep running to hand it out. So after writing the
-    response, clipGPT leaves a small background copy of itself (`clip_gpt
-    --x11-clipboard-owner`) running. It exits as soon as anything else is
-    copied. Don't run that option yourself; it's internal.
+    response, clipGPT leaves a small background copy of itself running
+    (`clip_gpt --clipboard-owner=wayland` or `--clipboard-owner=x11`,
+    whichever backend set the clipboard). It exits as soon as anything
+    else is copied. On X11 that includes finishing pastes already in
+    progress; one that stalls for 10 seconds is given up. The Wayland
+    helper has no such limit yet: a stalled paste there can keep it
+    running. Don't run that option yourself; it's internal.
   * `x11rb` is maintained and pure Rust: no libxcb, and in the default
     configuration used here it is compiled with `forbid(unsafe_code)`. It
     is unrelated to the `clipboard`/`x11-clipboard`
@@ -341,13 +377,18 @@ cargo install cargo-deb
 cargo deb
 ```
 
-The X11 clipboard tests need a real X server, so `cargo test` skips them
-by default. To run them headless:
+The X11 clipboard tests, and the end-to-end ones under `tests/` that run
+the real binary against it (`xclip` round trips through a local stub LLM
+server), need a real X server, so `cargo test` skips them by default. To
+run them headless:
 
 ```
-apt install xvfb xauth
+apt install xvfb xauth xclip
 xvfb-run -a cargo test -- --ignored
 ```
+
+The `tests/cli_dispatch.rs` integration tests (`--help`, `--list-profiles`,
+`--show-profile`, ...) need no display and run with plain `cargo test`.
 
 ### Docker (build environment only)
 

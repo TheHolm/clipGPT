@@ -51,7 +51,8 @@ clear = ["input"]
 # API too).
 api_type = "OpenAI"
 
-# OpenAI's real endpoint, or point this at a local Ollama server, e.g.:
+# Required in every profile that handles input (here or via include); there
+# is no default. OpenAI's endpoint, or point this at a local Ollama server, e.g.:
 # api_url = "http://127.0.0.1:11434/v1/chat/completions"
 # Only http and https are accepted. Plain http to anything other than this
 # computer (loopback or one of its own addresses) works, but prints a
@@ -74,7 +75,7 @@ model = "gpt-4o-mini"
 # the clipboard text is sent separately as the user message. "\n" is a
 # newline in "double-quoted" strings; 'single-quoted' strings take no
 # escapes.
-prompt_text = "Check spelling and gramma and rewrite following text on pirate speak. Be mean and pushy \n\n"
+prompt_text = "Correct the spelling, grammar and punctuation of the following text. Keep its original language, meaning, tone and formatting - do not translate, summarise or add anything. Reply with the corrected text only."
 
 # Prompt used when the clipboard contains an image (and no text). Sent as
 # the system message; the image is sent separately as the user message.
@@ -90,12 +91,13 @@ prompt_image = "You are an OCR engine. Transcribe all text visible in the image 
 
 # Largest clipboard image (in bytes) that will be sent, both as read from
 # the clipboard and after conversion to PNG (WebP, GIF, BMP and TIFF are
-# converted; PNG and JPEG are sent as they are). Bigger images are refused
-# with the error tone. Default 10485760 (10 MiB).
+# converted; PNG and JPEG only lose their metadata). Bigger images are
+# refused with the error tone. Default 10485760 (10 MiB).
 #max_image_bytes = 10485760
 
 # Follow HTTP redirects from api_url? Default false: any redirect is an
-# error. When true, up to 10 hops are followed, each checked like api_url.
+# error. When true, up to 10 hops are followed, each checked like api_url;
+# a redirect from https to plain http is always refused.
 # true or false, without quotes.
 #allow_redirects = false
 
@@ -105,10 +107,21 @@ prompt_image = "You are an OCR engine. Transcribe all text visible in the image 
 #secret_check = true
 
 # Longest wait, in whole seconds, for the LLM's answer (from sending the
-# request to the end of the response). 0 = no limit. Default 30. Raise it
+# request to the end of the response), at most 3600 (1 hour). 0 = no
+# limit. Default 30. Raise it
 # for slow local models - loading an Ollama model cold can take longer. The
 # --timeout SECONDS command line option overrides it for one run.
 #request_timeout = 30
+
+# Extra top-level fields for the JSON request body, as a TOML table: for
+# server options clipGPT has no key of its own for. Values keep their TOML
+# type (string, number, true/false, list, table); dates are refused, and so
+# are model, messages and stream, which clipGPT sets itself. Not set by
+# default: nothing extra is sent. A profile's own table replaces an
+# included one as a whole. Example for Ollama, which keeps the model
+# loaded for 8 hours after a request, so the next one doesn't wait for it
+# to load (Ollama's own default is 5 minutes):
+#request_extra_body = { keep_alive = "8h" }
 
 # A second profile for images only, using a local vision model. With
 # -p default,ocr clipboard text goes to [default] and images go here.

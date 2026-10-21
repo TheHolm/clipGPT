@@ -167,10 +167,11 @@ pub fn set_text(text: String) -> Result<(), String> {
     imp::set_text(text)
 }
 
-/// Run as the background X11 clipboard owner (the hidden
-/// [`crate::cli::OWNER_HELPER_ARG`] mode). Returns the exit status.
-pub fn serve_owner() -> i32 {
-    imp::serve_owner()
+/// Run as the background clipboard owner (the hidden
+/// `--clipboard-owner=...` mode; see [`crate::cli::OwnerBackend`]).
+/// Returns the process exit status.
+pub fn serve_owner(backend: crate::cli::OwnerBackend) -> i32 {
+    imp::serve_owner(backend)
 }
 
 /// True if any of the offered Wayland MIME types or X11 targets is the
@@ -236,14 +237,16 @@ fn check_text_size(text: String, max_bytes: usize) -> Result<String, String> {
     }
 }
 
-/// Exit status (and message) for the owner helper mode on platforms
-/// without an X11 clipboard.
+/// Error for the hidden `--clipboard-owner=...` mode on a platform
+/// without a background clipboard owner helper.
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 fn no_owner_helper() -> i32 {
-    eprintln!("The X11 clipboard owner helper is only available on Linux/FreeBSD");
+    eprintln!("The clipboard owner helper is only available on Linux/FreeBSD");
     2
 }
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+mod owner;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod x11;
 
@@ -283,10 +286,13 @@ fn display_is_set(display: Option<std::ffi::OsString>) -> bool {
 mod imp {
     use super::{
         bytes_to_text, choose, choose_image_type, display_is_set, image_too_large, marks_password,
-        too_large, with_x11_fallback, x11, Clip, ClipImage, Limits,
+        owner, too_large, with_x11_fallback, x11, Clip, ClipImage, Limits,
     };
+    use crate::cli::{OwnerBackend, OWNER_HELPER_WAYLAND_ARG};
     use std::io::Read;
-    use wl_clipboard_rs::copy::{Error as CopyError, MimeType as CopyMimeType, Options, Source};
+    use wl_clipboard_rs::copy::{
+        Error as CopyError, MimeType as CopyMimeType, Options, PreparedCopy, Source,
+    };
     use wl_clipboard_rs::paste::{
         get_contents, get_mime_types, ClipboardType, Error as PasteError, MimeType, Seat,
     };
@@ -429,32 +435,70 @@ mod imp {
         read_bytes_capped(source, max_bytes, too_large).and_then(|b| bytes_to_text(b, max_bytes))
     }
 
-    /// Offer `text` as the new clipboard contents via Wayland, falling back
-    /// to X11 when Wayland clipboard access is unavailable.
+    /// Offer `text` as the new clipboard contents: start the background
+    /// owner helper for Wayland ([`OWNER_HELPER_WAYLAND_ARG`]), falling
+    /// back to the X11 one when Wayland clipboard access is unavailable
+    /// (see [`wayland_owner_take`]).
     pub fn set_text(text: String) -> Result<(), String> {
-        let source = Source::Bytes(text.clone().into_bytes().into());
-        let wayland = Options::new().copy(source, CopyMimeType::Autodetect);
-        finish_set(wayland, have_display(), || x11::set_text(text))
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => {
+                return Err(format!(
+                    "Failed to set clipboard content: cannot find own executable: {e}"
+                ))
+            }
+        };
+        let command = owner::helper_command(exe, OWNER_HELPER_WAYLAND_ARG);
+        let result = owner::hand_over(command, text.as_bytes());
+        finish_set(result, have_display(), || x11::set_text(text))
     }
 
     /// Copy-side counterpart of [`finish_get`].
     pub(super) fn finish_set(
-        wayland: Result<(), CopyError>,
+        wayland: owner::HandOverResult,
         display_set: bool,
         x11_op: impl FnOnce() -> Result<(), x11::Failure>,
     ) -> Result<(), String> {
         match wayland {
-            Ok(()) => Ok(()),
-            Err(err) if copy_unavailable(&err) => {
-                with_x11_fallback("set", err.to_string(), display_set, x11_op)
+            owner::HandOverResult::Ok => Ok(()),
+            owner::HandOverResult::Unavailable(err) => {
+                with_x11_fallback("set", err, display_set, x11_op)
             }
-            Err(err) => Err(format!("Failed to set clipboard content: {err}")),
+            owner::HandOverResult::Failed(err) => {
+                Err(format!("Failed to set clipboard content: {err}"))
+            }
         }
     }
 
-    /// Serve the X11 clipboard as the background owner helper.
-    pub fn serve_owner() -> i32 {
-        x11::serve_owner()
+    /// The Wayland owner helper's `take` step: take the clipboard in
+    /// foreground mode (so [`PreparedCopy::serve`] can be called
+    /// afterwards), reporting [`owner::TakeFailure::Unavailable`] for the
+    /// same errors [`copy_unavailable`] classifies as such.
+    fn wayland_owner_take(data: Vec<u8>) -> Result<PreparedCopy, owner::TakeFailure> {
+        let text = String::from_utf8(data)
+            .map_err(|e| owner::TakeFailure::Failed(format!("text is not valid UTF-8: {e}")))?;
+        let mut options = Options::new();
+        options.foreground(true);
+        let source = Source::Bytes(text.into_bytes().into());
+        options
+            .prepare_copy(source, CopyMimeType::Autodetect)
+            .map_err(|err| {
+                if copy_unavailable(&err) {
+                    owner::TakeFailure::Unavailable(err.to_string())
+                } else {
+                    owner::TakeFailure::Failed(err.to_string())
+                }
+            })
+    }
+
+    /// Serve the clipboard as the background owner helper for `backend`.
+    pub fn serve_owner(backend: OwnerBackend) -> i32 {
+        match backend {
+            OwnerBackend::X11 => x11::serve_owner(),
+            OwnerBackend::Wayland => owner::run_owner_on_stdio(wayland_owner_take, |prepared| {
+                prepared.serve().map_err(|e| e.to_string())
+            }),
+        }
     }
 }
 
@@ -564,8 +608,9 @@ mod imp {
             .map_err(|e| format!("Failed to set clipboard content: {e}"))
     }
 
-    /// The X11 owner helper does not exist on Windows.
-    pub fn serve_owner() -> i32 {
+    /// The owner helper does not exist on Windows (the clipboard holds
+    /// data itself, so nothing needs to keep running to serve it).
+    pub fn serve_owner(_backend: crate::cli::OwnerBackend) -> i32 {
         super::no_owner_helper()
     }
 }
@@ -650,8 +695,9 @@ mod imp {
         }
     }
 
-    /// The X11 owner helper does not exist on macOS.
-    pub fn serve_owner() -> i32 {
+    /// The owner helper does not exist on macOS (the clipboard holds
+    /// data itself, so nothing needs to keep running to serve it).
+    pub fn serve_owner(_backend: crate::cli::OwnerBackend) -> i32 {
         super::no_owner_helper()
     }
 }
@@ -805,30 +851,34 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
     fn finish_set_outcomes() {
-        use wl_clipboard_rs::copy::Error;
         let never = || -> Result<(), x11::Failure> { panic!("no fallback expected") };
-        assert_eq!(imp::finish_set(Ok(()), true, never), Ok(()));
         assert_eq!(
-            imp::finish_set(Err(Error::NoSeats), true, never),
-            Err("Failed to set clipboard content: There are no seats".into())
+            imp::finish_set(owner::HandOverResult::Ok, true, never),
+            Ok(())
         );
-        let gnome = Error::MissingProtocol {
-            name: "ext-data-control",
-            version: 1,
-        };
-        assert_eq!(imp::finish_set(Err(gnome), true, || Ok(())), Ok(()));
-        let gnome = Error::MissingProtocol {
-            name: "ext-data-control",
-            version: 1,
-        };
-        let err = imp::finish_set(Err(gnome), true, || {
-            Err(x11::Failure::Connect("refused".into()))
-        })
+        assert_eq!(
+            imp::finish_set(
+                owner::HandOverResult::Failed("no seats".into()),
+                true,
+                never
+            ),
+            Err("Failed to set clipboard content: no seats".into())
+        );
+        assert_eq!(
+            imp::finish_set(
+                owner::HandOverResult::Unavailable("no protocol".into()),
+                true,
+                || Ok(())
+            ),
+            Ok(())
+        );
+        let err = imp::finish_set(
+            owner::HandOverResult::Unavailable("no protocol".into()),
+            true,
+            || Err(x11::Failure::Connect("refused".into())),
+        )
         .unwrap_err();
-        assert!(
-            err.contains("Wayland: A required Wayland protocol"),
-            "{err}"
-        );
+        assert!(err.contains("Wayland: no protocol"), "{err}");
         assert!(err.ends_with("X11: refused"), "{err}");
     }
 

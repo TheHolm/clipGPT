@@ -3,6 +3,140 @@
 This file lists user-facing changes for each tagged release. See `AGENTS.md`
 for the versioning and tagging convention.
 
+## v0.7.0 - Security hardening, request_extra_body, api_url required
+
+**Breaking changes:**
+
+- **`api_url` is now required** in every profile that handles input (set
+  there or included), like `model`. There is no default server any more:
+  a profile without `api_url` used to send the clipboard to OpenAI, now it
+  is an error naming the profile. Add
+  `api_url = "https://api.openai.com/v1/chat/completions"` to keep using
+  OpenAI.
+- **`keep_alive: "8h"` is no longer sent** with every request. To keep it
+  for an Ollama server, add `request_extra_body = { keep_alive = "8h" }`
+  to that profile.
+- **New default `prompt_text`**: a plain spelling, grammar and punctuation
+  fix that keeps the text's language, meaning, tone and formatting. The
+  old default rewrote text "in pirate speak"; the short example config
+  still does, on purpose.
+- `request_timeout` and `--timeout` are at most 3600 (1 hour); 0 still
+  means no limit.
+- Redirects from `https` to plain `http` are refused, even with
+  `allow_redirects = true`.
+- Clipboard text with hidden variation selectors (any of U+E0100-U+E01EF,
+  or two or more of U+FE00-U+FE0F in a row) is refused like tag
+  characters. A single selector after a character, as in emoji, is fine.
+- PNG and JPEG images whose structure can't be read are refused instead
+  of being sent as they are.
+
+User-facing changes:
+
+- **New: `request_extra_body`**, a table of extra top-level fields for the
+  JSON request body, for server options without a key of their own (e.g.
+  Ollama's `keep_alive` or `options`). Not set by default.
+- **Image metadata is removed** before sending: EXIF (camera, time, GPS
+  position), XMP, IPTC, text chunks, comments, embedded extra images and
+  anything after the end of the image. Colour profiles are kept. The EXIF
+  orientation goes too, and an animated PNG is sent as its first frame.
+- **More invisible characters are removed** from the text sent and the
+  response pasted (soft hyphen, Hangul fillers, combining grapheme joiner,
+  Mongolian vowel separator, interlinear annotation marks and others);
+  line and paragraph separators U+2028/U+2029 become newlines.
+- **Error messages no longer show the request URL's path or query**, where
+  a key may be (reqwest added the full URL to its messages).
+- **`--show-profile` hides secrets in `api_url`** (user name, password,
+  query, fragment) and now checks the `api_url` of every selected profile,
+  failing on an invalid one. A normal run only checks (and warns about)
+  the URL of the profile actually used.
+- The plain-http warning only mentions the API key when one is sent.
+- **X11:** the password-manager marker is found among up to 4096 offered
+  formats (was 256, which a padded list could get past). The background
+  clipboard helper gives up on a paste that stalls for 10 seconds after
+  something else was copied, instead of staying forever. The man page now
+  also lists the Windows password markers and the X11 limits.
+- **Fixed: on Wayland, the response (or the password/hidden-character
+  placeholder) could vanish from the clipboard the moment clipGPT exited**
+  - right after the success beep - unless something else (a clipboard
+  manager, or another application) grabbed it first. Reproduced on a
+  pure-Wayland session (sway, no Xwayland, no clipboard manager): the
+  clipboard read back empty immediately after "Response copied to
+  clipboard!". Wayland now gets the same kind of background clipboard
+  owner X11 already had; the internal argument that starts it changed
+  from `--x11-clipboard-owner` to `--clipboard-owner=x11` /
+  `--clipboard-owner=wayland` (nothing to change in normal use - it is
+  not meant to be run directly, and now refuses to if typed into a
+  terminal by mistake).
+- Release builds: FreeBSD dependency packages are verified against the
+  repository's checksums, and every build uses `--locked`, so packages
+  contain exactly the audited `Cargo.lock`.
+
+### Details
+
+- `net.rs`: `error_chain`/`describe` strip reqwest's " for url (...)"
+  suffix (also inside `io::Error`s from body reads); `post_json` calls
+  `without_url()`. `redirect_decision` takes the previous URLs and refuses
+  an https -> non-https hop; the key is named in a hop's warning only if
+  the origin is unchanged (reqwest drops `Authorization` otherwise).
+  `check_url`/`insecure_warning`/`build_client` take whether a key is
+  sent.
+- `sanitize.rs`: `is_invisible_format` strip list; `visible_chars` flags
+  hidden variation selectors (skipping characters stripped anyway, so a
+  run split by zero-width characters still counts); `contains_tag_chars`
+  became `contains_hidden_chars`. `main.rs`: `Block::HiddenTags` ->
+  `Block::HiddenChars`, placeholder text "hidden characters".
+- `imagefile.rs`: byte-level `strip_png` (keeps critical chunks and tRNS,
+  gAMA, cHRM, sRGB, iCCP, sBIT, pHYs, cICP, bKGD; stops at IEND) and
+  `strip_jpeg` (keeps APP0, APP2 ICC_PROFILE, APP14 Adobe, tables, frame
+  and scan data, also between progressive scans; stops at EOI). No new
+  dependency, no re-encoding; checked against ImageMagick baseline,
+  progressive and CMYK JPEGs (pixel-identical).
+- `configfile.rs`: `DEFAULT_API_URL` removed, `model` and `api_url` share
+  a `required` check. `request_extra_body` (`KeyType::JsonTable`,
+  `toml_to_json`; dates, nan/inf and the top-level keys model, messages,
+  stream refused); `display_value` prints tables and floats.
+  `MAX_REQUEST_TIMEOUT_SECS` = 3600. `display_api_url` for
+  `--show-profile`. `Selection::handlers` yields (name, config).
+- `main.rs`: `OpenAIRequest` flattens `request_extra_body`, no
+  `keep_alive` field. `decide_text` returns Unhandled before any
+  screening when no profile handles text. `run_with` checks only the used
+  profile's `api_url`; `verify_api_urls` checks all for `--show-profile`.
+- `clipboard_backend/x11.rs`: `MAX_TARGETS` 4096. INCR transfers record
+  their last progress; after `SelectionClear` the owner polls and drops
+  transfers idle for `TRANSFER_IDLE_TIMEOUT` (10 s).
+- The background-owner protocol (spawn a copy of clipGPT with a hidden
+  argument, hand it the text on stdin, read back a one-line status, leave
+  it running once it says `ok`) moved out of `x11.rs` into
+  `clipboard_backend/owner.rs`, shared with a new Wayland implementation:
+  `set_text` now starts `--clipboard-owner=wayland` instead of calling
+  wl-clipboard-rs's background `copy()` directly; the helper takes the
+  clipboard with `Options::foreground(true).prepare_copy(..)` and then
+  calls `PreparedCopy::serve()` itself, falling back to the X11 helper on
+  the same errors (`MissingProtocol`/`WaylandConnection`/
+  `SocketOpenError`) the old background-copy path did. The status line
+  gained a third case, `unavailable: <message>`, for that fallback
+  decision, distinct from a backend that was reached but failed
+  (`TakeFailure`/`HandOverResult`). `run_owner_on_stdio` refuses to start
+  if stdin is a terminal and caps how much text it reads (twice
+  `net::MAX_RESPONSE_BYTES`), used by both backends' real entry points.
+  Windows and macOS are unaffected: their clipboards hold data
+  themselves, so nothing needs to keep running. Checked on a throwaway
+  Proxmox VM (Debian 13, sway headless, pure Wayland): the response
+  survives after clipGPT exits, and the helper exits once something else
+  is copied; also checked that the X11 round trip still works end to end
+  (`xclip` under `Xvfb`) under the renamed argument.
+- `scripts/fetch-freebsd-deps.py`: each `.pkg` checked against
+  `pkgsize` and `sum` (pkg's "2$" base32 BLAKE2b-512, or hex SHA-256)
+  before unpacking; unknown or missing sums are errors. Docstring cleaned
+  of references to other projects; User-Agent `clipgpt-ci`.
+- `.woodpecker/release.yaml`, `scripts/ci-freebsd.sh`: `--locked` on all
+  builds; header lists every download and how it is verified (llvm-mingw
+  is only protected by HTTPS - no checksum is published).
+- Docs: README, man page and examples updated throughout; README and man
+  page config examples set `api_url`, and a new test parses them.
+- Tests: 244 unit tests plus 5 X11 tests under `xvfb-run` (password
+  marker behind 1000 padding entries, stalled INCR paste).
+
 ## v0.6.0 - Config profiles (config.toml), routing by clipboard content, -c
 
 **Breaking change: `config.ini` is no longer read.** The configuration is

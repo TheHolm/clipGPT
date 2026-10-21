@@ -83,9 +83,13 @@ selected profiles (the default one, or those given with
 after includes, each with the profile it came from or
 .Ql built-in default ,
 and which profile handles which kind of content, then exit.
-The API key is only shown as set or not.
-The whole file is checked as for a normal run, so this also tests a
-configuration.
+The API key is only shown as set or not, and
+.Cm api_url
+without user name, password, query or fragment, which may hold a key.
+The whole file is checked as for a normal run, and so is the
+.Cm api_url
+of every selected profile that handles input (a normal run only checks
+the one it uses), so this also tests a configuration.
 .It Fl s , Fl \-no\-secret\-check
 Do not refuse clipboard text that looks like an API key, token, private
 key or URL with a password, for this run.
@@ -93,7 +97,7 @@ The password-manager and hidden-character checks still apply.
 .It Fl \-timeout Ar seconds , Fl \-timeout Ns = Ns Ar seconds
 Wait at most
 .Ar seconds
-for the LLM's whole answer;
+for the LLM's whole answer, at most 3600 (1 hour);
 .Ar 0
 means no limit.
 Overrides
@@ -111,7 +115,7 @@ and
 .Fl \-timeout
 apply to whichever profile handles the clipboard.
 The argument
-.Fl \-x11\-clipboard\-owner
+.Fl \-clipboard\-owner Ns = Ns Ar backend
 is internal (see
 .Sx CLIPBOARD )
 and must not be used directly.
@@ -183,7 +187,9 @@ or
 .Ql [\(dqnone\(dq]
 for a profile that handles nothing and only exists to be included by
 others (such a profile cannot be selected, and needs no
-.Cm model ) .
+.Cm model
+or
+.Cm api_url ) .
 Without
 .Cm input
 a profile handles every kind, including kinds added in later versions.
@@ -201,8 +207,11 @@ The model name, e.g.\&
 .Ql gpt-4o-mini
 for OpenAI or a local model name for Ollama.
 .It Cm api_url
-Chat completions endpoint; default
-.Ql https://api.openai.com/v1/chat/completions .
+Required in every profile that handles input (set there or included);
+there is no default, so requests only go to a server that was chosen.
+The chat completions endpoint, e.g.\&
+.Ql https://api.openai.com/v1/chat/completions
+for OpenAI.
 Only
 .Ql http
 and
@@ -221,6 +230,13 @@ Only
 .It Cm prompt_text
 Prompt sent as the system message; the clipboard text is sent separately
 as the user message.
+The default is a plain proofread in the text's own language:
+.Bd -filled -offset indent
+Correct the spelling, grammar and punctuation of the following text.
+Keep its original language, meaning, tone and formatting - do not
+translate, summarise or add anything.
+Reply with the corrected text only.
+.Ed
 .It Cm prompt_image
 Prompt sent as the system message when the clipboard holds an image and
 no text; the image is sent separately as the user message.
@@ -247,12 +263,26 @@ Follow HTTP redirects from
 each hop checked like
 .Cm api_url
 itself, at most 10; default false.
+A redirect from https to plain http is always refused.
 .It Cm secret_check
 Refuse clipboard text that looks like a secret; default true.
 .It Cm request_timeout
 Longest wait in whole seconds for the LLM's answer, from sending the
-request to the end of the response; default 30, 0 means no limit.
+request to the end of the response; default 30, at most 3600 (1 hour),
+0 means no limit.
 Raise it for slow local models.
+.It Cm request_extra_body
+A table of extra top-level fields for the JSON request body, for server
+options without a key of their own, e.g.\&
+.Ql request_extra_body = { keep_alive = \(dq8h\(dq }
+to keep an Ollama model loaded for 8 hours.
+Values keep their TOML type; dates and times are refused, and so are
+.Ql model ,
+.Ql messages
+and
+.Ql stream .
+A profile's own table replaces an included one as a whole.
+Not set by default: nothing extra is sent.
 .El
 .Sh PROFILES
 Without
@@ -303,18 +333,30 @@ Otherwise, if
 is set, the X11 clipboard is used: on GNOME through Xwayland, which keeps
 it in sync with the Wayland clipboard, and in plain X11 sessions.
 .Pp
-An X11 clipboard is served by the program that set it, so after writing
-the response
+Neither clipboard holds data itself, only the name of the client that
+set it, which must keep running to answer paste requests.
+After writing the response
 .Nm
-leaves a copy of itself running in the background as
-.Ql clip_gpt \-\-x11\-clipboard\-owner .
+therefore leaves a copy of itself running in the background, as
+.Ql clip_gpt \-\-clipboard\-owner=wayland
+or
+.Ql clip_gpt \-\-clipboard\-owner=x11 ,
+matching whichever backend set the clipboard.
 It exits as soon as anything else is copied.
+On X11 that includes finishing pastes already in progress; one that
+stalls for 10 seconds is given up.
+The Wayland helper has no such limit yet: a stalled paste there can
+keep it running.
 .Sh IMAGES
 If the clipboard holds no text (or only white space) but an image,
 the image is sent instead, with
 .Cm prompt_image .
-PNG and JPEG images are sent as they are; WebP, GIF (first frame), BMP,
-Windows bitmaps and TIFF are converted to PNG first.
+PNG and JPEG images are sent without re-encoding, but with their metadata
+removed (EXIF, including GPS position, XMP, text chunks, comments and
+anything after the end of the image; colour profiles are kept); one whose
+structure cannot be read is refused.
+WebP, GIF (first frame), BMP, Windows bitmaps and TIFF are converted to
+PNG first, which drops their metadata too.
 Images to convert that are over 8192 pixels wide or high are refused.
 If the clipboard holds neither text nor an image,
 .Nm
@@ -335,24 +377,36 @@ is then not based on it.
 Clipboard contents marked as secret by a password manager
 .Po
 .Ql x\-kde\-passwordManagerHint
-on Wayland and X11,
+on Wayland and X11;
+.Ql ExcludeClipboardContentFromMonitorProcessing ,
+.Ql Clipboard Viewer Ignore
+or
+.Ql CanIncludeInClipboardHistory
+= 0 on Windows;
 .Ql org.nspasteboard.ConcealedType
 on macOS
 .Pc
 are never read or sent; the clipboard is replaced by a notice.
-Text containing invisible Unicode tag characters is refused the same way.
+On X11 the marker is looked for in the owner's list of formats
+.Pq Dv TARGETS :
+an owner that does not answer that request is read anyway (as text
+only), and only the first 4096 entries of a longer list are checked.
+Text containing invisible Unicode tag characters, or hidden variation
+selectors (any of U+E0100 to U+E01EF, or two or more of U+FE00 to U+FE0F
+in a row), is refused the same way; a single variation selector after a
+character, as in emoji, is allowed.
 Unless
 .Fl s
 or
 .Ql secret_check = false
 is used, text that looks like an API key, token, private key, JSON Web
 Token or URL with a password is refused and the clipboard left as it was.
-Control, bidirectional-override and zero-width characters are removed
-from both the text sent and the response pasted.
+Control, bidirectional-override, zero-width and other invisible format
+characters are removed from both the text sent and the response pasted.
 Text inside an image cannot be checked this way; the model is told not to
 follow instructions found in it.
 Responses over 1 MiB are discarded, and error messages never include the
-response body.
+response body, nor more of a URL than its scheme, host and port.
 .Sh ENVIRONMENT
 .Bl -tag -width Ds
 .It Ev HOME
@@ -388,7 +442,7 @@ or
 with a valid configuration.
 It exits 1 on any error, including an invalid option or configuration, a
 failed request, and refused clipboard contents (password, hidden
-characters, secret, too large, unsupported image, empty clipboard, content
+characters, secret, too large, unsupported or malformed image, empty clipboard, content
 no selected profile accepts).
 .Sh EXAMPLES
 A configuration with OpenAI for text, a local llama.cpp server with a
@@ -404,6 +458,7 @@ beep_duration = 150
 [default]
 include = ["beeps"]
 clear = ["input"]
+api_url = "https://api.openai.com/v1/chat/completions"
 api_key = "sk\-..."
 model = "gpt\-4o\-mini"
 prompt_text = "Fix spelling and grammar. Reply with the text only."

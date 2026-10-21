@@ -11,7 +11,8 @@
 //! * responses are capped at [`MAX_RESPONSE_BYTES`]
 //! * the whole request is bounded by the configured timeout (if any); a
 //!   timeout is reported as such, with the limit and how to raise it
-//! * error messages never contain the response body
+//! * error messages never contain the response body, nor the request URL's
+//!   path or query (which may hold a key)
 
 use reqwest::blocking::Client;
 use reqwest::{redirect, Url};
@@ -68,11 +69,17 @@ fn url_origin(url: &Url) -> String {
     url.origin().ascii_serialization()
 }
 
-/// Warning text for plain http to a host that is not this computer.
-pub fn insecure_warning(url: &Url) -> String {
+/// Warning text for plain http to a host that is not this computer. The
+/// API key is only named if `sends_key`, i.e. one goes with the request.
+pub fn insecure_warning(url: &Url, sends_key: bool) -> String {
+    let what = if sends_key {
+        "the API key and clipboard text travel"
+    } else {
+        "the clipboard text travels"
+    };
     format!(
         "Warning: {} uses unencrypted http to a host that is not this computer; \
-         the API key and clipboard text travel in clear text",
+         {what} in clear text",
         url_origin(url)
     )
 }
@@ -116,29 +123,46 @@ pub fn host_is_local(host: &str, port: u16) -> bool {
 }
 
 /// Check `url` before the request is sent: errors for bad schemes, and
-/// returns the warning to print (if any) for plain http to another host.
+/// returns the warning to print (if any) for plain http to another host
+/// (naming the API key only if `sends_key`).
 pub fn check_url(
     url: &Url,
+    sends_key: bool,
     is_local: &dyn Fn(&str, u16) -> bool,
 ) -> Result<Option<String>, String> {
     match assess_url(url, is_local)? {
-        Transport::PlainRemote => Ok(Some(insecure_warning(url))),
+        Transport::PlainRemote => Ok(Some(insecure_warning(url, sends_key))),
         Transport::Encrypted | Transport::PlainLocal => Ok(None),
     }
 }
 
-/// Decide one redirect hop when redirects are allowed. `visited` is the
-/// number of URLs already requested (reqwest's `previous().len()`). Returns
-/// a warning to print for plain http to another host, or an error to stop.
+/// Decide one redirect hop when redirects are allowed. `previous` holds
+/// the URLs already requested, in order (reqwest's `previous()`); the last
+/// one is redirecting to `next`. Returns a warning to print for plain http
+/// to another host, or an error to stop. A redirect from https to anything
+/// but https is refused, wherever it points: the request (a 307/308 one
+/// re-sends the clipboard text) must never lose the encryption it started
+/// with. `has_key` says whether the request carries an API key; reqwest
+/// drops it when a hop changes scheme, host or port, so the warning names
+/// the key only for a hop that keeps all three.
 pub fn redirect_decision(
     next: &Url,
-    visited: usize,
+    previous: &[Url],
+    has_key: bool,
     is_local: &dyn Fn(&str, u16) -> bool,
 ) -> Result<Option<String>, String> {
-    if visited > MAX_REDIRECTS {
+    if previous.len() > MAX_REDIRECTS {
         return Err(format!("Too many redirects (more than {})", MAX_REDIRECTS));
     }
-    check_url(next, is_local).map_err(|e| format!("Redirect refused: {}", e))
+    if previous.last().is_some_and(|p| p.scheme() == "https") && next.scheme() != "https" {
+        return Err(format!(
+            "Redirect refused: {} would downgrade https to {}",
+            url_origin(next),
+            next.scheme()
+        ));
+    }
+    let key_follows = has_key && previous.last().is_some_and(|p| p.origin() == next.origin());
+    check_url(next, key_follows, is_local).map_err(|e| format!("Redirect refused: {}", e))
 }
 
 /// Build the HTTP client. With `allow_redirects` false, no redirect is
@@ -146,11 +170,16 @@ pub fn redirect_decision(
 /// hop goes through [`redirect_decision`]. reqwest itself drops the
 /// Authorization header when a redirect changes host, port or scheme.
 /// `timeout` bounds the whole request, response body included; `None`
-/// means no limit.
-pub fn build_client(allow_redirects: bool, timeout: Option<Duration>) -> Result<Client, String> {
+/// means no limit. `has_key` (an API key is sent) only changes the wording
+/// of redirect warnings.
+pub fn build_client(
+    allow_redirects: bool,
+    has_key: bool,
+    timeout: Option<Duration>,
+) -> Result<Client, String> {
     let policy = if allow_redirects {
-        redirect::Policy::custom(|attempt| {
-            match redirect_decision(attempt.url(), attempt.previous().len(), &host_is_local) {
+        redirect::Policy::custom(move |attempt| {
+            match redirect_decision(attempt.url(), attempt.previous(), has_key, &host_is_local) {
                 Ok(warning) => {
                     if let Some(warning) = warning {
                         eprintln!("{}", warning);
@@ -185,7 +214,7 @@ pub fn read_capped(
             if io_is_timeout(&e) {
                 timeout_error(timeout, &e)
             } else {
-                format!("Failed to read response: {}", e)
+                format!("Failed to read response: {}", describe(&e))
             }
         })?;
     if body.len() > limit {
@@ -211,7 +240,7 @@ fn io_is_timeout(err: &std::io::Error) -> bool {
 /// Message for a request that timed out. With a configured limit it names
 /// the limit and how to change it; without one (`None`, so the timeout
 /// came from the network or OS) it gives the underlying error.
-pub fn timeout_error(timeout: Option<Duration>, err: &dyn std::error::Error) -> String {
+pub fn timeout_error(timeout: Option<Duration>, err: &(dyn std::error::Error + 'static)) -> String {
     match timeout {
         Some(limit) => format!(
             "The LLM did not answer within {} s; raise request_timeout in config.toml or use \
@@ -223,16 +252,36 @@ pub fn timeout_error(timeout: Option<Duration>, err: &dyn std::error::Error) -> 
 }
 
 /// Format an error with its whole `source()` chain, so the reason behind a
-/// reqwest error (e.g. a refused redirect) is visible.
-fn error_chain(err: &dyn std::error::Error) -> String {
-    let mut message = err.to_string();
+/// reqwest error (e.g. a refused redirect) is visible. Every link is
+/// formatted by [`describe`], so no request URL (whose path or query may
+/// hold a key) ends up in the message.
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = describe(err);
     let mut source = err.source();
     while let Some(inner) = source {
         message.push_str(": ");
-        message.push_str(&inner.to_string());
+        message.push_str(&describe(inner));
         source = inner.source();
     }
     message
+}
+
+/// One error's own message, without the " for url (...)" suffix reqwest
+/// adds when it knows the request URL. The URL's path and query can carry
+/// secrets (e.g. `?api-key=...`), and all other messages show only scheme,
+/// host and port. An `io::Error` wrapping a reqwest error (as body reads
+/// return) displays that error's text, so it is unwrapped first.
+fn describe(err: &(dyn std::error::Error + 'static)) -> String {
+    let message = err.to_string();
+    let reqwest_err = err.downcast_ref::<reqwest::Error>().or_else(|| {
+        err.downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref())
+            .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+    });
+    match reqwest_err.and_then(reqwest::Error::url) {
+        Some(url) => message.replace(&format!(" for url ({url})"), ""),
+        None => message,
+    }
 }
 
 /// POST `body` as JSON to `url` and return the response body as text.
@@ -252,6 +301,7 @@ pub fn post_json<T: serde::Serialize>(
         request = request.bearer_auth(key);
     }
     let response = request.send().map_err(|e| {
+        let e = e.without_url();
         if e.is_timeout() {
             timeout_error(timeout, &e)
         } else {
@@ -304,7 +354,7 @@ mod tests {
     fn https_is_encrypted() {
         let u = url("https://api.openai.com/v1/chat/completions");
         assert_eq!(assess_url(&u, &fake_local), Ok(Transport::Encrypted));
-        assert_eq!(check_url(&u, &fake_local), Ok(None));
+        assert_eq!(check_url(&u, true, &fake_local), Ok(None));
     }
 
     #[test]
@@ -320,7 +370,7 @@ mod tests {
                 Ok(Transport::PlainLocal),
                 "{s}"
             );
-            assert_eq!(check_url(&url(s), &fake_local), Ok(None), "{s}");
+            assert_eq!(check_url(&url(s), true, &fake_local), Ok(None), "{s}");
         }
     }
 
@@ -328,9 +378,29 @@ mod tests {
     fn http_to_other_host_warns_without_path() {
         let u = url("http://192.168.1.50:11434/v1/chat?token=abc");
         assert_eq!(assess_url(&u, &fake_local), Ok(Transport::PlainRemote));
-        let warning = check_url(&u, &fake_local).unwrap().unwrap();
+        let warning = check_url(&u, true, &fake_local).unwrap().unwrap();
         assert!(warning.contains("http://192.168.1.50:11434"));
         assert!(!warning.contains("token"));
+        assert!(warning.contains("the API key and clipboard text travel"));
+        let warning = check_url(&u, false, &fake_local).unwrap().unwrap();
+        assert!(!warning.contains("API key"), "{warning}");
+        assert!(warning.contains("the clipboard text travels in clear text"));
+    }
+
+    #[test]
+    fn redirect_warning_names_the_key_only_if_it_follows() {
+        let from = [url("http://192.168.1.50:8080/v1")];
+        let warn = |next: &str, has_key| {
+            redirect_decision(&url(next), &from, has_key, &fake_local)
+                .unwrap()
+                .unwrap()
+        };
+        // Same origin keeps the Authorization header.
+        assert!(warn("http://192.168.1.50:8080/v2", true).contains("API key"));
+        // Another host or port: reqwest drops it.
+        assert!(!warn("http://192.168.1.60:8080/v1", true).contains("API key"));
+        assert!(!warn("http://192.168.1.50:9090/v1", true).contains("API key"));
+        assert!(!warn("http://192.168.1.50:8080/v2", false).contains("API key"));
     }
 
     #[test]
@@ -346,22 +416,52 @@ mod tests {
 
     #[test]
     fn redirect_hops_are_checked() {
+        let from_http = [url("http://127.0.0.1/")];
         assert_eq!(
-            redirect_decision(&url("https://a.example/"), 1, &fake_local),
+            redirect_decision(&url("https://a.example/"), &from_http, true, &fake_local),
             Ok(None)
         );
-        assert!(redirect_decision(&url("http://a.example/"), 1, &fake_local)
-            .unwrap()
-            .is_some());
-        let err = redirect_decision(&url("file:///etc/passwd"), 1, &fake_local).unwrap_err();
+        assert!(
+            redirect_decision(&url("http://a.example/"), &from_http, true, &fake_local)
+                .unwrap()
+                .is_some()
+        );
+        let err = redirect_decision(&url("file:///etc/passwd"), &from_http, true, &fake_local)
+            .unwrap_err();
         assert!(err.contains("Redirect refused"));
+    }
+
+    #[test]
+    fn redirect_from_https_to_http_is_refused() {
+        let from_https = [url("https://api.example/v1")];
+        // Even to this computer, and even to the same host.
+        for next in [
+            "http://203.0.113.7/x?token=SECRET",
+            "http://localhost/",
+            "http://api.example/v1",
+        ] {
+            let err = redirect_decision(&url(next), &from_https, true, &fake_local).unwrap_err();
+            assert!(err.contains("downgrade https to http"), "{err}");
+            assert!(!err.contains("SECRET"), "{err}");
+        }
+        assert_eq!(
+            redirect_decision(&url("https://b.example/"), &from_https, true, &fake_local),
+            Ok(None)
+        );
+        // Only the hop that is being redirected from counts.
+        let chain = [url("https://a.example/"), url("http://127.0.0.1/")];
+        assert_eq!(
+            redirect_decision(&url("http://localhost/"), &chain, true, &fake_local),
+            Ok(None)
+        );
     }
 
     #[test]
     fn redirect_limit_enforced() {
         let u = url("https://a.example/");
-        assert!(redirect_decision(&u, MAX_REDIRECTS, &fake_local).is_ok());
-        assert!(redirect_decision(&u, MAX_REDIRECTS + 1, &fake_local).is_err());
+        let hops = |n| vec![url("https://a.example/"); n];
+        assert!(redirect_decision(&u, &hops(MAX_REDIRECTS), true, &fake_local).is_ok());
+        assert!(redirect_decision(&u, &hops(MAX_REDIRECTS + 1), true, &fake_local).is_err());
     }
 
     #[test]
@@ -397,7 +497,7 @@ mod tests {
     #[test]
     fn real_check_url_on_loopback_is_silent() {
         let u = url("http://127.0.0.1:11434/v1/chat/completions");
-        assert_eq!(check_url(&u, &host_is_local), Ok(None));
+        assert_eq!(check_url(&u, true, &host_is_local), Ok(None));
     }
 
     #[test]
@@ -463,7 +563,7 @@ mod tests {
             http_response("200 OK", "", "{\"ok\":1}"),
             http_response("200 OK", "", "{\"ok\":2}"),
         ]);
-        let client = build_client(false, None).unwrap();
+        let client = build_client(false, false, None).unwrap();
         let body = serde_json::json!({"x": 1});
         assert_eq!(
             post_json(&client, &base, Some("sk-test"), &body, None, None),
@@ -487,7 +587,7 @@ mod tests {
             "",
             "{\"error\":\"your secret clipboard text\"}",
         )]);
-        let client = build_client(false, None).unwrap();
+        let client = build_client(false, false, None).unwrap();
         let err = post_json(&client, &base, None, &serde_json::json!({}), None, None).unwrap_err();
         handle.join().unwrap();
         assert!(err.contains("400"));
@@ -501,7 +601,7 @@ mod tests {
             "",
             "{\"error\":{\"message\":\"image input is not supported\"}}",
         )]);
-        let client = build_client(false, None).unwrap();
+        let client = build_client(false, false, None).unwrap();
         let hint = Some("the model may not accept images");
         let err = post_json(&client, &base, None, &serde_json::json!({}), None, hint).unwrap_err();
         handle.join().unwrap();
@@ -518,7 +618,7 @@ mod tests {
             "Location: http://203.0.113.7/steal\r\n",
             "",
         )]);
-        let client = build_client(false, None).unwrap();
+        let client = build_client(false, false, None).unwrap();
         let err = post_json(
             &client,
             &base,
@@ -541,7 +641,7 @@ mod tests {
             &format!("Location: {}final\r\n", target),
             "",
         )]);
-        let client = build_client(true, None).unwrap();
+        let client = build_client(true, false, None).unwrap();
         let result = post_json(&client, &base, None, &serde_json::json!({}), None, None);
         handle.join().unwrap();
         let requests = target_handle.join().unwrap();
@@ -556,7 +656,7 @@ mod tests {
             "Location: ftp://203.0.113.7/x\r\n",
             "",
         )]);
-        let client = build_client(true, None).unwrap();
+        let client = build_client(true, false, None).unwrap();
         let err = post_json(&client, &base, None, &serde_json::json!({}), None, None).unwrap_err();
         handle.join().unwrap();
         assert!(err.contains("Redirect refused"), "{err}");
@@ -566,7 +666,7 @@ mod tests {
     fn post_json_rejects_oversized_response() {
         let big = "a".repeat(MAX_RESPONSE_BYTES + 1);
         let (base, handle) = serve(vec![http_response("200 OK", "", &big)]);
-        let client = build_client(false, None).unwrap();
+        let client = build_client(false, false, None).unwrap();
         let err = post_json(&client, &base, None, &serde_json::json!({}), None, None).unwrap_err();
         let _ = handle.join();
         assert!(err.contains("larger than"));
@@ -598,7 +698,7 @@ mod tests {
             Duration::ZERO,
         );
         let limit = Some(Duration::from_secs(1));
-        let client = build_client(false, limit).unwrap();
+        let client = build_client(false, false, limit).unwrap();
         let start = std::time::Instant::now();
         let err = post_json(&client, &base, None, &serde_json::json!({}), limit, None).unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(4));
@@ -615,7 +715,7 @@ mod tests {
         let partial = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"choices\"".to_string();
         let base = serve_slow(Duration::ZERO, partial, Duration::from_secs(5));
         let limit = Some(Duration::from_secs(1));
-        let client = build_client(false, limit).unwrap();
+        let client = build_client(false, false, limit).unwrap();
         let err = post_json(&client, &base, None, &serde_json::json!({}), limit, None).unwrap_err();
         assert!(err.contains("did not answer within 1 s"), "{err}");
     }
@@ -628,7 +728,7 @@ mod tests {
             http_response("200 OK", "", "slow but fine"),
             Duration::ZERO,
         );
-        let client = build_client(false, None).unwrap();
+        let client = build_client(false, false, None).unwrap();
         let body = post_json(&client, &base, None, &serde_json::json!({}), None, None);
         assert_eq!(body, Ok("slow but fine".to_string()));
     }
@@ -662,8 +762,60 @@ mod tests {
 
     #[test]
     fn build_client_both_modes() {
-        assert!(build_client(false, None).is_ok());
-        assert!(build_client(true, Some(Duration::from_secs(5))).is_ok());
+        assert!(build_client(false, false, None).is_ok());
+        assert!(build_client(true, false, Some(Duration::from_secs(5))).is_ok());
+    }
+
+    /// A loopback URL nothing listens on, with a secret in path and query.
+    fn closed_port_url() -> Url {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        url(&format!(
+            "http://127.0.0.1:{port}/v1/SECRETPATH?api-key=SECRETKEY"
+        ))
+    }
+
+    #[test]
+    fn failed_request_error_has_no_url_path_or_query() {
+        let u = closed_port_url();
+        let client = build_client(false, false, None).unwrap();
+        let err = post_json(&client, &u, None, &serde_json::json!({}), None, None).unwrap_err();
+        assert!(err.starts_with("Request failed: "), "{err}");
+        assert!(!err.contains("SECRET") && !err.contains("for url"), "{err}");
+        // Without a limit the timeout message shows the cause, also
+        // without the URL.
+        let client = build_client(false, false, None).unwrap();
+        let e = client.post(u).send().unwrap_err();
+        assert!(e.to_string().contains("SECRETKEY"), "reqwest adds the URL");
+        let msg = timeout_error(None, &e);
+        assert!(!msg.contains("SECRET"), "{msg}");
+    }
+
+    #[test]
+    fn refused_redirect_error_has_no_target_path_or_query() {
+        let (base, handle) = serve(vec![http_response(
+            "307 Temporary Redirect",
+            "Location: ftp://203.0.113.7/SECRETPATH?token=SECRETKEY\r\n",
+            "",
+        )]);
+        let client = build_client(true, false, None).unwrap();
+        let err = post_json(&client, &base, None, &serde_json::json!({}), None, None).unwrap_err();
+        handle.join().unwrap();
+        assert!(err.contains("Redirect refused"), "{err}");
+        assert!(!err.contains("SECRET"), "{err}");
+    }
+
+    #[test]
+    fn body_read_error_has_no_url_path_or_query() {
+        // Headers promise 100 bytes, then the connection closes early.
+        let partial = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"choices\"".to_string();
+        let base = serve_slow(Duration::ZERO, partial, Duration::ZERO);
+        let u = base.join("v1/SECRETPATH?api-key=SECRETKEY").unwrap();
+        let client = build_client(false, false, None).unwrap();
+        let err = post_json(&client, &u, None, &serde_json::json!({}), None, None).unwrap_err();
+        assert!(err.starts_with("Failed to read response"), "{err}");
+        assert!(!err.contains("SECRET"), "{err}");
     }
 
     #[test]

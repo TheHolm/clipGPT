@@ -17,18 +17,16 @@
 //! Writing is harder: on X11 the clipboard holds no data, only the name of
 //! the client that owns it, which must keep running to answer paste
 //! requests. [`set_text`] therefore starts a copy of clipGPT with
-//! [`OWNER_HELPER_ARG`] and passes the text on stdin; that copy
+//! [`OWNER_HELPER_X11_ARG`] and passes the text on stdin; that copy
 //! ([`serve_owner`]) takes ownership, reports back on stdout, and then
-//! serves requests until another client takes the clipboard over.
-//! Re-executing avoids `fork()` in a multi-threaded process.
+//! serves requests until another client takes the clipboard over. The
+//! protocol between the two (and why re-executing is used instead of
+//! `fork()`) is in the `owner` module, shared with the Wayland backend.
 
+use super::owner::{self, TakeFailure};
 use super::{choose, choose_image_type, image_too_large, marks_password, too_large, Clip, Limits};
-use crate::cli::OWNER_HELPER_ARG;
+use crate::cli::OWNER_HELPER_X11_ARG;
 use crate::imagefile::ClipImage;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::errors::{ConnectionError, ReplyError, ReplyOrIdError};
@@ -46,15 +44,26 @@ use x11rb::{COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT, CURRENT_TIME, NONE};
 /// clipboard owner (one selection reply, one `INCR` chunk, ...).
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How long [`set_text`] waits for the owner helper to report back.
-const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Pause between event polls while waiting with a timeout.
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// Most `TARGETS` entries looked at, so a hostile owner cannot make us
-/// look up an unbounded number of atom names.
-const MAX_TARGETS: u32 = 256;
+/// look up an unbounded number of atom names. Read in one request (16 KiB).
+/// Real owners list a few dozen at most; the limit used to be 256, which a
+/// list padded with junk could push a password-manager hint past. Entries
+/// after this many are still not checked (see [`get`]).
+const MAX_TARGETS: u32 = 4096;
+
+/// How long an `INCR` transfer may go without the requestor asking for
+/// the next chunk before the owner helper gives up on it. Only matters
+/// once the clipboard has been taken over: the helper then stays only to
+/// finish transfers already started, and a stalled one would otherwise
+/// keep it running forever.
+const TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Pause between event polls while the owner helper waits for unfinished
+/// transfers (coarser than [`POLL_INTERVAL`]: nobody waits on it).
+const TRANSFER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Largest single property write, in bytes. Texts above this (or above
 /// what the server accepts in one request) are sent with `INCR`.
@@ -359,7 +368,9 @@ impl Reader {
 /// among the offered formats, then reading what [`choose`] picks.
 /// Data over its limit is an error, never returned in part. If the owner
 /// does not answer `TARGETS`, the hint cannot be checked and `UTF8_STRING`,
-/// then `STRING` are tried (no image).
+/// then `STRING` are tried (no image). Only the first [`MAX_TARGETS`]
+/// entries of a longer `TARGETS` list are checked for the hint. Both gaps
+/// are documented (README "Security", man page SECURITY).
 pub fn get(limits: Limits) -> Result<Clip, Failure> {
     let (conn, screen_num) = connect()?;
     let win = create_window(&conn, screen_num)?;
@@ -436,7 +447,8 @@ fn plan_read(targets: Option<&[(Atom, String)]>, guesses: [Atom; 2]) -> ReadPlan
 
 /// The atoms of a `TARGETS` reply, or `None` if it is not a plain list of
 /// 32-bit atoms (e.g. an `INCR` announcement, which no sane owner uses for
-/// `TARGETS`).
+/// `TARGETS`). A list longer than was asked for comes back cut off
+/// (`bytes_after` > 0); its first part is still used.
 fn target_atoms(reply: &GetPropertyReply, incr: Atom) -> Option<Vec<Atom>> {
     if reply.type_ == incr {
         return None;
@@ -471,122 +483,39 @@ pub fn set_text(text: String) -> Result<(), Failure> {
     let exe = std::env::current_exe().map_err(|e| {
         Failure::Other(format!("Cannot find own executable for X11 clipboard: {e}"))
     })?;
-    hand_over(helper_command(exe), text.as_bytes())
-}
-
-/// The command that starts `exe` as the owner helper: the hidden argument,
-/// piped stdin/stdout, stderr discarded, cwd `/` (so it holds no directory
-/// busy), in its own process group (so a Ctrl-C in the terminal that
-/// started clipGPT does not take the clipboard down with it).
-fn helper_command(exe: std::path::PathBuf) -> Command {
-    let mut command = Command::new(exe);
-    command
-        .arg(OWNER_HELPER_ARG)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .current_dir("/")
-        .process_group(0);
-    command
-}
-
-/// Start the owner helper `command`, feed it `data` and wait (at most
-/// [`HELPER_READY_TIMEOUT`]) for its status line on stdout: `ok`, or
-/// `error: <message>`. The helper is killed if it does not answer in time;
-/// on success it is left running.
-fn hand_over(mut command: Command, data: &[u8]) -> Result<(), Failure> {
     let fail = |m: String| Failure::Other(format!("Failed to set X11 clipboard content: {m}"));
-    let mut child = command.spawn().map_err(|e| fail(e.to_string()))?;
-    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-        return Err(fail("helper has no stdin/stdout".to_string()));
-    };
-
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
-        let _ = tx.send(result);
-    });
-    // A helper that dies early makes this fail with a broken pipe; its
-    // status line (if any) says more, so that is preferred below.
-    let written = stdin.write_all(data);
-    drop(stdin);
-
-    let status = match rx.recv_timeout(HELPER_READY_TIMEOUT) {
-        Ok(Ok(line)) => line,
-        Ok(Err(e)) => format!("error: cannot read helper status: {e}"),
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(fail("helper did not respond in time".to_string()));
-        }
-    };
-    match parse_status(&status) {
-        Ok(()) => written.map_err(|e| fail(format!("cannot pass text to helper: {e}"))),
-        Err(message) => {
-            let _ = child.wait();
-            Err(fail(message))
-        }
+    match owner::hand_over(
+        owner::helper_command(exe, OWNER_HELPER_X11_ARG),
+        text.as_bytes(),
+    ) {
+        owner::HandOverResult::Ok => Ok(()),
+        owner::HandOverResult::Unavailable(m) | owner::HandOverResult::Failed(m) => Err(fail(m)),
     }
 }
 
-/// Interpret the helper's status line: `ok` is success, `error: <msg>` a
-/// reported failure, anything else (including nothing, if the helper died)
-/// an unexpected exit.
-fn parse_status(line: &str) -> Result<(), String> {
-    let line = line.trim_end();
-    if line == "ok" {
-        Ok(())
-    } else if let Some(message) = line.strip_prefix("error: ") {
-        Err(message.to_string())
-    } else {
-        Err("helper exited unexpectedly".to_string())
-    }
-}
-
-/// Entry point of the owner helper (clipGPT run with [`OWNER_HELPER_ARG`]):
-/// read the text from stdin, take the clipboard, report `ok` or
-/// `error: <message>` on stdout, then serve paste requests until another
-/// client takes the clipboard. Returns the process exit status.
+/// Entry point of the owner helper (clipGPT run with
+/// [`OWNER_HELPER_X11_ARG`]): read the text from stdin, take the
+/// clipboard, report `ok` or `error: <message>` on stdout (see
+/// [`owner::run_owner_on_stdio`]), then serve paste requests until
+/// another client takes the clipboard. Returns the process exit status.
 pub fn serve_owner() -> i32 {
-    run_owner(
-        std::io::stdin(),
-        std::io::stdout(),
-        Owner::take,
-        Owner::serve,
+    owner::run_owner_on_stdio(
+        |data| Owner::take(data).map_err(x11_take_failure),
+        |owner| owner.serve().map_err(x11_failure_message),
     )
 }
 
-/// The helper protocol of [`serve_owner`], with the I/O and the X11 parts
-/// (`take` the clipboard with the text, then `serve` it) passed in. The
-/// status line goes to `output` (one line, so newlines in an error are
-/// replaced); `serve` only runs once `ok` was written. Returns the exit
-/// status: 0 after serving, 1 on any failure.
-fn run_owner<O>(
-    mut input: impl Read,
-    mut output: impl Write,
-    take: impl FnOnce(Vec<u8>) -> Result<O, Failure>,
-    serve: impl FnOnce(O) -> Result<(), Failure>,
-) -> i32 {
-    let mut data = Vec::new();
-    let owner = input
-        .read_to_end(&mut data)
-        .map_err(|e| Failure::Other(format!("cannot read text: {e}")))
-        .and_then(|_| take(data));
-    let owner = match owner {
-        Ok(owner) => owner,
-        Err(Failure::Connect(m) | Failure::Other(m)) => {
-            let _ = writeln!(output, "error: {}", m.replace('\n', " "));
-            let _ = output.flush();
-            return 1;
-        }
-    };
-    if writeln!(output, "ok").and_then(|_| output.flush()).is_err() {
-        return 1;
-    }
-    match serve(owner) {
-        Ok(()) => 0,
-        Err(_) => 1,
+/// X11 is only tried by the owner helper once the parent already
+/// confirmed it is reachable ([`set_text`]'s probe), so a failure here is
+/// always final, never [`TakeFailure::Unavailable`].
+fn x11_take_failure(failure: Failure) -> TakeFailure {
+    TakeFailure::Failed(x11_failure_message(failure))
+}
+
+/// The message of a [`Failure`], regardless of its kind.
+fn x11_failure_message(failure: Failure) -> String {
+    match failure {
+        Failure::Connect(m) | Failure::Other(m) => m,
     }
 }
 
@@ -628,6 +557,8 @@ struct Transfer {
     property: Atom,
     type_: Atom,
     sender: IncrSender,
+    /// When the transfer started or last handed out a chunk.
+    last_progress: Instant,
 }
 
 /// One step of an `INCR` transfer: write `chunk` with type `type_`; if
@@ -645,9 +576,9 @@ struct Step<'a> {
 struct Transfers(Vec<Transfer>);
 
 impl Transfers {
-    /// Begin a transfer to `property` on `requestor`, replacing an earlier
-    /// one to the same place.
-    fn start(&mut self, requestor: Window, property: Atom, type_: Atom) {
+    /// Begin a transfer to `property` on `requestor` at `now`, replacing
+    /// an earlier one to the same place.
+    fn start(&mut self, now: Instant, requestor: Window, property: Atom, type_: Atom) {
         self.0
             .retain(|t| !(t.requestor == requestor && t.property == property));
         self.0.push(Transfer {
@@ -655,15 +586,26 @@ impl Transfers {
             property,
             type_,
             sender: IncrSender::default(),
+            last_progress: now,
         });
     }
 
-    /// The requestor deleted `property` on `window`, asking for the next
-    /// chunk of `data` (at most `chunk` bytes). `None` if no transfer goes
-    /// there. A transfer is dropped once its final empty chunk is handed
-    /// out.
+    /// Drop every transfer that made no progress for `max_idle` up to
+    /// `now`, returning how many were dropped.
+    fn expire(&mut self, now: Instant, max_idle: Duration) -> usize {
+        let before = self.0.len();
+        self.0
+            .retain(|t| now.saturating_duration_since(t.last_progress) < max_idle);
+        before - self.0.len()
+    }
+
+    /// The requestor deleted `property` on `window` at `now`, asking for
+    /// the next chunk of `data` (at most `chunk` bytes). `None` if no
+    /// transfer goes there. A transfer is dropped once its final empty
+    /// chunk is handed out.
     fn advance<'a>(
         &mut self,
+        now: Instant,
         window: Window,
         property: Atom,
         data: &'a [u8],
@@ -674,6 +616,7 @@ impl Transfers {
             .iter()
             .position(|t| t.requestor == window && t.property == property)?;
         let t = &mut self.0[i];
+        t.last_progress = now;
         let type_ = t.type_;
         // Finished transfers are removed right away, so `next` always
         // yields here; an empty chunk would end the transfer anyway.
@@ -813,12 +756,32 @@ impl Owner {
     }
 
     /// Answer requests until the clipboard is taken over and no transfer
-    /// is still in progress, or the connection ends.
+    /// is still in progress, or the connection ends. After the takeover,
+    /// transfers idle for [`TRANSFER_IDLE_TIMEOUT`] are dropped, so a
+    /// requestor that stalls in the middle cannot keep the helper alive.
     fn serve(self) -> Result<(), Failure> {
+        self.serve_with_idle_timeout(TRANSFER_IDLE_TIMEOUT)
+    }
+
+    /// [`Owner::serve`] with transfers dropped after `max_idle` without
+    /// progress (once the clipboard is taken over).
+    fn serve_with_idle_timeout(self, max_idle: Duration) -> Result<(), Failure> {
         let mut transfers = Transfers::default();
         let mut cleared = false;
         while !(cleared && transfers.is_empty()) {
-            match self.conn.wait_for_event()? {
+            let event = if cleared {
+                match self.conn.poll_for_event()? {
+                    Some(event) => event,
+                    None => {
+                        transfers.expire(Instant::now(), max_idle);
+                        std::thread::sleep(TRANSFER_POLL_INTERVAL);
+                        continue;
+                    }
+                }
+            } else {
+                self.conn.wait_for_event()?
+            };
+            match event {
                 Event::SelectionRequest(req) => self.answer(&req, &mut transfers)?,
                 Event::SelectionClear(ev)
                     if ev.owner == self.win && ev.selection == self.atoms.CLIPBOARD =>
@@ -924,7 +887,7 @@ impl Owner {
             self.atoms.INCR,
             &[size],
         )?;
-        transfers.start(requestor, property, type_);
+        transfers.start(Instant::now(), requestor, property, type_);
         Ok(())
     }
 
@@ -937,7 +900,9 @@ impl Owner {
         property: Atom,
         transfers: &mut Transfers,
     ) -> Result<(), Failure> {
-        let Some(step) = transfers.advance(window, property, &self.data, self.chunk) else {
+        let Some(step) =
+            transfers.advance(Instant::now(), window, property, &self.data, self.chunk)
+        else {
             return Ok(());
         };
         self.conn
@@ -1035,6 +1000,27 @@ mod tests {
     }
 
     #[test]
+    fn target_atoms_keeps_first_part_of_a_cut_off_list() {
+        let list = reply(4, 32, atom_bytes(&[7, 9]), 400);
+        assert_eq!(target_atoms(&list, 104), Some(vec![7, 9]));
+    }
+
+    #[test]
+    fn password_hint_found_deep_in_a_long_target_list() {
+        // An owner padding its list with junk before the hint: found as
+        // long as it is within the first MAX_TARGETS entries.
+        let mut t: Vec<(Atom, String)> = (0..MAX_TARGETS - 1)
+            .map(|i| (1000 + i, format!("junk-{i}")))
+            .collect();
+        t.insert(0, (2, "UTF8_STRING".into()));
+        t.truncate(MAX_TARGETS as usize - 1);
+        t.push((3, "x-kde-passwordManagerHint".into()));
+        assert_eq!(t.len(), MAX_TARGETS as usize);
+        assert_eq!(plan_read(Some(&t), [1, 2]), ReadPlan::Password);
+        const { assert!(MAX_TARGETS >= 4096) };
+    }
+
+    #[test]
     fn plan_read_choices() {
         let guesses = [1, 2];
         let plan = |text: Vec<Atom>, image: Option<Atom>| ReadPlan::Try { text, image };
@@ -1122,146 +1108,84 @@ mod tests {
         assert_eq!(reply_property(42, 105), 42);
     }
 
+    /// A fixed point in time for transfer tests that don't care about it.
+    fn now() -> Instant {
+        static NOW: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *NOW.get_or_init(Instant::now)
+    }
+
+    #[test]
+    fn idle_transfers_expire_and_progress_resets_the_clock() {
+        let start = now();
+        let idle = Duration::from_secs(10);
+        let mut t = Transfers::default();
+        t.start(start, 1, 50, 105);
+        t.start(start, 2, 50, 105);
+        // Window 1 keeps asking for chunks; window 2 stalls.
+        let later = start + Duration::from_secs(8);
+        assert!(t.advance(later, 1, 50, b"abcdef", 2).is_some());
+        assert_eq!(t.expire(start + Duration::from_secs(9), idle), 0);
+        assert_eq!(t.expire(start + idle, idle), 1, "window 2 dropped");
+        assert_eq!(t.0.len(), 1);
+        assert_eq!(t.0[0].requestor, 1);
+        assert_eq!(t.expire(later + idle - Duration::from_millis(1), idle), 0);
+        assert_eq!(t.expire(later + idle, idle), 1);
+        assert!(t.is_empty());
+        // A clock that went backwards never expires anything.
+        t.start(later, 3, 50, 105);
+        assert_eq!(t.expire(start, idle), 0);
+    }
+
     #[test]
     fn transfers_send_chunks_then_unwatch() {
         let data = b"abcde";
         let mut t = Transfers::default();
-        t.start(1, 50, 105);
-        assert_eq!(t.advance(2, 50, data, 3), None, "other window");
-        assert_eq!(t.advance(1, 51, data, 3), None, "other property");
+        t.start(now(), 1, 50, 105);
+        assert_eq!(t.advance(now(), 2, 50, data, 3), None, "other window");
+        assert_eq!(t.advance(now(), 1, 51, data, 3), None, "other property");
         let step = |chunk: &'static [u8], unwatch| Step {
             type_: 105,
             chunk,
             unwatch,
         };
-        assert_eq!(t.advance(1, 50, data, 3), Some(step(b"abc", false)));
-        assert_eq!(t.advance(1, 50, data, 3), Some(step(b"de", false)));
-        assert_eq!(t.advance(1, 50, data, 3), Some(step(b"", true)));
+        assert_eq!(t.advance(now(), 1, 50, data, 3), Some(step(b"abc", false)));
+        assert_eq!(t.advance(now(), 1, 50, data, 3), Some(step(b"de", false)));
+        assert_eq!(t.advance(now(), 1, 50, data, 3), Some(step(b"", true)));
         assert!(t.is_empty());
-        assert_eq!(t.advance(1, 50, data, 3), None);
+        assert_eq!(t.advance(now(), 1, 50, data, 3), None);
     }
 
     #[test]
     fn transfers_keep_watching_window_with_other_transfer() {
         let mut t = Transfers::default();
-        t.start(1, 50, 105);
-        t.start(1, 60, 107);
-        assert_eq!(t.advance(1, 50, b"", 3).map(|s| s.unwatch), Some(false));
-        assert_eq!(t.advance(1, 60, b"", 3).map(|s| s.unwatch), Some(true));
+        t.start(now(), 1, 50, 105);
+        t.start(now(), 1, 60, 107);
+        assert_eq!(
+            t.advance(now(), 1, 50, b"", 3).map(|s| s.unwatch),
+            Some(false)
+        );
+        assert_eq!(
+            t.advance(now(), 1, 60, b"", 3).map(|s| s.unwatch),
+            Some(true)
+        );
         assert!(t.is_empty());
     }
 
     #[test]
     fn transfers_restart_and_forget() {
         let mut t = Transfers::default();
-        t.start(1, 50, 105);
-        assert!(t.advance(1, 50, b"abcdef", 2).is_some());
+        t.start(now(), 1, 50, 105);
+        assert!(t.advance(now(), 1, 50, b"abcdef", 2).is_some());
         // A new request to the same place starts over from the beginning.
-        t.start(1, 50, 107);
+        t.start(now(), 1, 50, 107);
         assert_eq!(t.0.len(), 1);
-        let step = t.advance(1, 50, b"abcdef", 2).unwrap();
+        let step = t.advance(now(), 1, 50, b"abcdef", 2).unwrap();
         assert_eq!((step.type_, step.chunk), (107, &b"ab"[..]));
-        t.start(2, 50, 105);
+        t.start(now(), 2, 50, 105);
         t.forget_window(1);
         assert_eq!(t.0.len(), 1);
         t.forget_window(2);
         assert!(t.is_empty());
-    }
-
-    #[test]
-    fn helper_command_runs_hidden_mode_from_root() {
-        let command = helper_command("/opt/clip_gpt".into());
-        assert_eq!(command.get_program(), "/opt/clip_gpt");
-        let args: Vec<_> = command.get_args().collect();
-        assert_eq!(args, [OWNER_HELPER_ARG]);
-        assert_eq!(command.get_current_dir(), Some(std::path::Path::new("/")));
-    }
-
-    /// Run [`run_owner`] on `input`; returns exit status, output, and what
-    /// `take` received (if it ran) and whether `serve` ran.
-    fn owner_run(
-        input: &[u8],
-        take: Result<(), Failure>,
-        serve: Result<(), Failure>,
-    ) -> (i32, String, Option<Vec<u8>>, bool) {
-        let mut out = Vec::new();
-        let mut taken = None;
-        let mut served = false;
-        let status = run_owner(
-            input,
-            &mut out,
-            |data| {
-                taken = Some(data);
-                take
-            },
-            |()| {
-                served = true;
-                serve
-            },
-        );
-        (status, String::from_utf8(out).unwrap(), taken, served)
-    }
-
-    #[test]
-    fn run_owner_reports_ok_then_serves() {
-        let (status, out, taken, served) = owner_run(b"text", Ok(()), Ok(()));
-        assert_eq!((status, out.as_str(), served), (0, "ok\n", true));
-        assert_eq!(taken.as_deref(), Some(&b"text"[..]));
-        assert_eq!(parse_status(&out), Ok(()));
-        let (status, _, _, served) = owner_run(b"t", Ok(()), Err(Failure::Other("lost".into())));
-        assert_eq!((status, served), (1, true));
-    }
-
-    #[test]
-    fn run_owner_reports_take_failure_on_one_line() {
-        let fail = Err(Failure::Connect("no\ndisplay".into()));
-        let (status, out, _, served) = owner_run(b"t", fail, Ok(()));
-        assert_eq!(
-            (status, out.as_str(), served),
-            (1, "error: no display\n", false)
-        );
-        assert_eq!(parse_status(&out), Err("no display".into()));
-    }
-
-    #[test]
-    fn run_owner_input_and_output_errors() {
-        /// Reads and writes that always fail.
-        struct Broken;
-        impl Read for Broken {
-            /// Always fails.
-            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::other("closed"))
-            }
-        }
-        impl Write for Broken {
-            /// Always fails.
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::other("closed"))
-            }
-            /// Nothing to flush.
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut out = Vec::new();
-        let status = run_owner(
-            Broken,
-            &mut out,
-            |_| -> Result<(), _> { panic!() },
-            |_| panic!(),
-        );
-        assert_eq!(status, 1);
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "error: cannot read text: closed\n"
-        );
-        let status = run_owner(
-            &b"t"[..],
-            Broken,
-            |_| Ok(()),
-            |_| panic!("not after failed ok"),
-        );
-        assert_eq!(status, 1);
     }
 
     #[test]
@@ -1367,55 +1291,20 @@ mod tests {
         assert_eq!(chunk_size(0), 1);
     }
 
-    #[test]
-    fn status_line_parsing() {
-        assert_eq!(parse_status("ok\n"), Ok(()));
-        assert_eq!(
-            parse_status("error: no display\n"),
-            Err("no display".into())
-        );
-        assert_eq!(parse_status(""), Err("helper exited unexpectedly".into()));
-        assert_eq!(
-            parse_status("garbage"),
-            Err("helper exited unexpectedly".into())
-        );
-    }
+    /// Serialises the tests using the one real X clipboard.
+    static X11_CLIPBOARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// A shell command standing in for the owner helper, for testing
-    /// [`hand_over`] without an X server.
-    fn fake_helper(script: &str) -> Command {
-        let mut command = Command::new("sh");
-        command
-            .args(["-c", script])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        command
-    }
-
-    #[test]
-    fn hand_over_passes_data_and_accepts_ok() {
-        // The helper checks it got exactly the text before saying ok.
-        let script = r#"[ "$(cat)" = "hi there" ] && echo ok || echo "error: wrong data""#;
-        assert_eq!(hand_over(fake_helper(script), b"hi there"), Ok(()));
-        assert!(matches!(
-            hand_over(fake_helper(script), b"other"),
-            Err(Failure::Other(m)) if m.contains("wrong data")
-        ));
-    }
-
-    #[test]
-    fn hand_over_reports_helper_death() {
-        let result = hand_over(fake_helper("exit 3"), b"x");
-        assert!(matches!(result, Err(Failure::Other(m)) if m.contains("unexpectedly")));
-    }
-
-    #[test]
-    fn hand_over_times_out_silent_helper() {
-        let start = Instant::now();
-        let result = hand_over(fake_helper("cat >/dev/null; sleep 30"), b"x");
-        assert!(matches!(result, Err(Failure::Other(m)) if m.contains("in time")));
-        assert!(start.elapsed() < Duration::from_secs(20));
+    /// Take [`X11_CLIPBOARD`], first opening one idle X connection that
+    /// stays open for the rest of the test run. Xvfb resets the server
+    /// whenever its last client disconnects, and a test connecting during
+    /// that reset fails with "connection reset by peer"; with this
+    /// connection held, the gaps between tests never leave it without
+    /// clients.
+    fn x11_lock() -> std::sync::MutexGuard<'static, ()> {
+        static KEEP_SERVER_UP: std::sync::OnceLock<Option<RustConnection>> =
+            std::sync::OnceLock::new();
+        KEEP_SERVER_UP.get_or_init(|| connect().ok().map(|(conn, _)| conn));
+        X11_CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Own the clipboard in a thread with `data`, read it back through
@@ -1423,8 +1312,7 @@ mod tests {
     /// Needs a real X server: run with `xvfb-run cargo test -- --ignored`.
     /// Serialised, since all tests share the one X clipboard.
     fn round_trip(data: Vec<u8>, max_bytes: usize) -> Result<Clip, Failure> {
-        static CLIPBOARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = x11_lock();
         let owner = Owner::take(data)?;
         let server = std::thread::spawn(move || owner.serve());
         let result = get(Limits {
@@ -1461,5 +1349,129 @@ mod tests {
         assert_eq!(small, Failure::Other(too_large(999)));
         let incr = round_trip(vec![b'x'; 300_000], 299_999).unwrap_err();
         assert_eq!(incr, Failure::Other(too_large(299_999)));
+    }
+
+    /// Own the clipboard with a fake owner whose `TARGETS` answer is
+    /// `UTF8_STRING`, `padding` junk entries, then the password-manager
+    /// hint (and which serves "text" as `UTF8_STRING`), and read it back
+    /// through [`get`].
+    fn read_with_padded_targets(padding: usize) -> Result<Clip, Failure> {
+        let _guard = x11_lock();
+        let (conn, screen_num) = connect()?;
+        let win = create_window(&conn, screen_num)?;
+        let atoms = Atoms::new(&conn)?.reply()?;
+        let hint = conn
+            .intern_atom(false, b"x-kde-passwordManagerHint")?
+            .reply()?
+            .atom;
+        let mut targets = vec![atoms.TARGETS, atoms.UTF8_STRING];
+        targets.extend(std::iter::repeat_n(Atom::from(AtomEnum::PRIMARY), padding));
+        targets.push(hint);
+        conn.set_selection_owner(win, atoms.CLIPBOARD, CURRENT_TIME)?;
+        conn.flush()?;
+        let server = std::thread::spawn(move || -> Result<(), Failure> {
+            loop {
+                match conn.wait_for_event()? {
+                    Event::SelectionRequest(req) => {
+                        let property = reply_property(req.property, req.target);
+                        if req.target == atoms.TARGETS {
+                            conn.change_property32(
+                                PropMode::REPLACE,
+                                req.requestor,
+                                property,
+                                AtomEnum::ATOM,
+                                &targets,
+                            )?;
+                        } else {
+                            conn.change_property8(
+                                PropMode::REPLACE,
+                                req.requestor,
+                                property,
+                                atoms.UTF8_STRING,
+                                b"text",
+                            )?;
+                        }
+                        let notify = SelectionNotifyEvent {
+                            response_type: SELECTION_NOTIFY_EVENT,
+                            sequence: 0,
+                            time: req.time,
+                            requestor: req.requestor,
+                            selection: req.selection,
+                            target: req.target,
+                            property,
+                        };
+                        conn.send_event(false, req.requestor, EventMask::NO_EVENT, notify)?;
+                        conn.flush()?;
+                    }
+                    Event::SelectionClear(_) => return Ok(()),
+                    _ => {}
+                }
+            }
+        });
+        let result = get(Limits {
+            text: Some(100),
+            image: Some(100),
+        });
+        let other = Owner::take(Vec::new())?;
+        server.join().unwrap()?;
+        drop(other);
+        result
+    }
+
+    #[test]
+    #[ignore = "needs an X server (DISPLAY), e.g. xvfb-run"]
+    fn x11_password_hint_behind_many_targets_is_found() {
+        // 1000 junk entries pushed the hint past the old 256-entry limit.
+        assert_eq!(read_with_padded_targets(1000), Ok(Clip::Password));
+        assert_eq!(read_with_padded_targets(0), Ok(Clip::Password));
+        // Past MAX_TARGETS it is not seen (documented gap).
+        let beyond = MAX_TARGETS as usize;
+        assert_eq!(
+            read_with_padded_targets(beyond),
+            Ok(Clip::Text("text".into()))
+        );
+    }
+
+    #[test]
+    #[ignore = "needs an X server (DISPLAY), e.g. xvfb-run"]
+    fn x11_owner_exits_despite_a_stalled_incr_transfer() {
+        let _guard = x11_lock();
+        let owner = Owner::take(vec![b'x'; 300_000]).unwrap();
+        let idle = Duration::from_millis(500);
+        let server = std::thread::spawn(move || owner.serve_with_idle_timeout(idle));
+
+        // A requestor that starts an INCR transfer and then never deletes
+        // the property, i.e. never asks for the first chunk.
+        let (conn, screen_num) = connect().unwrap();
+        let win = create_window(&conn, screen_num).unwrap();
+        let atoms = Atoms::new(&conn).unwrap().reply().unwrap();
+        let prop = atoms.CLIPGPT_PROPERTY;
+        conn.convert_selection(win, atoms.CLIPBOARD, atoms.UTF8_STRING, prop, CURRENT_TIME)
+            .unwrap();
+        let property = wait_for(&conn, |event| match event {
+            Event::SelectionNotify(n) if n.requestor == win => Some(n.property),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(property, prop);
+        let reply = conn
+            .get_property(false, win, prop, AtomEnum::ANY, 0, 1)
+            .unwrap()
+            .reply()
+            .unwrap();
+        assert_eq!(reply.type_, atoms.INCR, "large text goes through INCR");
+
+        // Someone else copies; the helper must give up on the stalled
+        // transfer and finish, while the requestor's window still exists.
+        let taken = Instant::now();
+        let other = Owner::take(Vec::new()).unwrap();
+        server.join().unwrap().unwrap();
+        let waited = taken.elapsed();
+        assert!(
+            waited >= idle / 2,
+            "exited before the idle timeout: {waited:?}"
+        );
+        assert!(waited < Duration::from_secs(5), "took {waited:?}");
+        drop((other, conn));
     }
 }

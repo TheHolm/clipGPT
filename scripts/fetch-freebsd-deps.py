@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """Populate a FreeBSD cross-compilation sysroot with a package's dependency closure.
 
-Cross-linking a dak-nuggets helper for FreeBSD needs the native libraries the
-binary links against, which a plain `base.txz` sysroot (libc/CRT only) does not
+Cross-linking a program for FreeBSD needs the native libraries the binary
+links against, which a plain `base.txz` sysroot (libc/CRT only) does not
 contain. This helper downloads those packages from the official FreeBSD
 package repository and unpacks them into the sysroot. It needs no FreeBSD host
 and never runs a FreeBSD binary - it only downloads and extracts archives.
 
-Generalized from TheHolm/md_timesheet's `scripts/fetch-freebsd-gtk.py` (which
-hardcoded gtk4/libadwaita as the roots): here every root package and its
-pkg-config module name are passed on the command line, so the same script
-works for any program's FreeBSD dependency closure - e.g.
+Every root package and its pkg-config module name are passed on the command
+line, so the same script works for any program's FreeBSD dependency closure -
+e.g. `--root alsa-lib --root openssl` for clip_gpt (see
+.woodpecker/release.yaml), or
 `--root evolution-data-server --pkg-config-module evolution-data-server=libecal-2.0`
-for gnome-next-meeting, or `--root gtk4 --root libadwaita` for a future
-GTK4/libadwaita helper.
+for a program using a library whose package and module names differ.
 
 A `--root`'s *declared* runtime dependency closure (what `resolve_closure`
 walks) is not the same thing as the closure a cross-linker actually needs: it
@@ -21,34 +20,38 @@ also includes optional runtime plugins - modules only `dlopen`'d down some
 code path a mere link-time consumer of the library's public API never
 exercises. `--exclude NAME` (repeatable) prunes a named package, and
 anything only reachable through it, from the closure before any downloading
-happens. See NOTES.md for how the current `evolution-data-server` exclude
-list in `release.yaml` was derived from its FreeBSD port's `OPTIONS_DEFAULT`
-- this is not something to guess at from the package names alone.
+happens. Which packages are safe to exclude has to be worked out from the
+root's FreeBSD port (its `OPTIONS_DEFAULT` and the libraries the binary
+really links), not guessed from package names.
 
 The repository uses the pkg 2.x layout: `packagesite.pkg` is a zstd tar holding
 `packagesite.yaml` (one JSON manifest per line, each with a `path` under
 `All/Hashed/`), and that `path` is directly downloadable as a normal `.pkg`.
-This layout is not a stable public interface, so callers should treat this
-script as best-effort (mark the CI step `failure: ignore`) - a break here
-should never block a release for programs that don't need it. See
-TheHolm/dak's NOTES.md section 2 for the `.pkg` format itself.
+This layout is not a stable public interface, so a FreeBSD repository change
+can break this script. For clip_gpt the FreeBSD build is hard-required (see
+AGENTS.md), so a break fails the release rather than being ignored.
+
+Every downloaded `.pkg` is checked against the size (`pkgsize`) and checksum
+(`sum`) its manifest line lists before it is unpacked; a mismatch, or a
+checksum in a format this script does not know, is a hard error. The manifest
+itself is trusted as served over HTTPS by the repository (its signature, made
+with a key shipped inside the same archive, is not checked).
 
 Usage:
     fetch-freebsd-deps.py --sysroot /opt/freebsd-sysroot \
-        --root evolution-data-server \
-        --exclude webkit2-gtk_60 --exclude gtk4 \
-        --pkg-config-module evolution-data-server=libecal-2.0 \
-        --pkg-config-check libecal-2.0 --pkg-config-check libedataserver-1.2 \
+        --root alsa-lib --root openssl \
+        --pkg-config-check alsa --pkg-config-check openssl \
         --deps-output /opt/freebsd-deps.json
 
     # Offline / tested against a pre-downloaded manifest:
     fetch-freebsd-deps.py --sysroot ./root --manifest ./packagesite.yaml \
-        --root evolution-data-server
+        --root alsa-lib
 
 Requires `python3`, GNU `tar` built with zstd support, and `zstd` on PATH.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -73,9 +76,55 @@ DOWNLOAD_TIMEOUT = 60  # seconds; urlopen has no default and can hang forever
 
 def download(url: str, dest: str) -> None:
     """Download `url` to `dest` (streamed), failing on any HTTP error or stall."""
-    request = urllib.request.Request(url, headers={"User-Agent": "dak-nuggets-ci"})
+    request = urllib.request.Request(url, headers={"User-Agent": "clipgpt-ci"})
     with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response, open(dest, "wb") as out:
         shutil.copyfileobj(response, out)
+
+
+# pkg's own base32 alphabet (libpkg's pkg_checksum_encode_base32), used for
+# the "2$" checksum format below.
+PKG_BASE32 = "ybndrfg8ejkmcpqxot1uwisza345h769"
+
+
+def pkg_base32(raw: bytes) -> str:
+    """Encode `raw` the way pkg does: 5-bit groups taken from the least
+    significant bit of the bytes read as one little-endian number."""
+    number = int.from_bytes(raw, "little")
+    return "".join(PKG_BASE32[(number >> bit) & 31] for bit in range(0, len(raw) * 8, 5))
+
+
+def file_checksum(path: str, expected: str) -> str:
+    """Return `path`'s checksum in the format of the manifest `sum` value
+    `expected`: "2$<base32 BLAKE2b-512>" (pkg 2.x repositories) or a plain
+    64-digit hex SHA-256 (older ones). Raises on any other format, so an
+    unknown one is never silently accepted."""
+    if expected.startswith("2$"):
+        digest, encode = hashlib.blake2b(), lambda d: "2$" + pkg_base32(d.digest())
+    elif re.fullmatch(r"[0-9a-f]{64}", expected):
+        digest, encode = hashlib.sha256(), lambda d: d.hexdigest()
+    else:
+        raise SystemExit(f"error: unknown package checksum format {expected[:8]!r}...")
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return encode(digest)
+
+
+def verify_package(path: str, entry: dict) -> None:
+    """Fail unless the downloaded `.pkg` at `path` has the size and checksum
+    that its manifest `entry` lists."""
+    name = entry["name"]
+    expected = entry.get("sum")
+    if not expected:
+        raise SystemExit(f"error: manifest lists no checksum for {name!r}")
+    size = entry.get("pkgsize")
+    if size is not None and os.path.getsize(path) != size:
+        raise SystemExit(
+            f"error: {name}: downloaded {os.path.getsize(path)} bytes, manifest says {size}"
+        )
+    actual = file_checksum(path, expected)
+    if actual != expected:
+        raise SystemExit(f"error: {name}: checksum {actual} does not match manifest's {expected}")
 
 
 def package_url(repo: str, path: str) -> str:
@@ -111,9 +160,8 @@ def resolve_closure(packages: dict, roots: list, exclude: set = frozenset()) -> 
     this function walks) is not the same thing as a cross-linker's closure:
     it includes optional runtime plugins - e.g. `evolution-data-server`'s
     OAuth2 sign-in web view - that a program only linking against the
-    library's public API never touches. See NOTES.md for how the current
-    `release.yaml` exclude list for `evolution-data-server` was derived; it
-    is not something this function can determine on its own, because
+    library's public API never touches. Which packages to exclude is not
+    something this function can determine on its own, because
     `packagesite.yaml` does not distinguish a link-time dependency from an
     optional-plugin one.
 
@@ -260,7 +308,7 @@ def parse_args(argv: list) -> argparse.Namespace:
         help="package to prune from the closure, along with anything only "
              "reachable through it (repeatable) - for a --root's optional "
              "runtime plugins that a mere link-time consumer never touches, "
-             "e.g. an OAuth2 backend's embedded web view; see NOTES.md",
+             "e.g. an OAuth2 backend's embedded web view",
     )
     parser.add_argument(
         "--pkg-config-module",
@@ -287,7 +335,7 @@ def parse_args(argv: list) -> argparse.Namespace:
 
 
 def format_elapsed(seconds: float) -> str:
-    """Format a duration as "MmSs", matching scripts/lib-timing.sh's style."""
+    """Format a duration as "MmSs"."""
     total = int(seconds)
     return f"{total // 60}m{total % 60}s"
 
@@ -322,6 +370,7 @@ def main(argv: list) -> int:
             pkg_file = os.path.join(work, "pkg.pkg")
             print(f"[{index}/{len(names)}] {name} {entry['version']}", flush=True)
             download(package_url(args.repo, entry["path"]), pkg_file)
+            verify_package(pkg_file, entry)
             total += os.path.getsize(pkg_file)
             extract(pkg_file, args.sysroot)
             os.remove(pkg_file)

@@ -1,10 +1,14 @@
 //! Clipboard images: work out the real format, convert to something every
 //! OpenAI-compatible server decodes, and encode as a `data:` URL.
 //!
-//! PNG and JPEG are sent unchanged (re-encoding a photo as PNG would only
-//! make it bigger). WebP, GIF (first frame), BMP, Windows DIB and TIFF are
-//! decoded and re-encoded as PNG: llama.cpp's image loader, for one, cannot
-//! read WebP, and OpenAI accepts neither BMP nor TIFF.
+//! PNG and JPEG are not re-encoded (re-encoding a photo as PNG would only
+//! make it bigger), but their metadata is removed at the byte level by
+//! [`strip_png`] and [`strip_jpeg`]: EXIF (camera, time, GPS position),
+//! XMP, text chunks, comments, thumbnails and anything after the end of the
+//! image. Only what is needed to show the picture correctly is kept. WebP,
+//! GIF (first frame), BMP, Windows DIB and TIFF are decoded and re-encoded
+//! as PNG, which carries no metadata: llama.cpp's image loader, for one,
+//! cannot read WebP, and OpenAI accepts neither BMP nor TIFF.
 //!
 //! The format is taken from the data's first bytes, never from the name
 //! the clipboard owner gave it. Decoding is bounded by [`MAX_DIMENSION`]
@@ -152,8 +156,139 @@ fn convert_dib(bytes: &[u8], max_bytes: usize) -> Result<Prepared, String> {
     encode_png(img, max_bytes)
 }
 
+/// Error for a PNG or JPEG whose structure could not be walked.
+fn malformed(what: &str) -> String {
+    format!("Clipboard image ({what}) is malformed; not sent")
+}
+
+/// PNG ancillary chunks that are kept: those that affect how the pixels
+/// look (transparency, colour space, gamma, significant bits, pixel
+/// aspect). Every other ancillary chunk - text (tEXt, zTXt, iTXt), EXIF
+/// (eXIf), time (tIME), animation frames (acTL, fcTL, fdAT: the default
+/// image stays) and unknown private chunks - is dropped.
+const PNG_KEPT_ANCILLARY: [&[u8; 4]; 9] = [
+    b"tRNS", b"gAMA", b"cHRM", b"sRGB", b"iCCP", b"sBIT", b"pHYs", b"cICP", b"bKGD",
+];
+
+/// Return `png` (starting with the PNG signature) with every chunk removed
+/// except the critical ones (IHDR, PLTE, IDAT, IEND) and
+/// [`PNG_KEPT_ANCILLARY`], and nothing after IEND. Chunk CRCs are copied,
+/// not checked; decoding is left to the server. A truncated file, or one
+/// without IHDR first or without IEND, is an error.
+fn strip_png(png: &[u8]) -> Result<Vec<u8>, String> {
+    const SIGNATURE: usize = 8;
+    let bad = || malformed("PNG");
+    let mut out = png.get(..SIGNATURE).ok_or_else(bad)?.to_vec();
+    let mut pos = SIGNATURE;
+    let mut first = true;
+    loop {
+        let header = png.get(pos..pos + 8).ok_or_else(bad)?;
+        let len = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        let kind: &[u8; 4] = header[4..8].try_into().unwrap();
+        let end = pos
+            .checked_add(12)
+            .and_then(|p| p.checked_add(len))
+            .filter(|&e| e <= png.len())
+            .ok_or_else(bad)?;
+        if first && kind != b"IHDR" {
+            return Err(bad());
+        }
+        first = false;
+        // Bit 5 of the first type byte clear (upper case) = critical.
+        let critical = kind[0].is_ascii_uppercase();
+        if critical || PNG_KEPT_ANCILLARY.contains(&kind) {
+            out.extend_from_slice(&png[pos..end]);
+        }
+        if kind == b"IEND" {
+            return Ok(out);
+        }
+        pos = end;
+    }
+}
+
+/// Whether the JPEG segment with `marker` (the byte after 0xFF) and
+/// `payload` (the bytes after its length field) is kept. APP0 (JFIF),
+/// APP2 holding an ICC profile and APP14 (Adobe, needed to decode CMYK
+/// colours right) are kept; every other APPn (EXIF and XMP in APP1, MPF
+/// in APP2, ...) and COM (comments) are dropped. All other segments
+/// (tables, frame and scan headers) are image data and kept.
+fn jpeg_segment_kept(marker: u8, payload: &[u8]) -> bool {
+    match marker {
+        0xE0 => true,
+        0xE2 => payload.starts_with(b"ICC_PROFILE\0"),
+        0xEE => payload.starts_with(b"Adobe"),
+        0xE1..=0xEF | 0xFE => false,
+        _ => true,
+    }
+}
+
+/// Return `jpeg` (starting with SOI) with the metadata segments that
+/// [`jpeg_segment_kept`] rejects removed - before, between and after
+/// scans - and nothing after EOI (where e.g. MPF stores extra images with
+/// their own EXIF). Entropy-coded scan data is copied unchanged. Fill
+/// bytes before a marker are dropped. A truncated file, or one without
+/// EOI, is an error.
+fn strip_jpeg(jpeg: &[u8]) -> Result<Vec<u8>, String> {
+    let bad = || malformed("JPEG");
+    if !jpeg.starts_with(&[0xFF, 0xD8]) {
+        return Err(bad());
+    }
+    let mut out = vec![0xFF, 0xD8];
+    let mut pos = 2;
+    loop {
+        // A marker: 0xFF (any number of them as fill), then its code.
+        if jpeg.get(pos) != Some(&0xFF) {
+            return Err(bad());
+        }
+        while jpeg.get(pos) == Some(&0xFF) {
+            pos += 1;
+        }
+        let marker = *jpeg.get(pos).ok_or_else(bad)?;
+        pos += 1;
+        match marker {
+            0xD9 => {
+                out.extend_from_slice(&[0xFF, 0xD9]);
+                return Ok(out);
+            }
+            // Markers without a length: restart markers and TEM.
+            0xD0..=0xD7 | 0x01 => out.extend_from_slice(&[0xFF, marker]),
+            // A second SOI, or a stray 0xFF00 outside scan data.
+            0xD8 | 0x00 => return Err(bad()),
+            _ => {
+                let len_bytes = jpeg.get(pos..pos + 2).ok_or_else(bad)?;
+                let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+                if len < 2 {
+                    return Err(bad());
+                }
+                let end = pos + len;
+                let segment = jpeg.get(pos..end).ok_or_else(bad)?;
+                if jpeg_segment_kept(marker, &segment[2..]) {
+                    out.extend_from_slice(&[0xFF, marker]);
+                    out.extend_from_slice(segment);
+                }
+                pos = end;
+                if marker == 0xDA {
+                    // Start of scan: entropy-coded data up to the next
+                    // marker that is neither a stuffed 0xFF00 nor a
+                    // restart marker.
+                    let start = pos;
+                    loop {
+                        match (jpeg.get(pos), jpeg.get(pos + 1)) {
+                            (Some(0xFF), Some(0x00 | 0xD0..=0xD7)) => pos += 2,
+                            (Some(0xFF), Some(_)) => break,
+                            (Some(_), _) => pos += 1,
+                            (None, _) => return Err(bad()),
+                        }
+                    }
+                    out.extend_from_slice(&jpeg[start..pos]);
+                }
+            }
+        }
+    }
+}
+
 /// Check a clipboard image and turn it into PNG or JPEG of at most
-/// `max_bytes`. Unknown formats are refused.
+/// `max_bytes`, without metadata. Unknown formats are refused.
 pub fn prepare(image: ClipImage, max_bytes: usize) -> Result<Prepared, String> {
     let bytes = match image {
         ClipImage::Dib(bytes) => {
@@ -170,11 +305,11 @@ pub fn prepare(image: ClipImage, max_bytes: usize) -> Result<Prepared, String> {
     match sniff(&bytes) {
         Some(Format::Png) => Ok(Prepared {
             mime: "image/png",
-            bytes,
+            bytes: strip_png(&bytes)?,
         }),
         Some(Format::Jpeg) => Ok(Prepared {
             mime: "image/jpeg",
-            bytes,
+            bytes: strip_jpeg(&bytes)?,
         }),
         Some(Format::WebP) => convert_file(&bytes, ImageFormat::WebP, max_bytes),
         Some(Format::Gif) => convert_file(&bytes, ImageFormat::Gif, max_bytes),
@@ -234,14 +369,173 @@ mod tests {
     }
 
     #[test]
-    fn png_and_jpeg_pass_unchanged() {
+    fn png_and_jpeg_without_metadata_pass_unchanged() {
         let png = encoded(ImageFormat::Png);
         let got = prepare(ClipImage::File(png.clone()), 1 << 20).unwrap();
         assert_eq!((got.mime, got.bytes), ("image/png", png));
-        // Only the signature is looked at for JPEG; it is not decoded.
-        let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3];
-        let got = prepare(ClipImage::File(jpeg.clone()), 100).unwrap();
+        let jpeg = jpeg_from(&[&jfif(), &dqt_sof_dht(), &scan()]);
+        let got = prepare(ClipImage::File(jpeg.clone()), 1 << 20).unwrap();
         assert_eq!((got.mime, got.bytes), ("image/jpeg", jpeg));
+    }
+
+    /// A PNG chunk: length, type, data and a (dummy) CRC.
+    fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut c = (data.len() as u32).to_be_bytes().to_vec();
+        c.extend_from_slice(kind);
+        c.extend_from_slice(data);
+        c.extend_from_slice(&[0xAB; 4]);
+        c
+    }
+
+    /// `png` with `chunks` inserted after IHDR (which ends at byte 33).
+    fn png_with(png: &[u8], chunks: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = png[..33].to_vec();
+        for c in chunks {
+            out.extend_from_slice(c);
+        }
+        out.extend_from_slice(&png[33..]);
+        out
+    }
+
+    #[test]
+    fn png_metadata_is_removed() {
+        let png = encoded(ImageFormat::Png);
+        assert_eq!(&png[12..16], b"IHDR");
+        let mut tagged = png_with(
+            &png,
+            &[
+                chunk(b"tEXt", b"Author\0SECRET-NAME"),
+                chunk(b"iTXt", b"XML:com.adobe.xmp\0\0\0\0\0SECRET-XMP"),
+                chunk(b"eXIf", b"MM\0*SECRET-GPS"),
+                chunk(b"tIME", &[7, 0xEA, 1, 1, 0, 0, 0]),
+                chunk(b"prVt", b"SECRET-PRIVATE"),
+                chunk(b"gAMA", &[0, 0, 0xB1, 0x8F]),
+            ],
+        );
+        tagged.extend_from_slice(b"SECRET-TRAILER");
+        let got = prepare(ClipImage::File(tagged), 1 << 20).unwrap();
+        assert!(!got.bytes.windows(6).any(|w| w == b"SECRET"));
+        // The colour chunk stays; the result is the original plus it.
+        assert_eq!(
+            got.bytes,
+            png_with(&png, &[chunk(b"gAMA", &[0, 0, 0xB1, 0x8F])])
+        );
+        assert_same_picture(&got.bytes);
+    }
+
+    #[test]
+    fn broken_png_is_refused() {
+        let png = encoded(ImageFormat::Png);
+        // Truncated (no IEND), a chunk running past the end, no IHDR first.
+        for bad in [
+            png[..png.len() - 12].to_vec(),
+            png[..40].to_vec(),
+            [&png[..8], &chunk(b"IEND", b"")[..]].concat(),
+            b"\x89PNG\r\n\x1a\n".to_vec(),
+        ] {
+            let err = prepare(ClipImage::File(bad), 1 << 20).unwrap_err();
+            assert!(err.contains("(PNG) is malformed"), "{err}");
+        }
+        let mut huge = png[..8].to_vec();
+        huge.extend_from_slice(&chunk(b"IHDR", &[0; 13]));
+        huge[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(prepare(ClipImage::File(huge), 1 << 20).is_err());
+    }
+
+    /// A JPEG segment: 0xFF, `marker`, length and `payload`.
+    fn segment(marker: u8, payload: &[u8]) -> Vec<u8> {
+        let mut s = vec![0xFF, marker];
+        s.extend_from_slice(&(payload.len() as u16 + 2).to_be_bytes());
+        s.extend_from_slice(payload);
+        s
+    }
+
+    /// The JFIF APP0 segment.
+    fn jfif() -> Vec<u8> {
+        segment(0xE0, b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0")
+    }
+
+    /// Fake quantisation table, frame header and Huffman table segments
+    /// (structure only; the image is never decoded here).
+    fn dqt_sof_dht() -> Vec<u8> {
+        [
+            segment(0xDB, &[0; 65]),
+            segment(0xC0, &[8, 0, 2, 0, 3, 1, 1, 0x11, 0]),
+            segment(0xC4, &[0; 17]),
+        ]
+        .concat()
+    }
+
+    /// A scan header plus entropy-coded data containing a stuffed 0xFF00
+    /// and a restart marker, which are data, not segment boundaries.
+    fn scan() -> Vec<u8> {
+        let mut s = segment(0xDA, &[1, 1, 0, 0, 0x3F, 0]);
+        s.extend_from_slice(&[0x12, 0xFF, 0x00, 0x34, 0xFF, 0xD0, 0x56, 0xFE]);
+        s
+    }
+
+    /// SOI, `parts`, EOI.
+    fn jpeg_from(parts: &[&[u8]]) -> Vec<u8> {
+        let mut j = vec![0xFF, 0xD8];
+        for p in parts {
+            j.extend_from_slice(p);
+        }
+        j.extend_from_slice(&[0xFF, 0xD9]);
+        j
+    }
+
+    #[test]
+    fn jpeg_metadata_is_removed() {
+        let icc = segment(0xE2, b"ICC_PROFILE\0\x01\x01profile");
+        let adobe = segment(0xEE, b"Adobe\0\x64\0\0\0\0\x01");
+        let tagged = jpeg_from(&[
+            &jfif(),
+            &segment(0xE1, b"Exif\0\0MM\0*SECRET-GPS"),
+            &segment(0xE1, b"http://ns.adobe.com/xap/1.0/\0SECRET-XMP"),
+            &segment(0xE2, b"MPF\0SECRET-MPF"),
+            &icc,
+            &adobe,
+            &segment(0xED, b"Photoshop 3.0\0SECRET-IPTC"),
+            &segment(0xFE, b"SECRET-COMMENT"),
+            &[0xFF, 0xFF], // fill bytes before the next marker
+            &dqt_sof_dht(),
+            &scan(),
+            // A comment between progressive scans is dropped too.
+            &segment(0xFE, b"SECRET-BETWEEN-SCANS"),
+            &scan(),
+        ]);
+        let mut with_trailer = tagged.clone();
+        with_trailer.extend_from_slice(b"\xFF\xD8SECRET-SECOND-IMAGE\xFF\xD9");
+        let got = prepare(ClipImage::File(with_trailer), 1 << 20).unwrap();
+        assert_eq!(got.mime, "image/jpeg");
+        assert!(!got.bytes.windows(6).any(|w| w == b"SECRET"));
+        assert_eq!(
+            got.bytes,
+            jpeg_from(&[&jfif(), &icc, &adobe, &dqt_sof_dht(), &scan(), &scan()])
+        );
+    }
+
+    #[test]
+    fn broken_jpeg_is_refused() {
+        let good = jpeg_from(&[&jfif(), &dqt_sof_dht(), &scan()]);
+        let err = prepare(ClipImage::File(good[..10].to_vec()), 1 << 20).unwrap_err();
+        assert!(err.contains("(JPEG) is malformed"), "{err}");
+        let mut bad_len = good.clone();
+        bad_len[5] = 1; // APP0 length 1
+        for bad in [
+            vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3],
+            vec![0xFF, 0xD8, 0xFF],
+            good[..good.len() - 2].to_vec(), // no EOI
+            good[..10].to_vec(),             // segment cut off
+            bad_len,
+            jpeg_from(&[&[0x00, 0x11]]), // data where a marker belongs
+            jpeg_from(&[&[0xFF, 0xD8]]), // second SOI
+            vec![],                      // no SOI at all
+            vec![0x00, 0x01, 0x02],      // not even close to SOI
+        ] {
+            let err = strip_jpeg(&bad).unwrap_err();
+            assert!(err.contains("(JPEG) is malformed"), "{bad:?}: {err}");
+        }
     }
 
     #[test]

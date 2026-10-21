@@ -24,6 +24,7 @@ beep_duration = 250
 [default]
 include = ["beeps"]
 clear = ["input"]          # don't inherit "none" from [beeps]
+api_url = "https://api.openai.com/v1/chat/completions"
 api_key = "sk-your-key-here"
 model = "gpt-4o-mini"
 prompt_text = "Fix spelling and grammar. Reply with the corrected text only."
@@ -35,6 +36,11 @@ api_url = "http://127.0.0.1:11434/v1/chat/completions"
 api_key = ""               # no key (drops the one from [default])
 model = "llama3"
 request_timeout = 120      # cold model loads are slow
+# Extra JSON request fields. Ollama's keep_alive keeps the model loaded for
+# 8 hours after each request (its default is 5 minutes), so later hotkey
+# presses don't wait for a cold load. OpenAI doesn't know this field - keep
+# it to Ollama profiles.
+request_extra_body = { keep_alive = "8h" }
 
 # Images only, read by a local vision model (OCR prompt is the built-in one).
 [ocr]

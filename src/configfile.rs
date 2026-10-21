@@ -27,9 +27,11 @@ const CONFIG_FILE: &str = "config.toml";
 pub const DEFAULT_PROFILE: &str = "default";
 
 const DEFAULT_API_TYPE: &str = "OpenAI";
-const DEFAULT_API_URL: &str = "https://api.openai.com/v1/chat/completions";
-const DEFAULT_PROMPT_TEXT: &str =
-    "Check spelling and gramma and rewrite following text on pirate speak. Be mean and pushy \n\n";
+/// Default prompt for clipboard text: a plain proofread in the text's own
+/// language.
+const DEFAULT_PROMPT_TEXT: &str = "Correct the spelling, grammar and punctuation of the following \
+     text. Keep its original language, meaning, tone and formatting - do not translate, summarise \
+     or add anything. Reply with the corrected text only.";
 /// Default prompt for clipboard images: make a vision model act as OCR.
 const DEFAULT_PROMPT_IMAGE: &str = "You are an OCR engine. Transcribe all text visible in the \
      image exactly as written, in its original language. Do not translate, summarise, correct, or \
@@ -50,6 +52,11 @@ const DEFAULT_SECRET_CHECK: bool = true;
 /// Default for `request_timeout`, in seconds (the same as reqwest's own
 /// default, which applied before the option existed).
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Largest `request_timeout` / `--timeout`, in seconds (1 hour). Without a
+/// cap a huge value could overflow the HTTP client's deadline arithmetic
+/// (a panic); no clipboard round trip needs longer, and 0 still means no
+/// limit at all.
+const MAX_REQUEST_TIMEOUT_SECS: u64 = 3600;
 
 /// The `input` value marking a profile that handles nothing (one meant
 /// only to be included by others).
@@ -57,7 +64,7 @@ const INPUT_NONE: &str = "none";
 
 /// Every key a profile may contain, in the order `--show-profile` prints
 /// them.
-pub const KEYS: [&str; 17] = [
+pub const KEYS: [&str; 18] = [
     "include",
     "clear",
     "input",
@@ -75,7 +82,12 @@ pub const KEYS: [&str; 17] = [
     "allow_redirects",
     "secret_check",
     "request_timeout",
+    "request_extra_body",
 ];
+
+/// Top-level request body fields clipGPT sets itself (or, for `stream`,
+/// cannot handle), so `request_extra_body` may not contain them.
+const RESERVED_BODY_KEYS: [&str; 3] = ["model", "messages", "stream"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiType {
@@ -153,6 +165,10 @@ pub struct Config {
     /// of the response. `None` means no limit (`request_timeout = 0`). The
     /// `--timeout` command line option overrides it for one run.
     pub request_timeout: Option<Duration>,
+    /// Extra top-level fields added to the JSON request body
+    /// (`request_extra_body`), e.g. Ollama's `keep_alive`. Empty by
+    /// default: nothing extra is sent.
+    pub request_extra_body: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The type a key's value must have.
@@ -168,7 +184,8 @@ enum KeyType {
     Size,
     /// `true` or `false`.
     Bool,
-    /// A whole number of seconds, 0 = no limit.
+    /// A whole number of seconds up to [`MAX_REQUEST_TIMEOUT_SECS`],
+    /// 0 = no limit.
     Timeout,
     /// The list of input kinds (`input`).
     Input,
@@ -176,6 +193,8 @@ enum KeyType {
     Profiles,
     /// A list of key names (`clear`).
     Keys,
+    /// A table of extra JSON request body fields (`request_extra_body`).
+    JsonTable,
 }
 
 /// The type of `key`'s value, or `None` for an unknown key.
@@ -190,17 +209,17 @@ fn key_type(key: &str) -> Option<KeyType> {
         "max_input_bytes" | "max_image_bytes" => KeyType::Size,
         "allow_redirects" | "secret_check" => KeyType::Bool,
         "request_timeout" => KeyType::Timeout,
+        "request_extra_body" => KeyType::JsonTable,
         _ => return None,
     })
 }
 
 /// The built-in default of a setting, as a TOML value. `None` for keys
-/// without one (`api_key`, `model`) and for `input`, whose default is
-/// "every kind" (see [`InputKind::ALL`]).
+/// without one (`api_url`, `api_key`, `model`, `request_extra_body`) and
+/// for `input`, whose default is "every kind" (see [`InputKind::ALL`]).
 fn default_value(key: &str) -> Option<Value> {
     Some(match key {
         "api_type" => Value::from(DEFAULT_API_TYPE),
-        "api_url" => Value::from(DEFAULT_API_URL),
         "prompt_text" => Value::from(DEFAULT_PROMPT_TEXT),
         "prompt_image" => Value::from(DEFAULT_PROMPT_IMAGE),
         "beep_tone" => Value::from(i64::from(DEFAULT_BEEP_TONE)),
@@ -215,20 +234,52 @@ fn default_value(key: &str) -> Option<Value> {
     })
 }
 
+/// Which per-OS directory convention [`config_dir_for`] should use.
+/// [`config_dir`] picks it from `cfg!(target_os = ...)`, so tests
+/// (always built for one real OS) can still exercise all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OsKind {
+    Windows,
+    MacOs,
+    Other,
+}
+
+/// This build's actual OS, for [`config_dir`].
+fn build_os() -> OsKind {
+    if cfg!(target_os = "windows") {
+        OsKind::Windows
+    } else if cfg!(target_os = "macos") {
+        OsKind::MacOs
+    } else {
+        OsKind::Other
+    }
+}
+
 /// Per-OS directory holding config.toml:
 /// * Linux   "~/.config/clipgpt"
 /// * MacOS   "~/Library/Application Support/clipgpt"
 /// * Windows "%APPDATA%\clipgpt"
 fn config_dir() -> Result<String, String> {
-    if cfg!(target_os = "windows") {
-        if let Some(app_dir) = env::var_os("APPDATA") {
+    config_dir_for(build_os(), env::var_os("HOME"), env::var_os("APPDATA"))
+}
+
+/// [`config_dir`]'s logic for a given `os`, `home` (`$HOME`) and
+/// `appdata` (`%APPDATA%`, Windows only), so each branch can be tested
+/// regardless of the OS this was actually built for.
+fn config_dir_for(
+    os: OsKind,
+    home: Option<std::ffi::OsString>,
+    appdata: Option<std::ffi::OsString>,
+) -> Result<String, String> {
+    if os == OsKind::Windows {
+        if let Some(app_dir) = appdata {
             Ok(format!("{}\\{}", app_dir.to_string_lossy(), APP_NAME))
         } else {
             Err("APPDATA environment variable is not set. And we are under Windows".to_string())
         }
-    } else if let Some(home_dir) = env::var_os("HOME") {
+    } else if let Some(home_dir) = home {
         let home_dir = home_dir.to_string_lossy();
-        if cfg!(target_os = "macos") {
+        if os == OsKind::MacOs {
             Ok(format!(
                 "{}/Library/Application Support/{}",
                 home_dir, APP_NAME
@@ -244,11 +295,13 @@ fn config_dir() -> Result<String, String> {
 
 /// `file` inside `dir`, with the OS's path separator.
 fn join(dir: &str, file: &str) -> String {
-    let separator = if cfg!(target_os = "windows") {
-        '\\'
-    } else {
-        '/'
-    };
+    join_for(build_os(), dir, file)
+}
+
+/// [`join`]'s logic for a given `os`, so both separators can be tested
+/// regardless of the OS this was actually built for.
+fn join_for(os: OsKind, dir: &str, file: &str) -> String {
+    let separator = if os == OsKind::Windows { '\\' } else { '/' };
     format!("{dir}{separator}{file}")
 }
 
@@ -310,15 +363,23 @@ fn check_key_file_mode(mode: u32, path: &str) -> Result<(), String> {
     }
 }
 
-/// Parse a timeout given as a whole number of seconds; `0` means no limit
-/// (`None`). Anything else (negative, fractional, text) is an error naming
-/// `key`. Used by the `--timeout` command line option.
+/// What a timeout must be, for error messages.
+fn timeout_expected() -> String {
+    format!("a whole number of seconds from 0 to {MAX_REQUEST_TIMEOUT_SECS} (1 hour; 0 = no limit)")
+}
+
+/// Parse a timeout given as a whole number of seconds up to
+/// [`MAX_REQUEST_TIMEOUT_SECS`]; `0` means no limit (`None`). Anything
+/// else (negative, fractional, text, too large) is an error naming `key`.
+/// Used by the `--timeout` command line option.
 pub fn parse_timeout(key: &str, value: &str) -> Result<Option<Duration>, String> {
     match value.trim().parse::<u64>() {
-        Ok(secs) => Ok(timeout_from_secs(secs)),
-        Err(_) => Err(format!(
-            "Invalid value '{}' for '{}': expected a whole number of seconds (0 = no limit)",
-            value, key
+        Ok(secs) if secs <= MAX_REQUEST_TIMEOUT_SECS => Ok(timeout_from_secs(secs)),
+        _ => Err(format!(
+            "Invalid value '{}' for '{}': expected {}",
+            value,
+            key,
+            timeout_expected()
         )),
     }
 }
@@ -442,6 +503,10 @@ fn parse_file(path: &str, contents: &str) -> Result<ConfigFile, String> {
                 line_of(contents, span.start),
                 e.message()
             ),
+            // Parsing straight into a Table never goes through a path that
+            // leaves the span empty (that needs serde's custom-error
+            // constructor); kept so a future toml version doing so still
+            // gets a sensible message instead of panicking.
             None => format!("{path}: invalid TOML: {}", e.message()),
         }
     })?;
@@ -471,6 +536,53 @@ fn parse_file(path: &str, contents: &str) -> Result<ConfigFile, String> {
         file.resolve(&profile.name)?;
     }
     Ok(file)
+}
+
+/// Check a `request_extra_body` value: a table without the reserved keys
+/// ([`RESERVED_BODY_KEYS`]) whose values all have a JSON equivalent (see
+/// [`toml_to_json`]). Names a reserved key, never a value.
+fn check_extra_body(value: &Value) -> Result<(), String> {
+    let Some(table) = value.as_table() else {
+        return Err("must be a table, e.g. { keep_alive = \"8h\" }".into());
+    };
+    if let Some(key) = table
+        .keys()
+        .find(|k| RESERVED_BODY_KEYS.contains(&k.as_str()))
+    {
+        return Err(format!(
+            "cannot set '{key}' (clipGPT sets model and messages itself and cannot read a \
+             streamed reply)"
+        ));
+    }
+    toml_to_json(value).map(drop)
+}
+
+/// Convert a TOML value to the matching JSON value: strings, integers,
+/// booleans, arrays and tables map directly, floats become JSON numbers.
+/// Dates and times, and floats JSON cannot hold (NaN, infinity), have no
+/// JSON equivalent and are an error.
+fn toml_to_json(value: &Value) -> Result<serde_json::Value, String> {
+    use serde_json::Value as Json;
+    Ok(match value {
+        Value::String(s) => Json::String(s.clone()),
+        Value::Integer(n) => Json::from(*n),
+        Value::Boolean(b) => Json::Bool(*b),
+        Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(Json::Number)
+            .ok_or("contains a number JSON cannot hold (nan or inf)")?,
+        Value::Datetime(_) => {
+            return Err("contains a date or time, which JSON has no type for".into())
+        }
+        Value::Array(items) => {
+            Json::Array(items.iter().map(toml_to_json).collect::<Result<_, _>>()?)
+        }
+        Value::Table(table) => Json::Object(
+            table
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), toml_to_json(v)?)))
+                .collect::<Result<_, String>>()?,
+        ),
+    })
 }
 
 /// Check one profile's keys and value types.
@@ -544,10 +656,11 @@ fn check_value(kind: KeyType, value: &Value) -> Result<(), String> {
             .map(drop)
             .ok_or("must be true or false (without quotes)".into()),
         KeyType::Timeout => match integer {
-            Some(n) if n >= 0 => Ok(()),
-            _ => Err("must be a whole number of seconds (0 = no limit)".into()),
+            Some(n) if u64::try_from(n).is_ok_and(|n| n <= MAX_REQUEST_TIMEOUT_SECS) => Ok(()),
+            _ => Err(format!("must be {}", timeout_expected())),
         },
         KeyType::Input => check_input(value),
+        KeyType::JsonTable => check_extra_body(value),
         KeyType::Profiles => {
             let names = unique_strings(value, "profile names")?;
             match names.iter().find(|n| !valid_profile_name(n)) {
@@ -660,9 +773,11 @@ impl Selection {
             .and_then(|p| p.config.as_ref())
     }
 
-    /// Every config that handles something.
-    pub fn handlers(&self) -> impl Iterator<Item = &Config> {
-        self.profiles.iter().filter_map(|p| p.config.as_ref())
+    /// Every profile that handles something, as (name, config).
+    pub fn handlers(&self) -> impl Iterator<Item = (&str, &Config)> {
+        self.profiles
+            .iter()
+            .filter_map(|p| p.config.as_ref().map(|c| (p.name.as_str(), c)))
     }
 
     /// Mutable access to every config that handles something (to apply
@@ -868,7 +983,11 @@ impl ConfigFile {
     }
 
     /// Build the run settings of profile `name` from its `resolved`
-    /// settings; `handles` is only used in the missing-model message.
+    /// settings; `handles` is only used in the missing-model and
+    /// missing-api_url messages. `model` and `api_url` have no built-in
+    /// default: a profile that handles input must get both from its own
+    /// keys or its includes, so a request never goes to a server the user
+    /// did not choose.
     fn build_config(
         &self,
         name: &str,
@@ -885,20 +1004,22 @@ impl ConfigFile {
         let int = |key: &str| get(key).and_then(|v| v.as_integer()).unwrap_or(0);
         let boolean = |key: &str| get(key).and_then(|v| v.as_bool()).unwrap_or(false);
 
-        let model = string("model")
-            .filter(|m| !m.trim().is_empty())
-            .ok_or_else(|| {
+        let required = |key: &str| {
+            string(key).filter(|v| !v.trim().is_empty()).ok_or_else(|| {
                 let kinds: Vec<&str> = handles.iter().map(|k| k.name()).collect();
                 format!(
-                    "Profile [{name}] handles {} but has no model: set model in [{name}] or in a \
+                    "Profile [{name}] handles {} but has no {key}: set {key} in [{name}] or in a \
                      profile it includes ({})",
                     kinds.join(" and "),
                     self.path
                 )
-            })?;
+            })
+        };
+        let model = required("model")?;
+        let api_url = required("api_url")?;
         Ok(Config {
             api_type: ApiType::OpenAI,
-            api_url: string("api_url").unwrap_or_default(),
+            api_url,
             api_key: normalize_api_key(string("api_key")),
             model,
             prompt_text: string("prompt_text").unwrap_or_default(),
@@ -915,13 +1036,19 @@ impl ConfigFile {
             request_timeout: timeout_from_secs(
                 u64::try_from(int("request_timeout")).unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
             ),
+            // Checked by check_extra_body when the file was parsed.
+            request_extra_body: match get("request_extra_body").map(|v| toml_to_json(&v)) {
+                Some(Ok(serde_json::Value::Object(map))) => map,
+                _ => serde_json::Map::new(),
+            },
         })
     }
 
     /// The `--show-profile` report: each selected profile's settings after
     /// includes, with the profile each value came from, then which profile
     /// handles which kind. The API key is never shown, only whether one is
-    /// set.
+    /// set, and neither are the parts of `api_url` that may hold one (see
+    /// [`display_api_url`]).
     pub fn show(&self, selection: &Selection) -> String {
         let mut out = format!("# config: {}\n\n", self.path);
         for selected in &selection.profiles {
@@ -948,6 +1075,7 @@ impl ConfigFile {
                         "(set, hidden)".to_string()
                     }
                     ("api_key", Some(_)) => "\"\" (no key sent)".to_string(),
+                    ("api_url", Some(s)) => display_api_url(&s.value),
                     (_, Some(s)) => display_value(&s.value),
                     ("input", None) => format!("(every kind: {})", kind_names(&InputKind::ALL)),
                     (_, None) => default_value(key)
@@ -973,6 +1101,44 @@ impl ConfigFile {
             out.push_str(&format!("#   {:<6} -> {handler}\n", kind.name()));
         }
         out
+    }
+}
+
+/// `api_url`'s value for `--show-profile`, with the parts that can carry
+/// a secret removed: user name and password (`https://user:pass@host`),
+/// query (`?api-key=...`) and fragment, followed by a note naming what was
+/// hidden. A URL without them is shown exactly as written. A value that is
+/// not a valid URL is not shown at all (a normal run reports it as invalid).
+fn display_api_url(value: &Value) -> String {
+    let Some(raw) = value.as_str() else {
+        return display_value(value);
+    };
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return "(not a valid URL, hidden)".to_string();
+    };
+    let mut hidden = Vec::new();
+    if !url.username().is_empty() || url.password().is_some() {
+        // Only fails for URLs that cannot have user info at all.
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        hidden.push("user info");
+    }
+    if url.query().is_some() {
+        url.set_query(None);
+        hidden.push("query");
+    }
+    if url.fragment().is_some() {
+        url.set_fragment(None);
+        hidden.push("fragment");
+    }
+    if hidden.is_empty() {
+        display_value(value)
+    } else {
+        format!(
+            "{} ({} hidden)",
+            display_value(&Value::from(url.as_str())),
+            hidden.join(", ")
+        )
     }
 }
 
@@ -1015,8 +1181,33 @@ fn display_value(value: &Value) -> String {
         ),
         Value::Integer(n) => n.to_string(),
         Value::Boolean(b) => b.to_string(),
-        // Other types never pass check_value.
+        // Debug keeps a ".0" or exponent, so it stays a TOML float.
+        Value::Float(f) => format!("{f:?}"),
+        Value::Table(table) if table.is_empty() => "{}".to_string(),
+        Value::Table(table) => format!(
+            "{{ {} }}",
+            table
+                .iter()
+                .map(|(k, v)| format!("{} = {}", display_key(k), display_value(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        // Dates never pass check_value.
         other => format!("{other:?}"),
+    }
+}
+
+/// A table key in TOML syntax: bare if it only has letters, digits, `_`
+/// and `-`, else quoted like a string.
+fn display_key(key: &str) -> String {
+    let bare = !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if bare {
+        key.to_string()
+    } else {
+        display_value(&Value::from(key))
     }
 }
 
@@ -1089,10 +1280,11 @@ mod tests {
 
     #[test]
     fn defaults_apply_to_unset_keys() {
-        let cfg = default_config("[default]\nmodel = \"llama3\"\n");
+        let cfg =
+            default_config("[default]\nmodel = \"llama3\"\napi_url = \"https://llm.example/v1\"\n");
         assert_eq!(cfg.api_key, None);
         assert_eq!(cfg.model, "llama3");
-        assert_eq!(cfg.api_url, DEFAULT_API_URL);
+        assert_eq!(cfg.api_url, "https://llm.example/v1");
         assert_eq!(cfg.prompt_text, DEFAULT_PROMPT_TEXT);
         assert_eq!(cfg.prompt_image, DEFAULT_PROMPT_IMAGE);
         assert_eq!(cfg.beep_tone, DEFAULT_BEEP_TONE);
@@ -1131,13 +1323,17 @@ mod tests {
 
     #[test]
     fn empty_strings_are_real_values() {
-        let cfg = default_config("[default]\nmodel = \"m\"\nprompt_text = \"\"\napi_key = \"\"\n");
+        let cfg = default_config("[default]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\nprompt_text = \"\"\napi_key = \"\"\n");
         assert_eq!(cfg.prompt_text, "");
         assert_eq!(cfg.api_key, None);
     }
 
     #[test]
     fn wrong_types_are_errors_without_values() {
+        let cfg = default_config(
+            "[default]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\nrequest_timeout = 3600\n",
+        );
+        assert_eq!(cfg.request_timeout, Some(Duration::from_secs(3600)));
         for (line, expect) in [
             ("beep_tone = \"abc\"", "whole number"),
             ("beep_tone = -1", "whole number"),
@@ -1149,6 +1345,8 @@ mod tests {
             ("secret_check = 1", "true or false"),
             ("request_timeout = -1", "0 = no limit"),
             ("request_timeout = \"30s\"", "0 = no limit"),
+            ("request_timeout = 3601", "from 0 to 3600 (1 hour"),
+            ("request_timeout = 9223372036854775807", "from 0 to 3600"),
             ("api_url = 5", "must be a string"),
             ("api_key = 12345678", "must be a string"),
             ("api_type = \"Claude\"", "OpenAI"),
@@ -1195,7 +1393,7 @@ mod tests {
     #[test]
     fn blank_lines_comments_crlf_and_indentation_are_fine() {
         let cfg = default_config(
-            "# comment\r\n \t \r\n  [default]  # trailing\r\n\tmodel = \"m\" \t\r\n",
+            "# comment\r\n \t \r\n  [default]  # trailing\r\n\tmodel = \"m\" \t\r\napi_url = \"https://llm.example/v1\"\r\n",
         );
         assert_eq!(cfg.model, "m");
     }
@@ -1212,7 +1410,7 @@ mod tests {
 
     #[test]
     fn includes_apply_in_order_and_own_keys_win() {
-        let file = "[a]\ninput = [\"none\"]\nbeep_tone = 1\nerror_tone = 1\nmodel = \"a\"\n\
+        let file = "[a]\ninput = [\"none\"]\nbeep_tone = 1\nerror_tone = 1\nmodel = \"a\"\napi_url = \"https://llm.example/v1\"\n\
                     [b]\ninput = [\"none\"]\nbeep_tone = 2\nbeep_duration = 2\n\
                     [default]\ninclude = [\"a\", \"b\"]\nclear = [\"input\"]\nbeep_duration = 3\n";
         let cfg = default_config(file);
@@ -1236,7 +1434,7 @@ mod tests {
 
     #[test]
     fn clear_restores_the_built_in_default() {
-        let file = "[base]\nmodel = \"m\"\napi_key = \"sk-x\"\nbeep_tone = 5\nprompt_text = \"p\"\n\
+        let file = "[base]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\napi_key = \"sk-x\"\nbeep_tone = 5\nprompt_text = \"p\"\n\
                     [default]\ninclude = [\"base\"]\nclear = [\"api_key\", \"beep_tone\", \"prompt_text\"]\n";
         let cfg = default_config(file);
         assert_eq!(cfg.api_key, None);
@@ -1245,7 +1443,7 @@ mod tests {
         assert_eq!(cfg.model, "m");
         // Clearing model leaves the profile without one.
         let err = select(
-            "[base]\nmodel = \"m\"\n[default]\ninclude = [\"base\"]\nclear = [\"model\"]\n",
+            "[base]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n[default]\ninclude = [\"base\"]\nclear = [\"model\"]\n",
             None,
         )
         .unwrap_err();
@@ -1253,6 +1451,32 @@ mod tests {
             err.contains("[default] handles text and image but has no model"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn api_url_has_no_default() {
+        assert_eq!(default_value("api_url"), None);
+        let err = select("[default]\nmodel = \"m\"\n", None).unwrap_err();
+        assert!(
+            err.contains("[default] handles text and image but has no api_url"),
+            "{err}"
+        );
+        // Blank counts as missing; clearing an included one leaves none.
+        let err = select("[default]\nmodel = \"m\"\napi_url = \" \"\n", None).unwrap_err();
+        assert!(err.contains("has no api_url"), "{err}");
+        let file = "[base]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n\
+                    [default]\ninclude = [\"base\"]\nclear = [\"api_url\"]\n";
+        assert!(select(file, None).unwrap_err().contains("has no api_url"));
+        // A profile that handles nothing needs none.
+        let file = "[nourl]\ninput = [\"image\"]\nmodel = \"m\"\n\
+                    [default]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n";
+        assert!(select(file, Some("nourl,default")).is_ok());
+        // --show-profile shows it as not set.
+        let parsed = parse("[a]\ninput = [\"none\"]\n[default]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n").unwrap();
+        let sel = parsed.select(None).unwrap();
+        assert!(parsed
+            .show(&sel)
+            .contains("api_url          = \"https://llm.example/v1\"  # [default]"));
     }
 
     #[test]
@@ -1289,6 +1513,10 @@ mod tests {
         assert!(parse_err("[a]\ninclude = [\"a\"]\n").contains("[a] -> [a]"));
         assert!(parse_err("[a]\ninclude = [\"x\", \"x\"]\n").contains("twice"));
         assert!(parse_err("[a]\ninclude = \"x\"\n").contains("must be a list"));
+        // A listed name with characters a profile section name can't have.
+        assert!(
+            parse_err("[a]\ninclude = [\"not valid!\"]\n").contains("not a valid profile name"),
+        );
         // Checked in profiles that are never selected too.
         assert!(
             parse_err("[default]\nmodel = \"m\"\n[unused]\ninclude = [\"gone\"]\n")
@@ -1316,7 +1544,11 @@ mod tests {
 
     #[test]
     fn default_profile_is_used_without_p_and_required() {
-        let sel = select("[default]\nmodel = \"m\"\n[x]\nmodel = \"x\"\n", None).unwrap();
+        let sel = select(
+            "[default]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n[x]\nmodel = \"x\"\n",
+            None,
+        )
+        .unwrap();
         assert_eq!(sel.names(), "default");
         let err = select("[openai]\nmodel = \"m\"\n[x]\nmodel = \"x\"\n", None).unwrap_err();
         assert!(
@@ -1340,10 +1572,10 @@ mod tests {
 
     /// A file with profiles `both` (every kind), `text` and `image` (one
     /// kind each) and `beeps` (none).
-    const ROUTING: &str = "[beeps]\ninput = [\"none\"]\nbeep_tone = 880\n\
+    const ROUTING: &str = "[beeps]\ninput = [\"none\"]\nbeep_tone = 880\napi_url = \"https://llm.example/v1\"\n\
                            [both]\ninclude = [\"beeps\"]\nclear = [\"input\"]\nmodel = \"both\"\n\
-                           [text]\ninput = [\"text\"]\nmodel = \"text\"\n\
-                           [image]\ninput = [\"image\"]\nmodel = \"image\"\n";
+                           [text]\ninput = [\"text\"]\nmodel = \"text\"\napi_url = \"https://llm.example/v1\"\n\
+                           [image]\ninput = [\"image\"]\nmodel = \"image\"\napi_url = \"https://llm.example/v1\"\n";
 
     /// The model handling each kind (text, image) for `-p names`.
     fn routes(names: &str) -> (Option<String>, Option<String>) {
@@ -1373,13 +1605,24 @@ mod tests {
             .contains("[nomodel] is selected but handles nothing (overridden by [both])"));
         assert!(sel.profiles[0].config.is_none());
         assert_eq!(sel.fallback().unwrap().model, "both");
-        assert_eq!(sel.handlers().count(), 1);
+        assert_eq!(sel.handlers().map(|(n, _)| n).collect::<Vec<_>>(), ["both"]);
         // But a profile that handles something needs one.
         let err = select(&file, Some("text,nomodel")).unwrap_err();
         assert!(
             err.contains("[nomodel] handles image but has no model"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn handlers_mut_reaches_every_handling_profiles_config() {
+        let mut sel = select(ROUTING, Some("text,image,both")).unwrap();
+        for config in sel.handlers_mut() {
+            config.request_timeout = Some(Duration::from_secs(1));
+        }
+        for (_, config) in sel.handlers() {
+            assert_eq!(config.request_timeout, Some(Duration::from_secs(1)));
+        }
     }
 
     #[test]
@@ -1417,11 +1660,11 @@ mod tests {
 
     #[test]
     fn show_lists_values_sources_and_routing_but_never_the_key() {
-        let file = "[base]\ninput = [\"none\"]\napi_key = \"sk-very-secret\"\nmodel = \"gpt\"\n\
+        let file = "[base]\ninput = [\"none\"]\napi_key = \"sk-very-secret\"\nmodel = \"gpt\"\napi_url = \"https://llm.example/v1\"\n\
                     prompt_text = \"line1\\nline2\"\n\
                     [default]\ninclude = [\"base\"]\nclear = [\"input\"]\nbeep_tone = 1\n\
                     [ocr]\ninclude = [\"base\"]\ninput = [\"image\"]\n\
-                    [nokey]\ninput = [\"text\"]\napi_key = \"\"\nmodel = \"m\"\n";
+                    [nokey]\ninput = [\"text\"]\napi_key = \"\"\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n";
         let parsed = parse(file).unwrap();
         let sel = parsed
             .select(Some(&["default".into(), "ocr".into()]))
@@ -1476,10 +1719,149 @@ mod tests {
     }
 
     #[test]
+    fn show_hides_secrets_in_api_url() {
+        let file = "[default]\nmodel = \"m\"\n\
+                    api_url = \"https://user:SECRET1@llm.example/v1/chat?api-key=SECRET2#SECRET3\"\n\
+                    [plain]\nmodel = \"m\"\napi_url = \"https://llm.example/v1/chat/completions\"\n\
+                    [bad]\nmodel = \"m\"\napi_url = \"SECRET4 not a url\"\n";
+        let parsed = parse(file).unwrap();
+        let show = |name: &str| parsed.show(&parsed.select(Some(&[name.into()])).unwrap());
+        let out = show("default");
+        assert!(!out.contains("SECRET") && !out.contains("user:"), "{out}");
+        assert!(
+            out.contains(
+                "api_url          = \"https://llm.example/v1/chat\" \
+                 (user info, query, fragment hidden)  # [default]"
+            ),
+            "{out}"
+        );
+        let out = show("plain");
+        assert!(
+            out.contains(
+                "api_url          = \"https://llm.example/v1/chat/completions\"  # [plain]"
+            ),
+            "{out}"
+        );
+        let out = show("bad");
+        assert!(!out.contains("SECRET"), "{out}");
+        assert!(
+            out.contains("api_url          = (not a valid URL, hidden)"),
+            "{out}"
+        );
+        // A user name alone (some services take a token there) is hidden too.
+        assert_eq!(
+            display_api_url(&Value::from("https://tok@h.example/")),
+            "\"https://h.example/\" (user info hidden)"
+        );
+        assert_eq!(
+            display_api_url(&Value::from("https://h.example/?")),
+            "\"https://h.example/\" (query hidden)"
+        );
+        // Defensive: check_value never lets api_url be anything but a
+        // string, but display_api_url still has a sensible answer if
+        // that ever changed.
+        assert_eq!(
+            display_api_url(&Value::from(5)),
+            display_value(&Value::from(5))
+        );
+    }
+
+    #[test]
+    fn request_extra_body_is_empty_by_default() {
+        let cfg =
+            default_config("[default]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n");
+        assert!(cfg.request_extra_body.is_empty());
+        assert_eq!(default_value("request_extra_body"), None);
+    }
+
+    #[test]
+    fn request_extra_body_converts_to_json() {
+        let cfg = default_config(
+            "[default]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n\
+             [default.request_extra_body]\nkeep_alive = \"8h\"\ntemperature = 0.2\n\
+             seed = 7\nthink = false\nstop = [\"a\", 1]\noptions = { num_ctx = 8192 }\n",
+        );
+        assert_eq!(
+            serde_json::Value::Object(cfg.request_extra_body),
+            serde_json::json!({
+                "keep_alive": "8h", "temperature": 0.2, "seed": 7, "think": false,
+                "stop": ["a", 1], "options": {"num_ctx": 8192}
+            })
+        );
+    }
+
+    #[test]
+    fn request_extra_body_errors() {
+        for (value, expect) in [
+            ("\"8h\"", "must be a table"),
+            ("{ model = \"x\" }", "cannot set 'model'"),
+            ("{ messages = [] }", "cannot set 'messages'"),
+            ("{ stream = true }", "cannot set 'stream'"),
+            ("{ when = 2026-01-01 }", "date or time"),
+            ("{ a = [{ b = 1979-05-27T07:32:00Z }] }", "date or time"),
+            ("{ x = nan }", "nan or inf"),
+            ("{ x = inf }", "nan or inf"),
+        ] {
+            let err = parse(&format!(
+                "[default]\nmodel = \"m\"\nrequest_extra_body = {value}\n"
+            ))
+            .unwrap_err();
+            assert!(
+                err.contains("'request_extra_body'") && err.contains(expect),
+                "{value}: {err}"
+            );
+        }
+        // A reserved name nested deeper is just data.
+        assert!(parse("[default]\nrequest_extra_body = { options = { model = 1 } }\n").is_ok());
+    }
+
+    #[test]
+    fn request_extra_body_is_replaced_by_own_and_cleared() {
+        let base =
+            "[base]\ninput = [\"none\"]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n\
+                    request_extra_body = { keep_alive = \"8h\", seed = 1 }\n";
+        let own = default_config(&format!(
+            "{base}[default]\ninclude = [\"base\"]\nclear = [\"input\"]\nrequest_extra_body = {{ seed = 2 }}\n"
+        ));
+        assert_eq!(
+            serde_json::Value::Object(own.request_extra_body),
+            serde_json::json!({"seed": 2})
+        );
+        let cleared = default_config(&format!(
+            "{base}[default]\ninclude = [\"base\"]\nclear = [\"input\", \"request_extra_body\"]\n"
+        ));
+        assert!(cleared.request_extra_body.is_empty());
+    }
+
+    #[test]
+    fn show_prints_request_extra_body() {
+        let parsed = parse(
+            "[default]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n\
+             request_extra_body = { keep_alive = \"8h\", options = { num_ctx = 8192 }, \"a b\" = 0.5 }\n",
+        )
+        .unwrap();
+        let out = parsed.show(&parsed.select(None).unwrap());
+        assert!(
+            out.contains(
+                "request_extra_body = { keep_alive = \"8h\", options = { num_ctx = 8192 }, \
+                 \"a b\" = 0.5 }  # [default]"
+            ),
+            "{out}"
+        );
+        let parsed =
+            parse("[default]\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n").unwrap();
+        let out = parsed.show(&parsed.select(None).unwrap());
+        assert!(
+            out.contains("request_extra_body = (not set)  # built-in default"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn display_value_is_one_line_toml() {
         assert_eq!(
-            display_value(&Value::from("a\"b\\c\nd\te\u{1}")),
-            "\"a\\\"b\\\\c\\nd\\te\\u0001\""
+            display_value(&Value::from("a\"b\\c\nd\te\rf\u{1}")),
+            "\"a\\\"b\\\\c\\nd\\te\\rf\\u0001\""
         );
         assert_eq!(
             display_value(&Value::Array(vec!["x".into(), "y".into()])),
@@ -1487,6 +1869,9 @@ mod tests {
         );
         assert_eq!(display_value(&Value::from(true)), "true");
         assert_eq!(display_value(&Value::from(7)), "7");
+        // Dates never pass check_value, so this is purely defensive.
+        let date: Value = "1979-05-27T07:32:00Z".parse().unwrap();
+        assert_eq!(display_value(&date), format!("{date:?}"));
     }
 
     #[test]
@@ -1502,13 +1887,57 @@ mod tests {
             parse_timeout("k", " 120 "),
             Ok(Some(Duration::from_secs(120)))
         );
-        for bad in ["-1", "1.5", "ten", "", "30s"] {
+        assert_eq!(
+            parse_timeout("k", "3600"),
+            Ok(Some(Duration::from_secs(MAX_REQUEST_TIMEOUT_SECS)))
+        );
+        for bad in [
+            "-1",
+            "1.5",
+            "ten",
+            "",
+            "30s",
+            "3601",
+            "18446744073709551615",
+        ] {
             let err = parse_timeout("--timeout", bad).unwrap_err();
             assert!(
                 err.contains("--timeout") && err.contains("0 = no limit"),
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn config_dir_for_each_os() {
+        let home = Some(std::ffi::OsString::from("/home/u"));
+        let appdata = Some(std::ffi::OsString::from(r"C:\Users\u\AppData\Roaming"));
+        assert_eq!(
+            config_dir_for(OsKind::Other, home.clone(), None),
+            Ok("/home/u/.config/clipgpt".into())
+        );
+        assert_eq!(
+            config_dir_for(OsKind::MacOs, home.clone(), None),
+            Ok("/home/u/Library/Application Support/clipgpt".into())
+        );
+        assert_eq!(
+            config_dir_for(OsKind::Windows, None, appdata),
+            Ok(r"C:\Users\u\AppData\Roaming\clipgpt".into())
+        );
+        // Each OS only looks at its own variable.
+        let err = config_dir_for(OsKind::Other, None, None).unwrap_err();
+        assert!(err.contains("HOME"), "{err}");
+        let err = config_dir_for(OsKind::MacOs, None, home.clone()).unwrap_err();
+        assert!(err.contains("HOME"), "{err}");
+        let err = config_dir_for(OsKind::Windows, home, None).unwrap_err();
+        assert!(err.contains("APPDATA"), "{err}");
+    }
+
+    #[test]
+    fn join_for_each_os() {
+        assert_eq!(join_for(OsKind::Other, "/a/b", "f"), "/a/b/f");
+        assert_eq!(join_for(OsKind::MacOs, "/a/b", "f"), "/a/b/f");
+        assert_eq!(join_for(OsKind::Windows, r"C:\a\b", "f"), r"C:\a\b\f");
     }
 
     #[test]
@@ -1533,7 +1962,7 @@ mod tests {
     fn key_in_private_file_is_loaded() {
         let path = temp_config(
             "privkey",
-            "[default]\napi_key = \"sk-abc\"\nmodel = \"m\"\n",
+            "[default]\napi_key = \"sk-abc\"\nmodel = \"m\"\napi_url = \"https://llm.example/v1\"\n",
             0o600,
         );
         let file = load_from_path(&path).unwrap();
@@ -1663,14 +2092,36 @@ mod tests {
     }
 
     #[test]
-    fn short_example_is_one_plain_profile_with_the_default_prompt() {
+    fn short_example_is_one_plain_profile_with_its_own_text_prompt() {
         let file = parse(EXAMPLE_SHORT).unwrap();
         assert_eq!(file.profile_names(), [DEFAULT_PROFILE]);
         let profile = &file.profiles[0];
         assert!(profile.include.is_empty() && profile.clear.is_empty());
         let cfg = default_config(EXAMPLE_SHORT);
-        assert_eq!(cfg.prompt_text, DEFAULT_PROMPT_TEXT);
+        // A deliberately playful prompt, to show prompt_text is free-form;
+        // the built-in default is a plain proofread.
+        assert!(!cfg.prompt_text.trim().is_empty());
+        assert_ne!(cfg.prompt_text, DEFAULT_PROMPT_TEXT);
         assert_eq!(cfg.prompt_image, DEFAULT_PROMPT_IMAGE);
+    }
+
+    #[test]
+    fn full_example_prompt_text_matches_default() {
+        let line = EXAMPLE_FULL
+            .lines()
+            .find_map(|l| l.strip_prefix("prompt_text = "))
+            .expect("prompt_text in config.full.toml.example");
+        assert_eq!(line, display_value(&Value::from(DEFAULT_PROMPT_TEXT)));
+    }
+
+    #[test]
+    fn readme_and_man_page_show_the_default_text_prompt() {
+        assert!(include_str!("../README.md").contains(DEFAULT_PROMPT_TEXT));
+        let man = man_page().replace('\n', " ");
+        assert!(
+            man.contains(DEFAULT_PROMPT_TEXT),
+            "man page prompt_text default"
+        );
     }
 
     #[test]
@@ -1688,6 +2139,10 @@ mod tests {
         assert_eq!(image.model, "qwen2.5vl");
         assert_eq!(image.api_key, None, "api_key = \"\" in [local]");
         assert!(image.api_url.starts_with("http://127.0.0.1:"));
+        // [local]'s keep_alive reaches [ocr] through include; [default]
+        // (OpenAI) sends nothing extra.
+        assert_eq!(image.request_extra_body["keep_alive"], "8h");
+        assert!(text.request_extra_body.is_empty());
     }
 
     #[test]
@@ -1722,6 +2177,53 @@ mod tests {
         include_str!("../man/clip_gpt.1").replace("\\-", "-")
     }
 
+    /// Every profile of `contents` that handles input can be selected on
+    /// its own (include-only `input = ["none"]` profiles cannot be).
+    fn assert_all_profiles_selectable(what: &str, contents: &str) {
+        let file = parse(contents).unwrap_or_else(|e| panic!("{what}: {e}"));
+        let include_only = |name: &str| {
+            contents.contains(&format!("[{name}]")) && {
+                let section = contents.split(&format!("[{name}]")).nth(1).unwrap();
+                let section = section.split("\n[").next().unwrap();
+                section.contains("input = [\"none\"]")
+            }
+        };
+        for name in file.profile_names() {
+            if include_only(name) {
+                continue;
+            }
+            if let Err(e) = file.select(Some(&[name.to_string()])) {
+                panic!("{what}: [{name}]: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn readme_and_man_page_config_examples_are_valid() {
+        let readme = include_str!("../README.md");
+        let blocks: Vec<&str> = readme
+            .split("```toml\n")
+            .skip(1)
+            .map(|b| b.split("```").next().unwrap())
+            .collect();
+        assert!(blocks.len() >= 2);
+        for (i, block) in blocks.iter().enumerate() {
+            assert_all_profiles_selectable(&format!("README block {i}"), block);
+        }
+        let man = man_page();
+        let example = man
+            .split(".Bd -literal -offset indent\n")
+            .filter(|b| b.contains("[default]"))
+            .map(|b| b.split(".Ed").next().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!example.is_empty());
+        for block in example {
+            // The block starts with the llama-server command line.
+            let toml = &block[block.find("[beeps]").unwrap()..];
+            assert_all_profiles_selectable("man page", toml);
+        }
+    }
+
     #[test]
     fn man_page_documents_every_config_key() {
         let man = man_page();
@@ -1753,7 +2255,11 @@ mod tests {
                 "{key}: {entry}"
             );
         }
-        assert!(man.contains(DEFAULT_API_URL));
+        let api_url = man.split(".It Cm api_url\n").nth(1).unwrap();
+        assert!(
+            api_url.starts_with("Required") && api_url.contains("no default"),
+            "{api_url}"
+        );
         assert!(man.contains(&format!("~/.config/{APP_NAME}/config.toml")));
         assert!(man.contains(DEFAULT_PROFILE));
     }

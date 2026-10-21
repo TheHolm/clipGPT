@@ -19,9 +19,10 @@ use imagefile::Prepared;
 /// never sent to the LLM.
 const PASSWORD_PLACEHOLDER: &str = "[clipGPT] Clipboard held a password - not sent to the LLM.";
 
-/// Put onto the clipboard instead of text carrying hidden Unicode tag
-/// characters, so the hidden payload can't be pasted on elsewhere either.
-const HIDDEN_TAGS_PLACEHOLDER: &str = "[clipGPT] Clipboard contained hidden tag characters \
+/// Put onto the clipboard instead of text carrying hidden characters
+/// (Unicode tag characters or hidden variation selectors), so the hidden
+/// payload can't be pasted on elsewhere either.
+const HIDDEN_CHARS_PLACEHOLDER: &str = "[clipGPT] Clipboard contained hidden characters \
      (likely prompt injection) - not sent to the LLM.";
 
 /// Appended to the configured prompt in the system message, so the model
@@ -44,7 +45,11 @@ const IMAGE_STATUS_HINT: &str = "the model or server may not support image input
 struct OpenAIRequest {
     model: String,
     messages: Vec<Message>,
-    keep_alive: Option<String>,
+    /// The profile's `request_extra_body` fields, added at the top level
+    /// (none by default). Never holds `model` or `messages`: the config
+    /// check refuses those.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -106,9 +111,10 @@ enum Block {
     /// A password manager marked the contents as secret. The clipboard is
     /// replaced by [`PASSWORD_PLACEHOLDER`].
     Password,
-    /// The text contained Unicode tag characters (hidden prompt injection).
-    /// The clipboard is replaced by [`HIDDEN_TAGS_PLACEHOLDER`].
-    HiddenTags,
+    /// The text contained Unicode tag characters or hidden variation
+    /// selectors (hidden prompt injection or data). The clipboard is
+    /// replaced by [`HIDDEN_CHARS_PLACEHOLDER`].
+    HiddenChars,
     /// The text looked like it contained a secret of this kind. The
     /// clipboard is left untouched, so a deliberately copied key isn't lost.
     Secret(&'static str),
@@ -129,8 +135,9 @@ impl Block {
                 "Clipboard held a password (marked by a password manager); not sent to the LLM"
                     .to_string()
             }
-            Block::HiddenTags => "Clipboard contained hidden Unicode tag characters (likely \
-                 prompt injection); not sent to the LLM"
+            Block::HiddenChars => "Clipboard contained hidden characters (Unicode tag \
+                 characters or variation selector runs; likely prompt injection); not sent to \
+                 the LLM"
                 .to_string(),
             Block::Secret(kind) => format!(
                 "Clipboard looks like it contains a secret ({}); not sent to the LLM, clipboard \
@@ -177,7 +184,9 @@ fn main() {
             println!("{}", cli::version_text());
             return;
         }
-        Ok(cli::Command::ClipboardOwner) => std::process::exit(clipboard_backend::serve_owner()),
+        Ok(cli::Command::ClipboardOwner(backend)) => {
+            std::process::exit(clipboard_backend::serve_owner(backend))
+        }
         Ok(cli::Command::ListProfiles(options)) => {
             for name in load_config(&options).profile_names() {
                 println!("{name}");
@@ -195,6 +204,10 @@ fn main() {
         .unwrap_or_else(|e| fail_default(&e));
     if show {
         print!("{}", file.show(&selection));
+        match verify_api_urls(selection.handlers()) {
+            Ok(warnings) => warnings.iter().for_each(|w| eprintln!("{w}")),
+            Err(e) => fail_default(&e),
+        }
         return;
     }
     for warning in selection.warnings() {
@@ -257,15 +270,16 @@ fn fail(message: &str, tone: u32, duration: u32) -> ! {
 }
 
 /// Check and clean clipboard text before it may be sent, in this order:
-/// 1. tag characters anywhere -> [`Block::HiddenTags`] (always checked)
+/// 1. tag characters or hidden variation selectors anywhere ->
+///    [`Block::HiddenChars`] (always checked)
 /// 2. invisible/control characters are removed (always)
 /// 3. nothing but white space left -> [`Block::Empty`]
 /// 4. if `check_secrets`, the cleaned text is scanned for secrets ->
 ///    [`Block::Secret`]. Scanning the cleaned text means a key with
 ///    zero-width characters slipped into it is still caught.
 fn screen_input(text: &str, check_secrets: bool) -> Result<String, Block> {
-    if sanitize::contains_tag_chars(text) {
-        return Err(Block::HiddenTags);
+    if sanitize::contains_hidden_chars(text) {
+        return Err(Block::HiddenChars);
     }
     let cleaned = sanitize::sanitize_input(text);
     if cleaned.trim().is_empty() {
@@ -279,14 +293,66 @@ fn screen_input(text: &str, check_secrets: bool) -> Result<String, Block> {
     Ok(cleaned)
 }
 
-/// Parse and check a profile's `api_url`, printing the warning for plain
-/// http to another computer.
-fn check_api_url(config: &Config) -> Result<Url, String> {
-    let url = Url::parse(&config.api_url).map_err(|e| format!("Invalid api_url: {}", e))?;
-    if let Some(warning) = net::check_url(&url, &net::host_is_local)? {
-        eprintln!("{}", warning);
+/// What to do with clipboard text, see [`decide_text`].
+#[derive(Debug)]
+enum TextDecision<'a> {
+    /// Send the cleaned text with this profile.
+    Send(&'a Config, String),
+    /// Refuse it (the caller replaces the clipboard for
+    /// [`Block::HiddenChars`] only).
+    Refuse(Block),
+    /// No selected profile handles text: report it, leave the clipboard
+    /// alone.
+    Unhandled,
+}
+
+/// Decide about clipboard text `raw` for the profile `config` handling
+/// text (`None` if none does). Blank text is [`Block::Empty`] either way,
+/// so an empty clipboard is reported as such. Otherwise text that no
+/// profile handles is [`TextDecision::Unhandled`] *before* any screening:
+/// text that will not be sent is not checked, so it can never trigger the
+/// hidden-character placeholder or a secret warning. Text that will be
+/// sent goes through [`screen_input`], with the secret check unless the
+/// profile or `-s` turns it off.
+fn decide_text<'a>(
+    raw: &str,
+    config: Option<&'a Config>,
+    no_secret_check: bool,
+) -> TextDecision<'a> {
+    let Some(config) = config else {
+        return if raw.trim().is_empty() {
+            TextDecision::Refuse(Block::Empty)
+        } else {
+            TextDecision::Unhandled
+        };
+    };
+    match screen_input(raw, config.secret_check && !no_secret_check) {
+        Ok(text) => TextDecision::Send(config, text),
+        Err(block) => TextDecision::Refuse(block),
     }
-    Ok(url)
+}
+
+/// Parse and check a profile's `api_url` (see [`net::check_url`]).
+/// Returns the URL and the warning to print for plain http to another
+/// computer, if any.
+fn check_api_url(config: &Config) -> Result<(Url, Option<String>), String> {
+    let url = Url::parse(&config.api_url).map_err(|e| format!("Invalid api_url: {}", e))?;
+    let warning = net::check_url(&url, config.api_key.is_some(), &net::host_is_local)?;
+    Ok((url, warning))
+}
+
+/// `--show-profile`'s check of every handling profile's `api_url`, as a
+/// normal run only checks the one it uses. Returns the warnings, each
+/// naming its profile, or the first error, naming its profile.
+fn verify_api_urls<'a>(
+    profiles: impl IntoIterator<Item = (&'a str, &'a Config)>,
+) -> Result<Vec<String>, String> {
+    let mut warnings = Vec::new();
+    for (name, config) in profiles {
+        let (_, warning) = check_api_url(config).map_err(|e| format!("Profile [{name}]: {e}"))?;
+        warnings.extend(warning.map(|w| format!("Profile [{name}]: {w}")));
+    }
+    Ok(warnings)
 }
 
 /// The clipboard size limits for `selection`: each kind's limit from the
@@ -317,11 +383,6 @@ fn run_with<'a>(
     no_secret_check: bool,
     used: &mut Option<&'a Config>,
 ) -> Result<Outcome, String> {
-    // Every profile that may be used must have a valid api_url, whatever
-    // the clipboard holds.
-    for config in selection.handlers() {
-        check_api_url(config)?;
-    }
     let unhandled = |kind| Ok(Outcome::Blocked(Block::Unhandled(kind, selection.names())));
 
     let (config, input) = match clipboard_backend::get(limits_for(selection))? {
@@ -339,27 +400,33 @@ fn run_with<'a>(
             (config, Input::Image(image))
         }
         Clip::Text(raw_text) => {
-            // An empty clipboard is reported as empty text even when no
-            // profile takes text.
             let config = selection.handler(InputKind::Text);
             *used = config.or(*used);
-            let check_secrets = config.is_none_or(|c| c.secret_check) && !no_secret_check;
-            match (screen_input(&raw_text, check_secrets), config) {
-                (Ok(text), Some(config)) => (config, Input::Text(text)),
-                (Ok(_), None) => return unhandled(InputKind::Text),
-                (Err(Block::HiddenTags), _) => {
-                    clipboard_backend::set_text(HIDDEN_TAGS_PLACEHOLDER.to_string())?;
-                    return Ok(Outcome::Blocked(Block::HiddenTags));
+            match decide_text(&raw_text, config, no_secret_check) {
+                TextDecision::Send(config, text) => (config, Input::Text(text)),
+                TextDecision::Unhandled => return unhandled(InputKind::Text),
+                TextDecision::Refuse(Block::HiddenChars) => {
+                    clipboard_backend::set_text(HIDDEN_CHARS_PLACEHOLDER.to_string())?;
+                    return Ok(Outcome::Blocked(Block::HiddenChars));
                 }
-                (Err(block), _) => return Ok(Outcome::Blocked(block)),
+                TextDecision::Refuse(block) => return Ok(Outcome::Blocked(block)),
             }
         }
     };
 
-    let url = Url::parse(&config.api_url).map_err(|e| format!("Invalid api_url: {}", e))?;
+    // Only the profile actually used is checked (no DNS lookups or
+    // warnings for the others); --show-profile checks them all.
+    let (url, warning) = check_api_url(config)?;
+    if let Some(warning) = warning {
+        eprintln!("{}", warning);
+    }
     let hint = status_hint(&input);
     let payload = build_request(config, input);
-    let client = net::build_client(config.allow_redirects, config.request_timeout)?;
+    let client = net::build_client(
+        config.allow_redirects,
+        config.api_key.is_some(),
+        config.request_timeout,
+    )?;
     let body = net::post_json(
         &client,
         &url,
@@ -421,7 +488,7 @@ fn build_request(config: &Config, input: Input) -> OpenAIRequest {
                 content,
             },
         ],
-        keep_alive: Some("8h".to_string()),
+        extra: config.request_extra_body.clone(),
     }
 }
 
@@ -466,7 +533,33 @@ mod tests {
             allow_redirects: false,
             secret_check: true,
             request_timeout: Some(std::time::Duration::from_secs(30)),
+            request_extra_body: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn request_has_only_model_and_messages_by_default() {
+        let request = build_request(&config_with_prompt("p"), Input::Text("x".into()));
+        let json = serde_json::to_value(&request).unwrap();
+        let mut keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["messages", "model"], "no keep_alive or other extras");
+    }
+
+    #[test]
+    fn request_extra_body_is_added_at_top_level() {
+        let mut config = config_with_prompt("p");
+        let serde_json::Value::Object(extra) =
+            serde_json::json!({"keep_alive": "8h", "options": {"num_ctx": 8192}})
+        else {
+            unreachable!()
+        };
+        config.request_extra_body = extra;
+        let json = serde_json::to_value(build_request(&config, Input::Text("x".into()))).unwrap();
+        assert_eq!(json["keep_alive"], "8h");
+        assert_eq!(json["options"]["num_ctx"], 8192);
+        assert_eq!(json["model"], "test-model");
+        assert_eq!(json["messages"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -603,8 +696,21 @@ mod tests {
     #[test]
     fn screen_refuses_tag_chars_even_without_secret_check() {
         let text = "hello\u{E0001}\u{E0069}";
-        assert_eq!(screen_input(text, true), Err(Block::HiddenTags));
-        assert_eq!(screen_input(text, false), Err(Block::HiddenTags));
+        assert_eq!(screen_input(text, true), Err(Block::HiddenChars));
+        assert_eq!(screen_input(text, false), Err(Block::HiddenChars));
+    }
+
+    #[test]
+    fn screen_refuses_variation_selector_runs_but_keeps_emoji() {
+        for text in ["x\u{FE01}\u{FE02}", "x\u{E0100}"] {
+            assert_eq!(
+                screen_input(text, false),
+                Err(Block::HiddenChars),
+                "{text:?}"
+            );
+        }
+        let emoji = "I \u{2764}\u{FE0F} it";
+        assert_eq!(screen_input(emoji, true), Ok(emoji.to_string()));
     }
 
     #[test]
@@ -615,6 +721,81 @@ mod tests {
             Err(Block::Secret("GitHub token"))
         );
         assert_eq!(screen_input(&text, false), Ok(text));
+    }
+
+    #[test]
+    fn verify_api_urls_checks_every_profile_and_names_it() {
+        let with_url = |url: &str| {
+            let mut c = config_with_prompt("p");
+            c.api_url = url.into();
+            c
+        };
+        let good = with_url("https://llm.example/v1");
+        let local = with_url("http://127.0.0.1:11434/v1");
+        let plain = with_url("http://203.0.113.7/v1");
+        let bad_scheme = with_url("ftp://llm.example/");
+        let garbage = with_url("not a url");
+        assert_eq!(verify_api_urls([("a", &good), ("b", &local)]), Ok(vec![]));
+        let warnings = verify_api_urls([("a", &good), ("remote", &plain)]).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].starts_with("Profile [remote]: "),
+            "{warnings:?}"
+        );
+        // The bad one is found even when it is not the first or last.
+        let err = verify_api_urls([("a", &good), ("ocr", &bad_scheme), ("b", &local)]).unwrap_err();
+        assert!(err.starts_with("Profile [ocr]: "), "{err}");
+        let err = verify_api_urls([("x", &garbage)]).unwrap_err();
+        assert!(err.starts_with("Profile [x]: Invalid api_url"), "{err}");
+    }
+
+    #[test]
+    fn unhandled_text_is_never_screened() {
+        // Hidden characters or a secret, but no profile takes text: report
+        // it as unhandled (clipboard untouched), not as an attack.
+        for raw in [
+            "hello\u{E0001}\u{E0069}",
+            "x\u{FE01}\u{FE02}",
+            "key sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCD",
+            "plain text",
+        ] {
+            assert!(
+                matches!(decide_text(raw, None, false), TextDecision::Unhandled),
+                "{raw:?}"
+            );
+        }
+        assert!(matches!(
+            decide_text(" \n", None, false),
+            TextDecision::Refuse(Block::Empty)
+        ));
+    }
+
+    #[test]
+    fn handled_text_is_screened_with_profile_and_option() {
+        let config = config_with_prompt("p");
+        assert!(matches!(
+            decide_text("a\u{200B}b", Some(&config), false),
+            TextDecision::Send(c, t) if std::ptr::eq(c, &config) && t == "ab"
+        ));
+        assert!(matches!(
+            decide_text("hello\u{E0001}", Some(&config), true),
+            TextDecision::Refuse(Block::HiddenChars)
+        ));
+        let secret = "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n";
+        assert!(matches!(
+            decide_text(secret, Some(&config), false),
+            TextDecision::Refuse(Block::Secret(_))
+        ));
+        assert!(matches!(
+            decide_text(secret, Some(&config), true),
+            TextDecision::Send(..)
+        ));
+        let mut off = config.clone();
+        off.secret_check = false;
+        assert!(matches!(
+            decide_text(secret, Some(&off), false),
+            TextDecision::Send(..)
+        ));
     }
 
     #[test]
@@ -634,7 +815,7 @@ mod tests {
         assert!(msg.contains("GitHub token"));
         assert!(msg.contains("--no-secret-check"));
         assert!(msg.contains("secret_check = false"));
-        assert!(Block::HiddenTags.message().contains("tag characters"));
+        assert!(Block::HiddenChars.message().contains("hidden characters"));
         assert!(Block::Password.message().contains("password"));
         assert!(Block::Empty.message().contains("no text or image"));
         let msg = Block::Unhandled(InputKind::Image, "a,b".into()).message();
