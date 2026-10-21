@@ -530,6 +530,8 @@ mod tests {
             bad_len,
             jpeg_from(&[&[0x00, 0x11]]), // data where a marker belongs
             jpeg_from(&[&[0xFF, 0xD8]]), // second SOI
+            vec![],                      // no SOI at all
+            vec![0x00, 0x01, 0x02],      // not even close to SOI
         ] {
             let err = strip_jpeg(&bad).unwrap_err();
             assert!(err.contains("(JPEG) is malformed"), "{bad:?}: {err}");
