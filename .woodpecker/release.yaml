@@ -184,14 +184,20 @@ steps:
       - mkdir -p dist
       - cp target/linux-amd64-trixie/x86_64-unknown-linux-gnu/debian/*.deb dist/
       # Build-time smoke test: confirm the binary actually landed in the
-      # built package, and the licence text (not just its name) made it
-      # into the auto-generated copyright file. Each .deb step matches its
-      # own exact file name (clip-gpt_<ver>-1~<distro>_<arch>.deb): dist/ is
+      # built package, the licence text (not just its name) made it into
+      # the explicitly-installed copyright file, and a Debian changelog
+      # was generated from debian/changelog (Debian Policy 12.7 requires
+      # one for a non-native package, which every "~<distro>"
+      # deb-revision here makes this). Each .deb step matches its own
+      # exact file name (clip-gpt_<ver>-1~<distro>_<arch>.deb): dist/ is
       # shared, so a loose glob could match another step's package.
+      # lintian's default --fail-on error means this step only fails the
+      # build on an E: tag; a W:/I: tag is printed but doesn't fail it.
       - dpkg-deb -c dist/*~trixie_amd64.deb | grep -qF 'usr/bin/clip_gpt'
       - dpkg-deb -c dist/*~trixie_amd64.deb | grep -qF 'usr/share/man/man1/clip_gpt.1.gz'
+      - dpkg-deb -c dist/*~trixie_amd64.deb | grep -qF 'usr/share/doc/clip-gpt/changelog.Debian.gz'
       - dpkg-deb --fsys-tarfile dist/*~trixie_amd64.deb | tar -xO ./usr/share/doc/clip-gpt/copyright | grep -qi 'GNU AFFERO GENERAL PUBLIC LICENSE'
-      - lintian --info dist/*~trixie_amd64.deb || true
+      - lintian --info dist/*~trixie_amd64.deb
 
   - name: build-linux-arm64-trixie
     image: rust:1.92-trixie
@@ -213,8 +219,9 @@ steps:
       - cp target/linux-arm64-trixie/aarch64-unknown-linux-gnu/debian/*.deb dist/
       - dpkg-deb -c dist/*~trixie_arm64.deb | grep -qF 'usr/bin/clip_gpt'
       - dpkg-deb -c dist/*~trixie_arm64.deb | grep -qF 'usr/share/man/man1/clip_gpt.1.gz'
+      - dpkg-deb -c dist/*~trixie_arm64.deb | grep -qF 'usr/share/doc/clip-gpt/changelog.Debian.gz'
       - dpkg-deb --fsys-tarfile dist/*~trixie_arm64.deb | tar -xO ./usr/share/doc/clip-gpt/copyright | grep -qi 'GNU AFFERO GENERAL PUBLIC LICENSE'
-      - lintian --info dist/*~trixie_arm64.deb || true
+      - lintian --info dist/*~trixie_arm64.deb
 
   - name: build-linux-amd64-ubuntu2604
     image: ubuntu:26.04
@@ -235,8 +242,9 @@ steps:
       - cp target/linux-amd64-ubuntu2604/debian/*.deb dist/
       - dpkg-deb -c dist/*~ubuntu2604_amd64.deb | grep -qF 'usr/bin/clip_gpt'
       - dpkg-deb -c dist/*~ubuntu2604_amd64.deb | grep -qF 'usr/share/man/man1/clip_gpt.1.gz'
+      - dpkg-deb -c dist/*~ubuntu2604_amd64.deb | grep -qF 'usr/share/doc/clip-gpt/changelog.Debian.gz'
       - dpkg-deb --fsys-tarfile dist/*~ubuntu2604_amd64.deb | tar -xO ./usr/share/doc/clip-gpt/copyright | grep -qi 'GNU AFFERO GENERAL PUBLIC LICENSE'
-      - lintian --info dist/*~ubuntu2604_amd64.deb || true
+      - lintian --info dist/*~ubuntu2604_amd64.deb
 
   - name: build-linux-arm64-ubuntu2604
     image: ubuntu:26.04
@@ -261,8 +269,9 @@ steps:
       - cp target/linux-arm64-ubuntu2604/aarch64-unknown-linux-gnu/debian/*.deb dist/
       - dpkg-deb -c dist/*~ubuntu2604_arm64.deb | grep -qF 'usr/bin/clip_gpt'
       - dpkg-deb -c dist/*~ubuntu2604_arm64.deb | grep -qF 'usr/share/man/man1/clip_gpt.1.gz'
+      - dpkg-deb -c dist/*~ubuntu2604_arm64.deb | grep -qF 'usr/share/doc/clip-gpt/changelog.Debian.gz'
       - dpkg-deb --fsys-tarfile dist/*~ubuntu2604_arm64.deb | tar -xO ./usr/share/doc/clip-gpt/copyright | grep -qi 'GNU AFFERO GENERAL PUBLIC LICENSE'
-      - lintian --info dist/*~ubuntu2604_arm64.deb || true
+      - lintian --info dist/*~ubuntu2604_arm64.deb
 
   - name: build-windows-amd64
     image: rust:1.92-trixie

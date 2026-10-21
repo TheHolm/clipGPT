@@ -1,0 +1,11 @@
+clip-gpt (0.7.1-1) unstable; urgency=medium
+
+  * Debian packaging fixes only, no functional change. See RELEASE_NOTES.md
+    in the source tarball for the full, user-facing history.
+  * Added a real Maintainer address (lintian's mail-address check
+    requires one).
+  * Added this changelog, required by Debian Policy 12.7 for every
+    non-native package.
+  * Changed Section from the invalid "utility" to "utils".
+
+ -- TheHolm <16282750+TheHolm@users.noreply.github.com>  Wed, 21 Oct 2026 09:49:37 +0000

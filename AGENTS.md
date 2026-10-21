@@ -89,6 +89,12 @@ should pass before merging anything touching the macOS backend.
 - `debian/copyright` - the full AGPL-3.0-or-later text, installed into every
   `.deb` explicitly (Debian Policy 12.5 - `cargo-deb`'s own auto-generated
   copyright only names the licence, not its text)
+- `debian/changelog` - standard Debian changelog, one entry per release;
+  `cargo-deb` reads it (`changelog` key in `Cargo.toml`) to generate
+  `changelog.Debian.gz`, required by Debian Policy 12.7 since every `.deb`
+  built here uses a `~<distro>` `deb-revision`, which makes it non-native.
+  `tests/packaging.rs` fails if its top entry's version doesn't match
+  `Cargo.toml` - add a new entry with every version bump
 - `.woodpecker/release.yaml` - tag-triggered CI: builds Linux `.deb`,
   Windows binaries, and FreeBSD `.pkg` artifacts and publishes a GitHub
   release
