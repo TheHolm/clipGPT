@@ -78,16 +78,45 @@ when:
 # (all seven in parallel overloaded it). Each step waits for the previous
 # one in its lane; publish waits for every build:
 #
-#   lane A: build-freebsd-pkg -> build-windows-amd64 -> build-windows-arm64
-#   lane B: build-ci-tools -> linux-amd64-trixie -> linux-arm64-trixie
-#           -> linux-amd64-ubuntu2604 -> linux-arm64-ubuntu2604
+#   audit  -> lane A: build-freebsd-pkg -> build-windows-amd64 -> build-windows-arm64
+#          -> lane B: build-ci-tools -> linux-amd64-trixie -> linux-arm64-trixie
+#                      -> linux-amd64-ubuntu2604 -> linux-arm64-ubuntu2604
+#
+# audit runs once, before both lanes, instead of inside one of the .deb
+# steps: it scans Cargo.lock, which lists every target's dependencies
+# (Windows-only clipboard-win, macOS-only objc2-app-kit, Linux/FreeBSD-only
+# wl-clipboard-rs and x11rb) regardless of which one a given step builds,
+# so one run already covers all of them. Both lanes depend on it directly
+# instead of on each other, so a vulnerable lockfile fails before either
+# lane's slow builds (FreeBSD, the four .debs) start, rather than only
+# after lane A happens to finish.
 #
 # A failing step skips the rest of its lane, and so the publish step: every
 # target stays hard-required. FreeBSD, the slowest step, starts lane A.
 steps:
-  - name: build-freebsd-pkg
+  - name: audit
     image: rust:1.92-trixie
     depends_on: []
+    commands:
+      - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
+      - cargo install cargo-audit --locked --version 0.22.2 --root /tmp/audit-tools
+      # Fails the release when a dependency in Cargo.lock has a published
+      # advisory, or is yanked. Every build below uses --locked, so what
+      # is built is exactly the Cargo.lock audited here: a lock file that
+      # cargo would have to update fails the build instead of being
+      # silently changed. cargo fetch populates cargo's own index cache
+      # first, and .cargo/audit.toml tells cargo-audit to read that
+      # instead of re-downloading each of the ~280 locked crates' index
+      # entries itself for the yanked check, which has a hard-coded 10 s
+      # timeout per crate with no way to raise it and timed out on most
+      # of them here every time (https://github.com/RustSec/rustsec,
+      # rustsec::cached_index::REQUEST_TIMEOUT).
+      - cargo fetch --locked
+      - /tmp/audit-tools/bin/cargo-audit audit
+
+  - name: build-freebsd-pkg
+    image: rust:1.92-trixie
+    depends_on: [audit]
     environment:
       PKG_CONFIG_ALLOW_CROSS: "1"
       PKG_CONFIG_SYSROOT_DIR: /opt/freebsd-sysroot
@@ -141,22 +170,22 @@ steps:
       - rustup target add x86_64-unknown-freebsd
       - ./scripts/ci-freebsd.sh /opt/freebsd-sysroot /opt/freebsd-stage dist /opt/freebsd-deps.json
 
-  # cargo-deb and cargo-audit are compiled once here into the shared
-  # workspace (.ci-tools/bin) instead of in every .deb step. Built against
-  # trixie's glibc, they also run in the ubuntu:26.04 steps (newer glibc);
-  # the arm64 steps cross-compile on the amd64 host, so they run the same
-  # amd64 tools. Removed first: the workspace can persist between runs, and
-  # a stale or half-built tool must never be reused.
+  # cargo-deb is compiled once here into the shared workspace
+  # (.ci-tools/bin) instead of in every .deb step. Built against trixie's
+  # glibc, it also runs in the ubuntu:26.04 steps (newer glibc); the arm64
+  # steps cross-compile on the amd64 host, so they run the same amd64
+  # tool. Removed first: the workspace can persist between runs, and a
+  # stale or half-built tool must never be reused. Depends on audit
+  # (rather than running in parallel with it) so a vulnerable lockfile is
+  # caught before spending time compiling anything else for this lane.
   - name: build-ci-tools
     image: rust:1.92-trixie
-    depends_on: []
+    depends_on: [audit]
     commands:
       - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
       - rm -rf .ci-tools
       - cargo install cargo-deb --locked --version 3.8.0 --root .ci-tools
-      - cargo install cargo-audit --locked --version 0.22.2 --root .ci-tools
       - .ci-tools/bin/cargo-deb --version
-      - .ci-tools/bin/cargo-audit --version
 
   - name: build-linux-amd64-trixie
     image: rust:1.92-trixie
@@ -167,19 +196,8 @@ steps:
       - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
       - apt-get update && apt-get install -y --no-install-recommends libasound2-dev libssl-dev pkg-config lintian
       - export PATH="$CI_WORKSPACE/.ci-tools/bin:$PATH"
-      # Fails the release when a dependency in Cargo.lock has a published
-      # advisory, or is yanked. Every build below uses --locked, so what
-      # is built is exactly the Cargo.lock audited here: a lock file that
-      # cargo would have to update fails the build instead of being
-      # silently changed. cargo fetch populates cargo's own index cache
-      # first, and .cargo/audit.toml tells cargo-audit to read that
-      # instead of re-downloading each of the ~280 locked crates' index
-      # entries itself for the yanked check, which has a hard-coded 10 s
-      # timeout per crate with no way to raise it and timed out on most
-      # of them here every time (https://github.com/RustSec/rustsec,
-      # rustsec::cached_index::REQUEST_TIMEOUT).
-      - cargo fetch --locked
-      - cargo audit
+      # cargo-audit already ran once, on Cargo.lock, in the audit step
+      # (see the lane diagram above) - not repeated per .deb target.
       - cargo deb --locked --target x86_64-unknown-linux-gnu --deb-revision "1~trixie"
       - mkdir -p dist
       - cp target/linux-amd64-trixie/x86_64-unknown-linux-gnu/debian/*.deb dist/

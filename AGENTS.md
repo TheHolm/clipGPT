@@ -102,7 +102,11 @@ should pass before merging anything touching the macOS backend.
   from cargo's own local index cache instead of downloading each locked
   crate's entry itself (slow, prone to timing out); run `cargo fetch
   --locked` (or any build) first so that cache is current. Ignored by
-  cargo itself
+  cargo itself. `cargo audit` itself runs once, in its own `audit` step
+  in `.woodpecker/release.yaml`, before either build lane: it scans
+  `Cargo.lock`, which already lists every target's dependencies
+  regardless of which one a given step builds, so one run covers all of
+  them
 - `RELEASE_NOTES.md` - detailed, user-facing history of tagged releases
 - `AGENTS.md` - this file
 - `LICENSE` - GNU Affero GPL v3 or later (`AGPL-3.0-or-later`)
