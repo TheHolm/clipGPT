@@ -92,6 +92,11 @@ should pass before merging anything touching the macOS backend.
 - `.woodpecker/release.yaml` - tag-triggered CI: builds Linux `.deb`,
   Windows binaries, and FreeBSD `.pkg` artifacts and publishes a GitHub
   release
+- `.cargo/audit.toml` - tells `cargo audit` to check for yanked crates
+  from cargo's own local index cache instead of downloading each locked
+  crate's entry itself (slow, prone to timing out); run `cargo fetch
+  --locked` (or any build) first so that cache is current. Ignored by
+  cargo itself
 - `RELEASE_NOTES.md` - detailed, user-facing history of tagged releases
 - `AGENTS.md` - this file
 - `LICENSE` - GNU Affero GPL v3 or later (`AGPL-3.0-or-later`)

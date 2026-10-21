@@ -168,9 +168,17 @@ steps:
       - apt-get update && apt-get install -y --no-install-recommends libasound2-dev libssl-dev pkg-config lintian
       - export PATH="$CI_WORKSPACE/.ci-tools/bin:$PATH"
       # Fails the release when a dependency in Cargo.lock has a published
-      # advisory. Every build below uses --locked, so what is built is
-      # exactly the Cargo.lock audited here: a lock file that cargo would
-      # have to update fails the build instead of being silently changed.
+      # advisory, or is yanked. Every build below uses --locked, so what
+      # is built is exactly the Cargo.lock audited here: a lock file that
+      # cargo would have to update fails the build instead of being
+      # silently changed. cargo fetch populates cargo's own index cache
+      # first, and .cargo/audit.toml tells cargo-audit to read that
+      # instead of re-downloading each of the ~280 locked crates' index
+      # entries itself for the yanked check, which has a hard-coded 10 s
+      # timeout per crate with no way to raise it and timed out on most
+      # of them here every time (https://github.com/RustSec/rustsec,
+      # rustsec::cached_index::REQUEST_TIMEOUT).
+      - cargo fetch --locked
       - cargo audit
       - cargo deb --locked --target x86_64-unknown-linux-gnu --deb-revision "1~trixie"
       - mkdir -p dist

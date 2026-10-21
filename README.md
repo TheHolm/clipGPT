@@ -390,6 +390,19 @@ xvfb-run -a cargo test -- --ignored
 The `tests/cli_dispatch.rs` integration tests (`--help`, `--list-profiles`,
 `--show-profile`, ...) need no display and run with plain `cargo test`.
 
+To check for security advisories against dependencies:
+
+```
+cargo install cargo-audit
+cargo fetch --locked
+cargo audit
+```
+
+`cargo fetch` first makes sure cargo's own local copy of the crates.io
+index is current; `.cargo/audit.toml` tells `cargo audit` to check
+whether any locked crate was yanked using that local copy, instead of
+downloading each crate's entry itself (slow, and prone to timing out).
+
 ### Docker (build environment only)
 
 `docker/` contains a Dockerfile/compose setup for building the project in a

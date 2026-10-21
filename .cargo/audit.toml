@@ -1,0 +1,14 @@
+# cargo-audit settings for this repo (see `cargo audit` in
+# .woodpecker/release.yaml and AGENTS.md). Ignored by cargo itself, so it
+# does not affect any build or package.
+#
+# The yanked-crate check stays on, but reads cargo's local copy of the
+# crates.io index instead of downloading every locked crate's entry
+# itself: cargo-audit allows only 10 seconds per crate for that download,
+# hard-coded, with no option to raise it, which timed out on most of
+# this project's 276 dependencies in CI every time. Run
+# `cargo fetch --locked` (or any build) first, so that local copy is
+# current; without it, the check only sees the index as of the last
+# fetch or build.
+[yanked]
+update_index = false

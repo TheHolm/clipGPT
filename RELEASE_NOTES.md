@@ -70,6 +70,9 @@ User-facing changes:
 - Release builds: FreeBSD dependency packages are verified against the
   repository's checksums, and every build uses `--locked`, so packages
   contain exactly the audited `Cargo.lock`.
+- **Fixed: `rustls-webpki` updated to 0.103.16**, which addresses
+  RUSTSEC-2026-0382 (certificate verification could accept a
+  distrusted intermediate certificate). Caught by `cargo audit` in CI.
 
 ### Details
 
@@ -132,6 +135,15 @@ User-facing changes:
 - `.woodpecker/release.yaml`, `scripts/ci-freebsd.sh`: `--locked` on all
   builds; header lists every download and how it is verified (llvm-mingw
   is only protected by HTTPS - no checksum is published).
+- `cargo audit` in CI: `cargo fetch --locked` now runs first, and new
+  `.cargo/audit.toml` (`[yanked] update_index = false`) makes the
+  yanked-crate check read cargo's own local index cache instead of
+  downloading each of the ~280 locked crates' entries itself, which has
+  a hard-coded, unconfigurable 10 s timeout per crate and was timing out
+  on most of them. Also applies to a local `cargo audit` (README
+  "Compiling" - Linux).
+- Dependency bump: `rustls-webpki` 0.103.15 -> 0.103.16 (see the
+  RUSTSEC-2026-0382 fix above).
 - Docs: README, man page and examples updated throughout; README and man
   page config examples set `api_url`, and a new test parses them.
 - Tests: 244 unit tests plus 5 X11 tests under `xvfb-run` (password
