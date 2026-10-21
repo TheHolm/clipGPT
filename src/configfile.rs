@@ -234,20 +234,52 @@ fn default_value(key: &str) -> Option<Value> {
     })
 }
 
+/// Which per-OS directory convention [`config_dir_for`] should use.
+/// [`config_dir`] picks it from `cfg!(target_os = ...)`, so tests
+/// (always built for one real OS) can still exercise all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OsKind {
+    Windows,
+    MacOs,
+    Other,
+}
+
+/// This build's actual OS, for [`config_dir`].
+fn build_os() -> OsKind {
+    if cfg!(target_os = "windows") {
+        OsKind::Windows
+    } else if cfg!(target_os = "macos") {
+        OsKind::MacOs
+    } else {
+        OsKind::Other
+    }
+}
+
 /// Per-OS directory holding config.toml:
 /// * Linux   "~/.config/clipgpt"
 /// * MacOS   "~/Library/Application Support/clipgpt"
 /// * Windows "%APPDATA%\clipgpt"
 fn config_dir() -> Result<String, String> {
-    if cfg!(target_os = "windows") {
-        if let Some(app_dir) = env::var_os("APPDATA") {
+    config_dir_for(build_os(), env::var_os("HOME"), env::var_os("APPDATA"))
+}
+
+/// [`config_dir`]'s logic for a given `os`, `home` (`$HOME`) and
+/// `appdata` (`%APPDATA%`, Windows only), so each branch can be tested
+/// regardless of the OS this was actually built for.
+fn config_dir_for(
+    os: OsKind,
+    home: Option<std::ffi::OsString>,
+    appdata: Option<std::ffi::OsString>,
+) -> Result<String, String> {
+    if os == OsKind::Windows {
+        if let Some(app_dir) = appdata {
             Ok(format!("{}\\{}", app_dir.to_string_lossy(), APP_NAME))
         } else {
             Err("APPDATA environment variable is not set. And we are under Windows".to_string())
         }
-    } else if let Some(home_dir) = env::var_os("HOME") {
+    } else if let Some(home_dir) = home {
         let home_dir = home_dir.to_string_lossy();
-        if cfg!(target_os = "macos") {
+        if os == OsKind::MacOs {
             Ok(format!(
                 "{}/Library/Application Support/{}",
                 home_dir, APP_NAME
@@ -263,11 +295,13 @@ fn config_dir() -> Result<String, String> {
 
 /// `file` inside `dir`, with the OS's path separator.
 fn join(dir: &str, file: &str) -> String {
-    let separator = if cfg!(target_os = "windows") {
-        '\\'
-    } else {
-        '/'
-    };
+    join_for(build_os(), dir, file)
+}
+
+/// [`join`]'s logic for a given `os`, so both separators can be tested
+/// regardless of the OS this was actually built for.
+fn join_for(os: OsKind, dir: &str, file: &str) -> String {
+    let separator = if os == OsKind::Windows { '\\' } else { '/' };
     format!("{dir}{separator}{file}")
 }
 
@@ -469,6 +503,10 @@ fn parse_file(path: &str, contents: &str) -> Result<ConfigFile, String> {
                 line_of(contents, span.start),
                 e.message()
             ),
+            // Parsing straight into a Table never goes through a path that
+            // leaves the span empty (that needs serde's custom-error
+            // constructor); kept so a future toml version doing so still
+            // gets a sensible message instead of panicking.
             None => format!("{path}: invalid TOML: {}", e.message()),
         }
     })?;
@@ -1475,6 +1513,10 @@ mod tests {
         assert!(parse_err("[a]\ninclude = [\"a\"]\n").contains("[a] -> [a]"));
         assert!(parse_err("[a]\ninclude = [\"x\", \"x\"]\n").contains("twice"));
         assert!(parse_err("[a]\ninclude = \"x\"\n").contains("must be a list"));
+        // A listed name with characters a profile section name can't have.
+        assert!(
+            parse_err("[a]\ninclude = [\"not valid!\"]\n").contains("not a valid profile name"),
+        );
         // Checked in profiles that are never selected too.
         assert!(
             parse_err("[default]\nmodel = \"m\"\n[unused]\ninclude = [\"gone\"]\n")
@@ -1570,6 +1612,17 @@ mod tests {
             err.contains("[nomodel] handles image but has no model"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn handlers_mut_reaches_every_handling_profiles_config() {
+        let mut sel = select(ROUTING, Some("text,image,both")).unwrap();
+        for config in sel.handlers_mut() {
+            config.request_timeout = Some(Duration::from_secs(1));
+        }
+        for (_, config) in sel.handlers() {
+            assert_eq!(config.request_timeout, Some(Duration::from_secs(1)));
+        }
     }
 
     #[test]
@@ -1704,6 +1757,13 @@ mod tests {
             display_api_url(&Value::from("https://h.example/?")),
             "\"https://h.example/\" (query hidden)"
         );
+        // Defensive: check_value never lets api_url be anything but a
+        // string, but display_api_url still has a sensible answer if
+        // that ever changed.
+        assert_eq!(
+            display_api_url(&Value::from(5)),
+            display_value(&Value::from(5))
+        );
     }
 
     #[test]
@@ -1800,8 +1860,8 @@ mod tests {
     #[test]
     fn display_value_is_one_line_toml() {
         assert_eq!(
-            display_value(&Value::from("a\"b\\c\nd\te\u{1}")),
-            "\"a\\\"b\\\\c\\nd\\te\\u0001\""
+            display_value(&Value::from("a\"b\\c\nd\te\rf\u{1}")),
+            "\"a\\\"b\\\\c\\nd\\te\\rf\\u0001\""
         );
         assert_eq!(
             display_value(&Value::Array(vec!["x".into(), "y".into()])),
@@ -1809,6 +1869,9 @@ mod tests {
         );
         assert_eq!(display_value(&Value::from(true)), "true");
         assert_eq!(display_value(&Value::from(7)), "7");
+        // Dates never pass check_value, so this is purely defensive.
+        let date: Value = "1979-05-27T07:32:00Z".parse().unwrap();
+        assert_eq!(display_value(&date), format!("{date:?}"));
     }
 
     #[test]
@@ -1843,6 +1906,38 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn config_dir_for_each_os() {
+        let home = Some(std::ffi::OsString::from("/home/u"));
+        let appdata = Some(std::ffi::OsString::from(r"C:\Users\u\AppData\Roaming"));
+        assert_eq!(
+            config_dir_for(OsKind::Other, home.clone(), None),
+            Ok("/home/u/.config/clipgpt".into())
+        );
+        assert_eq!(
+            config_dir_for(OsKind::MacOs, home.clone(), None),
+            Ok("/home/u/Library/Application Support/clipgpt".into())
+        );
+        assert_eq!(
+            config_dir_for(OsKind::Windows, None, appdata),
+            Ok(r"C:\Users\u\AppData\Roaming\clipgpt".into())
+        );
+        // Each OS only looks at its own variable.
+        let err = config_dir_for(OsKind::Other, None, None).unwrap_err();
+        assert!(err.contains("HOME"), "{err}");
+        let err = config_dir_for(OsKind::MacOs, None, home.clone()).unwrap_err();
+        assert!(err.contains("HOME"), "{err}");
+        let err = config_dir_for(OsKind::Windows, home, None).unwrap_err();
+        assert!(err.contains("APPDATA"), "{err}");
+    }
+
+    #[test]
+    fn join_for_each_os() {
+        assert_eq!(join_for(OsKind::Other, "/a/b", "f"), "/a/b/f");
+        assert_eq!(join_for(OsKind::MacOs, "/a/b", "f"), "/a/b/f");
+        assert_eq!(join_for(OsKind::Windows, r"C:\a\b", "f"), r"C:\a\b\f");
     }
 
     #[test]
