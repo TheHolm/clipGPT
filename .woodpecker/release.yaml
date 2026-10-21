@@ -91,25 +91,56 @@ when:
 # lane's slow builds (FreeBSD, the four .debs) start, rather than only
 # after lane A happens to finish.
 #
+# audit's `cargo fetch --locked` also fills a crate cache
+# ($CI_WORKSPACE/.cargo-home) shared read-only by every build step below
+# (CARGO_NET_OFFLINE=true there), instead of each of the 7 steps
+# downloading the same ~280 crates into its own container. Compiled
+# output is never shared this way, only the downloaded .crate files and
+# the crates.io index: each step still has its own target directory (or,
+# for the two rust:1.92-trixie lane A steps, runs after the other in the
+# same lane) and compiles on its own. The two Ubuntu steps additionally
+# share a $CI_WORKSPACE/.rustup-ubuntu so only the first of them downloads
+# the 1.92.0 toolchain itself; see the comment there. Cargo's cache lock
+# is shared for reads and only briefly exclusive for a download, so
+# steps in different lanes reading it at the same time do not block each
+# other - and, CARGO_NET_OFFLINE turns a missing crate there into a hard
+# failure rather than a silent download, so no build step below pulls in
+# a crate the audit step didn't already see. This only covers crates:
+# apt packages, the FreeBSD base system and dependency closure,
+# llvm-mingw and rustup's own toolchains/targets are unrelated downloads,
+# unaffected by any of this. build-ci-tools is the one exception that
+# keeps normal cargo network access too, since cargo-deb isn't itself
+# pinned in this project's Cargo.lock for audit's fetch to have covered.
+#
+# Both caches are wiped at the very start of the steps that fill them, so
+# every release starts from nothing cached, the same rule .ci-tools
+# already follows.
+#
 # A failing step skips the rest of its lane, and so the publish step: every
 # target stays hard-required. FreeBSD, the slowest step, starts lane A.
 steps:
   - name: audit
     image: rust:1.92-trixie
     depends_on: []
+    environment:
+      CARGO_HOME: ${CI_WORKSPACE}/.cargo-home
     commands:
       - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
+      - rm -rf "$CARGO_HOME"
       - cargo install cargo-audit --locked --version 0.22.2 --root /tmp/audit-tools
       # Fails the release when a dependency in Cargo.lock has a published
       # advisory, or is yanked. Every build below uses --locked, so what
       # is built is exactly the Cargo.lock audited here: a lock file that
       # cargo would have to update fails the build instead of being
-      # silently changed. cargo fetch populates cargo's own index cache
-      # first, and .cargo/audit.toml tells cargo-audit to read that
-      # instead of re-downloading each of the ~280 locked crates' index
-      # entries itself for the yanked check, which has a hard-coded 10 s
-      # timeout per crate with no way to raise it and timed out on most
-      # of them here every time (https://github.com/RustSec/rustsec,
+      # silently changed. This also downloads and unpacks every crate
+      # Cargo.lock lists, for every target, into CARGO_HOME above, which
+      # every build step below reads from instead of downloading again
+      # (see the lane-diagram comment). .cargo/audit.toml tells
+      # cargo-audit to read cargo's own index cache instead of
+      # re-downloading each of the ~280 locked crates' index entries
+      # itself for the yanked check, which has a hard-coded 10 s timeout
+      # per crate with no way to raise it and timed out on most of them
+      # here every time (https://github.com/RustSec/rustsec,
       # rustsec::cached_index::REQUEST_TIMEOUT).
       - cargo fetch --locked
       - /tmp/audit-tools/bin/cargo-audit audit
@@ -118,6 +149,8 @@ steps:
     image: rust:1.92-trixie
     depends_on: [audit]
     environment:
+      CARGO_HOME: ${CI_WORKSPACE}/.cargo-home
+      CARGO_NET_OFFLINE: "true"
       PKG_CONFIG_ALLOW_CROSS: "1"
       PKG_CONFIG_SYSROOT_DIR: /opt/freebsd-sysroot
       PKG_CONFIG_LIBDIR: /opt/freebsd-sysroot/usr/local/libdata/pkgconfig:/opt/freebsd-sysroot/usr/local/lib/pkgconfig
@@ -178,9 +211,16 @@ steps:
   # stale or half-built tool must never be reused. Depends on audit
   # (rather than running in parallel with it) so a vulnerable lockfile is
   # caught before spending time compiling anything else for this lane.
+  # Uses the same CARGO_HOME as audit (reusing whatever of cargo-deb's own
+  # dependencies happen to already be cached from it) but, unlike every
+  # build step below, keeps normal network access: cargo-deb isn't in
+  # this project's Cargo.lock, so audit's fetch doesn't necessarily cover
+  # everything it needs.
   - name: build-ci-tools
     image: rust:1.92-trixie
     depends_on: [audit]
+    environment:
+      CARGO_HOME: ${CI_WORKSPACE}/.cargo-home
     commands:
       - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
       - rm -rf .ci-tools
@@ -192,12 +232,17 @@ steps:
     depends_on: [build-ci-tools]
     environment:
       CARGO_TARGET_DIR: target/linux-amd64-trixie
+      CARGO_HOME: ${CI_WORKSPACE}/.cargo-home
+      CARGO_NET_OFFLINE: "true"
     commands:
       - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
       - apt-get update && apt-get install -y --no-install-recommends libasound2-dev libssl-dev pkg-config lintian
       - export PATH="$CI_WORKSPACE/.ci-tools/bin:$PATH"
       # cargo-audit already ran once, on Cargo.lock, in the audit step
-      # (see the lane diagram above) - not repeated per .deb target.
+      # (see the lane diagram above) - not repeated per .deb target. Its
+      # cargo fetch already downloaded everything --locked needs here
+      # too, into the shared CARGO_HOME above; CARGO_NET_OFFLINE makes a
+      # missing crate a hard failure instead of a silent download.
       - cargo deb --locked --target x86_64-unknown-linux-gnu --deb-revision "1~trixie"
       - mkdir -p dist
       - cp target/linux-amd64-trixie/x86_64-unknown-linux-gnu/debian/*.deb dist/
@@ -222,6 +267,8 @@ steps:
     depends_on: [build-linux-amd64-trixie]
     environment:
       CARGO_TARGET_DIR: target/linux-arm64-trixie
+      CARGO_HOME: ${CI_WORKSPACE}/.cargo-home
+      CARGO_NET_OFFLINE: "true"
     commands:
       - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
       - dpkg --add-architecture arm64
@@ -241,19 +288,37 @@ steps:
       - dpkg-deb --fsys-tarfile dist/*~trixie_arm64.deb | tar -xO ./usr/share/doc/clip-gpt/copyright | grep -qi 'GNU AFFERO GENERAL PUBLIC LICENSE'
       - lintian --info dist/*~trixie_arm64.deb
 
+  # RUSTUP_HOME and CARGO_HOME are shared with build-linux-arm64-ubuntu2604
+  # below (not with any rust:1.92-trixie step - those images already
+  # have their own baked-in toolchain under /usr/local/rustup, unrelated
+  # to this): rustup-init here downloads the full 1.92.0 toolchain once;
+  # the arm64 step's own rustup-init then finds it already installed
+  # (confirmed: ~0.3s instead of ~60s, downloading only a small manifest
+  # checksum) and only needs to add its own target's rust-std component.
+  # CARGO_HOME, pointed at the same directory cargo fetch --locked filled
+  # in the audit step, is set before rustup-init runs (not after, unlike
+  # the rust:1.92-trixie steps above) so rustup-init installs its cargo/
+  # rustc shims directly into it instead of this container's own $HOME -
+  # confirmed to work and be where rustup-init itself then points the
+  # ". ... /env" instruction it prints. CARGO_NET_OFFLINE is set the same
+  # way as those steps, once cargo itself is in place.
   - name: build-linux-amd64-ubuntu2604
     image: ubuntu:26.04
     depends_on: [build-linux-arm64-trixie]
     environment:
       CARGO_TARGET_DIR: target/linux-amd64-ubuntu2604
+      RUSTUP_HOME: ${CI_WORKSPACE}/.rustup-ubuntu
+      CARGO_HOME: ${CI_WORKSPACE}/.cargo-home
     commands:
       - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
+      - rm -rf "$RUSTUP_HOME"
       - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential libasound2-dev libssl-dev pkg-config lintian
       # rustup-init checked against the SHA-256 published next to it, instead of
       # piping https://sh.rustup.rs into a shell.
       - sh scripts/fetch-verified.sh https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init /tmp/rustup-init
       - chmod +x /tmp/rustup-init && /tmp/rustup-init -y --profile minimal --default-toolchain 1.92.0
-      - . "$HOME/.cargo/env"
+      - . "$CARGO_HOME/env"
+      - export CARGO_NET_OFFLINE=true
       - export PATH="$CI_WORKSPACE/.ci-tools/bin:$PATH"
       - cargo deb --locked --deb-revision "1~ubuntu2604"
       - mkdir -p dist
@@ -264,19 +329,25 @@ steps:
       - dpkg-deb --fsys-tarfile dist/*~ubuntu2604_amd64.deb | tar -xO ./usr/share/doc/clip-gpt/copyright | grep -qi 'GNU AFFERO GENERAL PUBLIC LICENSE'
       - lintian --info dist/*~ubuntu2604_amd64.deb
 
+  # Reuses build-linux-amd64-ubuntu2604's RUSTUP_HOME/CARGO_HOME (see the
+  # comment there): this step's own rustup-init call below finds the
+  # 1.92.0 toolchain already installed and only adds its aarch64 target.
   - name: build-linux-arm64-ubuntu2604
     image: ubuntu:26.04
     depends_on: [build-linux-amd64-ubuntu2604]
     environment:
       CARGO_TARGET_DIR: target/linux-arm64-ubuntu2604
+      RUSTUP_HOME: ${CI_WORKSPACE}/.rustup-ubuntu
+      CARGO_HOME: ${CI_WORKSPACE}/.cargo-home
     commands:
       - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
       - dpkg --add-architecture arm64
       - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential gcc-aarch64-linux-gnu libc6-dev-arm64-cross libasound2-dev:arm64 libssl-dev:arm64 pkg-config lintian
       - sh scripts/fetch-verified.sh https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init /tmp/rustup-init
       - chmod +x /tmp/rustup-init && /tmp/rustup-init -y --profile minimal --default-toolchain 1.92.0
-      - . "$HOME/.cargo/env"
+      - . "$CARGO_HOME/env"
       - rustup target add aarch64-unknown-linux-gnu
+      - export CARGO_NET_OFFLINE=true
       - export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
       - export PKG_CONFIG_ALLOW_CROSS=1
       - export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
@@ -294,6 +365,9 @@ steps:
   - name: build-windows-amd64
     image: rust:1.92-trixie
     depends_on: [build-freebsd-pkg]
+    environment:
+      CARGO_HOME: ${CI_WORKSPACE}/.cargo-home
+      CARGO_NET_OFFLINE: "true"
     commands:
       - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
       - apt-get update && apt-get install -y --no-install-recommends mingw-w64
@@ -309,6 +383,9 @@ steps:
   - name: build-windows-arm64
     image: rust:1.92-trixie
     depends_on: [build-windows-amd64]
+    environment:
+      CARGO_HOME: ${CI_WORKSPACE}/.cargo-home
+      CARGO_NET_OFFLINE: "true"
     commands:
       - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
       # Classic GNU mingw-w64 has no ARM64 Windows support at all - only the

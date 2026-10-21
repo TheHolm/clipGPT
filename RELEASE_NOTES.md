@@ -3,6 +3,22 @@
 This file lists user-facing changes for each tagged release. See `AGENTS.md`
 for the versioning and tagging convention.
 
+## v0.7.2 - Release pipeline fixes
+
+No change to the program or its packages; this release only fixes the
+release pipeline itself (`.woodpecker/release.yaml`):
+
+- `cargo audit` ran only inside the Linux amd64/Trixie `.deb` build. It
+  still covered every platform (it scans `Cargo.lock`, which lists every
+  target's dependencies regardless of which step builds them), but a
+  vulnerable lockfile let the FreeBSD and both Windows builds run to
+  completion first; it now runs once, in its own step, before either of
+  the two build lanes.
+- Every build step downloaded the same ~280 crates into its own
+  container. They now share one crate cache, filled once by that audit
+  step; the two Ubuntu builds also share one Rust toolchain install
+  instead of each downloading their own.
+
 ## v0.7.1 - Debian packaging fixes
 
 No functional change; this only fixes the `.deb` package itself, which
