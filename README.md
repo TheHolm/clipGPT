@@ -336,13 +336,15 @@ Clipboard access is OS-specific:
       clipGPT goes through Xwayland there. GNOME keeps the Xwayland and
       Wayland clipboards in sync, so this is the same clipboard.
     * **Pure X11 sessions** work the same way.
-  * On X11 the clipboard holds no data itself: the program that copied
+  * **Neither clipboard holds data itself**: the program that copied
     something must keep running to hand it out. So after writing the
-    response, clipGPT leaves a small background copy of itself (`clip_gpt
-    --x11-clipboard-owner`) running. It exits as soon as anything else is
-    copied (after finishing pastes already in progress; one that stalls
-    for 10 seconds is given up). Don't run that option yourself; it's
-    internal.
+    response, clipGPT leaves a small background copy of itself running
+    (`clip_gpt --clipboard-owner=wayland` or `--clipboard-owner=x11`,
+    whichever backend set the clipboard). It exits as soon as anything
+    else is copied. On X11 that includes finishing pastes already in
+    progress; one that stalls for 10 seconds is given up. The Wayland
+    helper has no such limit yet: a stalled paste there can keep it
+    running. Don't run that option yourself; it's internal.
   * `x11rb` is maintained and pure Rust: no libxcb, and in the default
     configuration used here it is compiled with `forbid(unsafe_code)`. It
     is unrelated to the `clipboard`/`x11-clipboard`

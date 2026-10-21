@@ -184,7 +184,9 @@ fn main() {
             println!("{}", cli::version_text());
             return;
         }
-        Ok(cli::Command::ClipboardOwner) => std::process::exit(clipboard_backend::serve_owner()),
+        Ok(cli::Command::ClipboardOwner(backend)) => {
+            std::process::exit(clipboard_backend::serve_owner(backend))
+        }
         Ok(cli::Command::ListProfiles(options)) => {
             for name in load_config(&options).profile_names() {
                 println!("{name}");

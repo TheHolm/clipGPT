@@ -115,7 +115,7 @@ and
 .Fl \-timeout
 apply to whichever profile handles the clipboard.
 The argument
-.Fl \-x11\-clipboard\-owner
+.Fl \-clipboard\-owner Ns = Ns Ar backend
 is internal (see
 .Sx CLIPBOARD )
 and must not be used directly.
@@ -333,13 +333,20 @@ Otherwise, if
 is set, the X11 clipboard is used: on GNOME through Xwayland, which keeps
 it in sync with the Wayland clipboard, and in plain X11 sessions.
 .Pp
-An X11 clipboard is served by the program that set it, so after writing
-the response
+Neither clipboard holds data itself, only the name of the client that
+set it, which must keep running to answer paste requests.
+After writing the response
 .Nm
-leaves a copy of itself running in the background as
-.Ql clip_gpt \-\-x11\-clipboard\-owner .
-It exits as soon as anything else is copied, after finishing pastes
-already in progress; one that stalls for 10 seconds is given up.
+therefore leaves a copy of itself running in the background, as
+.Ql clip_gpt \-\-clipboard\-owner=wayland
+or
+.Ql clip_gpt \-\-clipboard\-owner=x11 ,
+matching whichever backend set the clipboard.
+It exits as soon as anything else is copied.
+On X11 that includes finishing pastes already in progress; one that
+stalls for 10 seconds is given up.
+The Wayland helper has no such limit yet: a stalled paste there can
+keep it running.
 .Sh IMAGES
 If the clipboard holds no text (or only white space) but an image,
 the image is sent instead, with

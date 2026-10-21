@@ -17,18 +17,16 @@
 //! Writing is harder: on X11 the clipboard holds no data, only the name of
 //! the client that owns it, which must keep running to answer paste
 //! requests. [`set_text`] therefore starts a copy of clipGPT with
-//! [`OWNER_HELPER_ARG`] and passes the text on stdin; that copy
+//! [`OWNER_HELPER_X11_ARG`] and passes the text on stdin; that copy
 //! ([`serve_owner`]) takes ownership, reports back on stdout, and then
-//! serves requests until another client takes the clipboard over.
-//! Re-executing avoids `fork()` in a multi-threaded process.
+//! serves requests until another client takes the clipboard over. The
+//! protocol between the two (and why re-executing is used instead of
+//! `fork()`) is in the `owner` module, shared with the Wayland backend.
 
+use super::owner::{self, TakeFailure};
 use super::{choose, choose_image_type, image_too_large, marks_password, too_large, Clip, Limits};
-use crate::cli::OWNER_HELPER_ARG;
+use crate::cli::OWNER_HELPER_X11_ARG;
 use crate::imagefile::ClipImage;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::errors::{ConnectionError, ReplyError, ReplyOrIdError};
@@ -45,9 +43,6 @@ use x11rb::{COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT, CURRENT_TIME, NONE};
 /// How long to wait for any single answer from the X server or the
 /// clipboard owner (one selection reply, one `INCR` chunk, ...).
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// How long [`set_text`] waits for the owner helper to report back.
-const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Pause between event polls while waiting with a timeout.
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
@@ -488,122 +483,41 @@ pub fn set_text(text: String) -> Result<(), Failure> {
     let exe = std::env::current_exe().map_err(|e| {
         Failure::Other(format!("Cannot find own executable for X11 clipboard: {e}"))
     })?;
-    hand_over(helper_command(exe), text.as_bytes())
-}
-
-/// The command that starts `exe` as the owner helper: the hidden argument,
-/// piped stdin/stdout, stderr discarded, cwd `/` (so it holds no directory
-/// busy), in its own process group (so a Ctrl-C in the terminal that
-/// started clipGPT does not take the clipboard down with it).
-fn helper_command(exe: std::path::PathBuf) -> Command {
-    let mut command = Command::new(exe);
-    command
-        .arg(OWNER_HELPER_ARG)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .current_dir("/")
-        .process_group(0);
-    command
-}
-
-/// Start the owner helper `command`, feed it `data` and wait (at most
-/// [`HELPER_READY_TIMEOUT`]) for its status line on stdout: `ok`, or
-/// `error: <message>`. The helper is killed if it does not answer in time;
-/// on success it is left running.
-fn hand_over(mut command: Command, data: &[u8]) -> Result<(), Failure> {
     let fail = |m: String| Failure::Other(format!("Failed to set X11 clipboard content: {m}"));
-    let mut child = command.spawn().map_err(|e| fail(e.to_string()))?;
-    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-        return Err(fail("helper has no stdin/stdout".to_string()));
-    };
-
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
-        let _ = tx.send(result);
-    });
-    // A helper that dies early makes this fail with a broken pipe; its
-    // status line (if any) says more, so that is preferred below.
-    let written = stdin.write_all(data);
-    drop(stdin);
-
-    let status = match rx.recv_timeout(HELPER_READY_TIMEOUT) {
-        Ok(Ok(line)) => line,
-        Ok(Err(e)) => format!("error: cannot read helper status: {e}"),
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(fail("helper did not respond in time".to_string()));
-        }
-    };
-    match parse_status(&status) {
-        Ok(()) => written.map_err(|e| fail(format!("cannot pass text to helper: {e}"))),
-        Err(message) => {
-            let _ = child.wait();
-            Err(fail(message))
-        }
+    match owner::hand_over(
+        owner::helper_command(exe, OWNER_HELPER_X11_ARG),
+        text.as_bytes(),
+    ) {
+        owner::HandOverResult::Ok => Ok(()),
+        owner::HandOverResult::Unavailable(m) | owner::HandOverResult::Failed(m) => Err(fail(m)),
     }
 }
 
-/// Interpret the helper's status line: `ok` is success, `error: <msg>` a
-/// reported failure, anything else (including nothing, if the helper died)
-/// an unexpected exit.
-fn parse_status(line: &str) -> Result<(), String> {
-    let line = line.trim_end();
-    if line == "ok" {
-        Ok(())
-    } else if let Some(message) = line.strip_prefix("error: ") {
-        Err(message.to_string())
-    } else {
-        Err("helper exited unexpectedly".to_string())
-    }
-}
-
-/// Entry point of the owner helper (clipGPT run with [`OWNER_HELPER_ARG`]):
-/// read the text from stdin, take the clipboard, report `ok` or
-/// `error: <message>` on stdout, then serve paste requests until another
-/// client takes the clipboard. Returns the process exit status.
+/// Entry point of the owner helper (clipGPT run with
+/// [`OWNER_HELPER_X11_ARG`]): read the text from stdin, take the
+/// clipboard, report `ok` or `error: <message>` on stdout (see
+/// [`owner::run_owner`]), then serve paste requests until another client
+/// takes the clipboard. Returns the process exit status.
 pub fn serve_owner() -> i32 {
-    run_owner(
+    owner::run_owner(
         std::io::stdin(),
         std::io::stdout(),
-        Owner::take,
-        Owner::serve,
+        |data| Owner::take(data).map_err(x11_take_failure),
+        |owner| owner.serve().map_err(x11_failure_message),
     )
 }
 
-/// The helper protocol of [`serve_owner`], with the I/O and the X11 parts
-/// (`take` the clipboard with the text, then `serve` it) passed in. The
-/// status line goes to `output` (one line, so newlines in an error are
-/// replaced); `serve` only runs once `ok` was written. Returns the exit
-/// status: 0 after serving, 1 on any failure.
-fn run_owner<O>(
-    mut input: impl Read,
-    mut output: impl Write,
-    take: impl FnOnce(Vec<u8>) -> Result<O, Failure>,
-    serve: impl FnOnce(O) -> Result<(), Failure>,
-) -> i32 {
-    let mut data = Vec::new();
-    let owner = input
-        .read_to_end(&mut data)
-        .map_err(|e| Failure::Other(format!("cannot read text: {e}")))
-        .and_then(|_| take(data));
-    let owner = match owner {
-        Ok(owner) => owner,
-        Err(Failure::Connect(m) | Failure::Other(m)) => {
-            let _ = writeln!(output, "error: {}", m.replace('\n', " "));
-            let _ = output.flush();
-            return 1;
-        }
-    };
-    if writeln!(output, "ok").and_then(|_| output.flush()).is_err() {
-        return 1;
-    }
-    match serve(owner) {
-        Ok(()) => 0,
-        Err(_) => 1,
+/// X11 is only tried by the owner helper once the parent already
+/// confirmed it is reachable ([`set_text`]'s probe), so a failure here is
+/// always final, never [`TakeFailure::Unavailable`].
+fn x11_take_failure(failure: Failure) -> TakeFailure {
+    TakeFailure::Failed(x11_failure_message(failure))
+}
+
+/// The message of a [`Failure`], regardless of its kind.
+fn x11_failure_message(failure: Failure) -> String {
+    match failure {
+        Failure::Connect(m) | Failure::Other(m) => m,
     }
 }
 
@@ -1277,102 +1191,6 @@ mod tests {
     }
 
     #[test]
-    fn helper_command_runs_hidden_mode_from_root() {
-        let command = helper_command("/opt/clip_gpt".into());
-        assert_eq!(command.get_program(), "/opt/clip_gpt");
-        let args: Vec<_> = command.get_args().collect();
-        assert_eq!(args, [OWNER_HELPER_ARG]);
-        assert_eq!(command.get_current_dir(), Some(std::path::Path::new("/")));
-    }
-
-    /// Run [`run_owner`] on `input`; returns exit status, output, and what
-    /// `take` received (if it ran) and whether `serve` ran.
-    fn owner_run(
-        input: &[u8],
-        take: Result<(), Failure>,
-        serve: Result<(), Failure>,
-    ) -> (i32, String, Option<Vec<u8>>, bool) {
-        let mut out = Vec::new();
-        let mut taken = None;
-        let mut served = false;
-        let status = run_owner(
-            input,
-            &mut out,
-            |data| {
-                taken = Some(data);
-                take
-            },
-            |()| {
-                served = true;
-                serve
-            },
-        );
-        (status, String::from_utf8(out).unwrap(), taken, served)
-    }
-
-    #[test]
-    fn run_owner_reports_ok_then_serves() {
-        let (status, out, taken, served) = owner_run(b"text", Ok(()), Ok(()));
-        assert_eq!((status, out.as_str(), served), (0, "ok\n", true));
-        assert_eq!(taken.as_deref(), Some(&b"text"[..]));
-        assert_eq!(parse_status(&out), Ok(()));
-        let (status, _, _, served) = owner_run(b"t", Ok(()), Err(Failure::Other("lost".into())));
-        assert_eq!((status, served), (1, true));
-    }
-
-    #[test]
-    fn run_owner_reports_take_failure_on_one_line() {
-        let fail = Err(Failure::Connect("no\ndisplay".into()));
-        let (status, out, _, served) = owner_run(b"t", fail, Ok(()));
-        assert_eq!(
-            (status, out.as_str(), served),
-            (1, "error: no display\n", false)
-        );
-        assert_eq!(parse_status(&out), Err("no display".into()));
-    }
-
-    #[test]
-    fn run_owner_input_and_output_errors() {
-        /// Reads and writes that always fail.
-        struct Broken;
-        impl Read for Broken {
-            /// Always fails.
-            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::other("closed"))
-            }
-        }
-        impl Write for Broken {
-            /// Always fails.
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::other("closed"))
-            }
-            /// Nothing to flush.
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut out = Vec::new();
-        let status = run_owner(
-            Broken,
-            &mut out,
-            |_| -> Result<(), _> { panic!() },
-            |_| panic!(),
-        );
-        assert_eq!(status, 1);
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "error: cannot read text: closed\n"
-        );
-        let status = run_owner(
-            &b"t"[..],
-            Broken,
-            |_| Ok(()),
-            |_| panic!("not after failed ok"),
-        );
-        assert_eq!(status, 1);
-    }
-
-    #[test]
     fn prefers_utf8_target() {
         let names = ["TARGETS", "STRING", "TEXT", "UTF8_STRING"];
         assert_eq!(choose_text_target(&names), Some(3));
@@ -1473,57 +1291,6 @@ mod tests {
         assert_eq!(chunk_size(usize::MAX), MAX_CHUNK);
         assert_eq!(chunk_size(4096), 4096 - 64);
         assert_eq!(chunk_size(0), 1);
-    }
-
-    #[test]
-    fn status_line_parsing() {
-        assert_eq!(parse_status("ok\n"), Ok(()));
-        assert_eq!(
-            parse_status("error: no display\n"),
-            Err("no display".into())
-        );
-        assert_eq!(parse_status(""), Err("helper exited unexpectedly".into()));
-        assert_eq!(
-            parse_status("garbage"),
-            Err("helper exited unexpectedly".into())
-        );
-    }
-
-    /// A shell command standing in for the owner helper, for testing
-    /// [`hand_over`] without an X server.
-    fn fake_helper(script: &str) -> Command {
-        let mut command = Command::new("sh");
-        command
-            .args(["-c", script])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        command
-    }
-
-    #[test]
-    fn hand_over_passes_data_and_accepts_ok() {
-        // The helper checks it got exactly the text before saying ok.
-        let script = r#"[ "$(cat)" = "hi there" ] && echo ok || echo "error: wrong data""#;
-        assert_eq!(hand_over(fake_helper(script), b"hi there"), Ok(()));
-        assert!(matches!(
-            hand_over(fake_helper(script), b"other"),
-            Err(Failure::Other(m)) if m.contains("wrong data")
-        ));
-    }
-
-    #[test]
-    fn hand_over_reports_helper_death() {
-        let result = hand_over(fake_helper("exit 3"), b"x");
-        assert!(matches!(result, Err(Failure::Other(m)) if m.contains("unexpectedly")));
-    }
-
-    #[test]
-    fn hand_over_times_out_silent_helper() {
-        let start = Instant::now();
-        let result = hand_over(fake_helper("cat >/dev/null; sleep 30"), b"x");
-        assert!(matches!(result, Err(Failure::Other(m)) if m.contains("in time")));
-        assert!(start.elapsed() < Duration::from_secs(20));
     }
 
     /// Serialises the tests using the one real X clipboard.

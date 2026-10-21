@@ -42,10 +42,25 @@ pub fn version_text() -> String {
     format!("clip_gpt version {}", env!("CARGO_PKG_VERSION"))
 }
 
-/// Hidden argument that runs clipGPT as the background X11 clipboard owner
-/// (see `clipboard_backend`'s `x11` module). Deliberately not in [`USAGE`]:
-/// it is only meant to be passed by clipGPT itself.
-pub const OWNER_HELPER_ARG: &str = "--x11-clipboard-owner";
+/// Hidden argument that runs clipGPT as the background clipboard owner
+/// helper for one backend (see `clipboard_backend`'s `owner` module).
+/// Deliberately not in [`USAGE`]: it is only meant to be passed by
+/// clipGPT itself. Only used on Linux/FreeBSD, which have a helper at
+/// all; `cfg_attr` keeps other platforms from warning about that.
+pub const OWNER_HELPER_ARG_PREFIX: &str = "--clipboard-owner=";
+/// Full argument for the X11 backend.
+#[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
+pub const OWNER_HELPER_X11_ARG: &str = "--clipboard-owner=x11";
+/// Full argument for the Wayland backend.
+#[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
+pub const OWNER_HELPER_WAYLAND_ARG: &str = "--clipboard-owner=wayland";
+
+/// The clipboard backend named by `--clipboard-owner=<backend>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerBackend {
+    X11,
+    Wayland,
+}
 
 /// Parsed command-line options.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -77,14 +92,15 @@ pub enum Command {
     Help,
     /// Print [`version_text`] and exit successfully.
     Version,
-    /// Serve the X11 clipboard ([`OWNER_HELPER_ARG`], must be the only
-    /// argument).
-    ClipboardOwner,
+    /// Serve the clipboard as the background owner helper
+    /// (`--clipboard-owner=<backend>`, must be the only argument).
+    ClipboardOwner(OwnerBackend),
 }
 
 /// Parse the arguments after the program name. Unknown arguments are an
 /// error naming the argument, so a mistyped flag never silently does
-/// nothing. [`OWNER_HELPER_ARG`] is only recognised on its own.
+/// nothing. [`OWNER_HELPER_X11_ARG`] / [`OWNER_HELPER_WAYLAND_ARG`] are
+/// only recognised on their own.
 pub fn parse<I, S>(args: I) -> Result<Command, String>
 where
     I: IntoIterator<Item = S>,
@@ -92,8 +108,8 @@ where
 {
     let args: Vec<S> = args.into_iter().collect();
     if let [only] = args.as_slice() {
-        if only.as_ref() == OWNER_HELPER_ARG {
-            return Ok(Command::ClipboardOwner);
+        if let Some(backend) = only.as_ref().to_str().and_then(owner_backend) {
+            return Ok(Command::ClipboardOwner(backend));
         }
     }
     let mut options = Options::default();
@@ -158,6 +174,16 @@ where
 /// The error for an unknown argument (shown lossily if not UTF-8).
 fn unknown(arg: &OsStr) -> String {
     format!("Unknown option '{}'\n\n{USAGE}", arg.to_string_lossy())
+}
+
+/// The backend named by `arg` if it is exactly
+/// `--clipboard-owner=<backend>` with a recognised backend.
+fn owner_backend(arg: &str) -> Option<OwnerBackend> {
+    match arg.strip_prefix(OWNER_HELPER_ARG_PREFIX)? {
+        "x11" => Some(OwnerBackend::X11),
+        "wayland" => Some(OwnerBackend::Wayland),
+        _ => None,
+    }
 }
 
 /// Store the config file `value` of option `option`. Giving the option
@@ -450,10 +476,21 @@ mod tests {
 
     #[test]
     fn owner_helper_only_alone_and_hidden() {
-        assert_eq!(parse([OWNER_HELPER_ARG]), Ok(Command::ClipboardOwner));
-        assert!(parse(["-s", OWNER_HELPER_ARG]).is_err());
-        assert!(parse([OWNER_HELPER_ARG, "-s"]).is_err());
-        assert!(!USAGE.contains(OWNER_HELPER_ARG));
+        assert_eq!(
+            parse([OWNER_HELPER_X11_ARG]),
+            Ok(Command::ClipboardOwner(OwnerBackend::X11))
+        );
+        assert_eq!(
+            parse([OWNER_HELPER_WAYLAND_ARG]),
+            Ok(Command::ClipboardOwner(OwnerBackend::Wayland))
+        );
+        assert!(parse(["-s", OWNER_HELPER_X11_ARG]).is_err());
+        assert!(parse([OWNER_HELPER_X11_ARG, "-s"]).is_err());
+        assert!(!USAGE.contains(OWNER_HELPER_ARG_PREFIX));
+        // An unrecognised backend, or the prefix alone, is just unknown.
+        assert!(parse(["--clipboard-owner=macos"]).is_err());
+        assert!(parse(["--clipboard-owner="]).is_err());
+        assert!(parse(["--clipboard-owner"]).is_err());
     }
 
     #[test]
@@ -464,7 +501,7 @@ mod tests {
             assert!(man.contains(&macro_form), "{flag} missing from man page");
         }
         assert!(
-            man.contains(OWNER_HELPER_ARG),
+            man.contains("clipboard-owner"),
             "internal argument should be named"
         );
         assert!(!man.contains("Fl T"), "-T was removed");
