@@ -151,7 +151,12 @@ def parse_args(argv: list) -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--deps-file", help="JSON {name: {origin, version}} for deps")
     parser.add_argument("--comment", required=True, help="short one-line summary")
-    parser.add_argument("--maintainer", default="TheHolm <theholm@github.com>")
+    # Not a real mailbox (GitHub doesn't deliver to it): it only gives
+    # the manifest's maintainer field a plausible-looking address.
+    # Contact goes through --www's issue tracker instead.
+    parser.add_argument(
+        "--maintainer", default="TheHolm <16282750+TheHolm@users.noreply.github.com>"
+    )
     parser.add_argument("--www", required=True)
     parser.add_argument("--license", default="AGPL-3.0-or-later")
     parser.add_argument("--category", default="sysutils")

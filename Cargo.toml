@@ -1,10 +1,11 @@
 [package]
 name = "clip_gpt"
-version = "0.7.0"
+version = "0.7.1"
 authors = [ "TheHolm" ]
 license = "AGPL-3.0-or-later"
 rust-version = "1.92"
 edition = "2021"
+repository = "https://github.com/TheHolm/clipGPT"
 # default-run = "clipGPT"
 
 [dependencies]
@@ -49,10 +50,16 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard"] }
 
 [package.metadata.deb]
-maintainer = "TheHolm"
+# The users.noreply.github.com address doesn't take mail (nobody can
+# reply to it); it only satisfies Debian Policy 5.6.2, which requires the
+# Maintainer field to look like a real address. The `repository` key
+# above becomes the control file's Homepage field (cargo-deb falls back
+# to it when `homepage` isn't set), which is where bug reports actually
+# go, through that project's issue tracker.
+maintainer = "TheHolm <16282750+TheHolm@users.noreply.github.com>"
 extended-description = """Interact with LLM via clipboard"""
 depends = "$auto"
-section = "utility"
+section = "utils"
 priority = "optional"
 # debian/copyright is installed explicitly as the package's one licence
 # file (Debian Policy 12.5, followed by Ubuntu): with an asset at that path
@@ -62,6 +69,11 @@ priority = "optional"
 # The binary goes to /usr/bin and the man page to /usr/share/man: Debian
 # Policy 9.1.2 (same on Ubuntu) leaves /usr/local to the local admin, so no
 # package may install there. cargo-deb gzips the man page itself (-9n).
+# changelog points at debian/changelog (Debian Policy 12.7): the
+# "~<distro>" deb-revision used for every build here makes dpkg treat the
+# package as non-native, which requires a changelog.Debian.gz, not just
+# the upstream one cargo-deb would otherwise look for.
+changelog = "debian/changelog"
 assets = [
  ["target/release/clip_gpt", "usr/bin/", "755"],
  ["man/clip_gpt.1", "usr/share/man/man1/clip_gpt.1", "644"],

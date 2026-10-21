@@ -3,6 +3,21 @@
 This file lists user-facing changes for each tagged release. See `AGENTS.md`
 for the versioning and tagging convention.
 
+## v0.7.1 - Debian packaging fixes
+
+No functional change; this only fixes the `.deb` package itself, which
+`lintian` flagged as broken in three ways:
+
+- The `Maintainer` field (`TheHolm`) had no email address, which lintian
+  requires. It now reads `TheHolm
+  <16282750+TheHolm@users.noreply.github.com>`; that address can't
+  receive mail, so the package's `Homepage` field (the project's GitHub
+  page) is now set too, for reporting bugs.
+- The package had no Debian changelog at all, required for every release
+  built here since all of them use a `~<distro>` suffix in their version.
+- `Section: utility` named a section that doesn't exist on the Debian/
+  Ubuntu archives; it's `Section: utils` now.
+
 ## v0.7.0 - Security hardening, request_extra_body, api_url required
 
 **Breaking changes:**
