@@ -5,3 +5,5 @@ execute.sh
 *.swo
 *~
 .ci-tools
+__pycache__
+*.pyc
